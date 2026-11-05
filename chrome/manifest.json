@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_name__",
+  "description": "__MSG_description__",
+  "version": "0.1.2",
+  "minimum_chrome_version": "116",
+  "default_locale": "zh_CN",
+  "permissions": ["debugger", "tabs", "storage", "alarms", "notifications"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html" }
+}

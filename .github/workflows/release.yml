@@ -1,0 +1,56 @@
+name: Release
+
+# 推送 v* 标签时自动打包并发布 Release。
+# 标签必须和 manifest.json 的 version 一致（v0.2.0 ↔ "0.2.0"），否则失败，避免发错版本。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      EXT_ID: app-life
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version
+        id: version
+        run: |
+          version=$(jq -r .version manifest.json)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 manifest.json 的版本 $version 不一致"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "chrome=$(jq -r .version chrome/manifest.json)" >> "$GITHUB_OUTPUT"
+
+      # 扩展包：解压后整个 app-life/ 目录放进 <DATA_DIR>/users/<账号>/extensions/
+      - name: Package extension
+        run: |
+          mkdir -p dist stage
+          rsync -a ./ "stage/$EXT_ID/" \
+            --exclude '.git' --exclude '.github' --exclude 'docs/screenshots' --exclude 'node_modules' \
+            --exclude 'dist' --exclude 'stage' \
+            --exclude '*.test.ts' --exclude '*.test.js' --exclude '*test-utils.ts' --exclude '*.d.ts' --exclude 'tsconfig.json'
+          (cd stage && zip -rqX "../dist/$EXT_ID-${{ steps.version.outputs.version }}.zip" "$EXT_ID")
+
+      # Chrome 插件包：与 NoBot 页面里下载到的一致，解压后「加载已解压的扩展程序」选 nobot-chrome-<版本>/
+      - name: Package Chrome extension
+        run: |
+          name="nobot-chrome-${{ steps.version.outputs.chrome }}"
+          rsync -a chrome/ "stage/$name/" \
+            --exclude '.*' --exclude '*.test.ts' --exclude 'test-utils.ts' --exclude '*.d.ts' --exclude 'tsconfig.json'
+          (cd stage && zip -rqX "../dist/$name.zip" "$name")
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "应用生活 / App Life $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Chrome 插件（NoBot 浏览器桥）版本：${{ steps.version.outputs.chrome }}"

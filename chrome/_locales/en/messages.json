@@ -1,0 +1,98 @@
+{
+  "name": {
+    "message": "NoBot Browser Bridge"
+  },
+  "description": {
+    "message": "Let a paired NoBot control dedicated extension-owned tabs"
+  },
+  "pairing": {
+    "message": "Paste pairing string (contains a secret; do not share)"
+  },
+  "pair": {
+    "message": "Pair"
+  },
+  "revoke": {
+    "message": "Revoke pairing"
+  },
+  "paused": {
+    "message": "Pause all browser operations"
+  },
+  "domains": {
+    "message": "Allowed domains"
+  },
+  "saveDomains": {
+    "message": "Save allowlist"
+  },
+  "security": {
+    "message": "The paired server can read login credentials and act on these websites. Only pair servers you trust."
+  },
+  "logs": {
+    "message": "Last 20 operations"
+  },
+  "online": {
+    "message": "Connected"
+  },
+  "offline": {
+    "message": "Offline"
+  },
+  "server": {
+    "message": "Server"
+  },
+  "unpaired": {
+    "message": "Not paired"
+  },
+  "failed": {
+    "message": "Operation failed. Check your connection and pairing."
+  },
+  "INVALID_PAIR": {
+    "message": "Invalid pairing string"
+  },
+  "TLS_REQUIRED": {
+    "message": "Remote servers require HTTPS / WSS"
+  },
+  "INVALID_DOMAIN": {
+    "message": "Invalid domain"
+  },
+  "PROTOCOL_MISMATCH": {
+    "message": "Incompatible protocol. Update the extension."
+  },
+  "UNAUTHORIZED": {
+    "message": "Pairing was revoked. Pair again."
+  },
+  "CONNECTION_FAILED": {
+    "message": "Connection failed; retrying"
+  },
+  "address": {
+    "message": "Server address"
+  },
+  "saveAddress": {
+    "message": "Save"
+  },
+  "addressHint": {
+    "message": "The address the extension uses to reach NoBot, e.g. a VPN IP: http://192.168.1.10:3000. Changing it keeps the pairing. LAN / VPN addresses may use http; anything else must be https."
+  },
+  "pausedHint": {
+    "message": "While paused, every NoBot operation is refused; the connection stays up"
+  },
+  "pairTitle": {
+    "message": "Pair"
+  },
+  "repairTitle": {
+    "message": "Pair again"
+  },
+  "pausedState": {
+    "message": "Paused"
+  },
+  "domainsHint": {
+    "message": "One per line, subdomains included"
+  },
+  "noLogs": {
+    "message": "No operations yet"
+  },
+  "revokeConfirm": {
+    "message": "The extension will disconnect and delete its pairing. Continue?"
+  },
+  "INVALID_ENDPOINT": {
+    "message": "Invalid address, e.g. http://192.168.1.10:3000"
+  }
+}

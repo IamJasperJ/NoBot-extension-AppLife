@@ -1,0 +1,98 @@
+{
+  "name": {
+    "message": "NoBot 浏览器桥"
+  },
+  "description": {
+    "message": "让配对的 NoBot 驱动插件自己的专用标签页"
+  },
+  "pairing": {
+    "message": "粘贴配对串（包含密钥，请勿分享）"
+  },
+  "pair": {
+    "message": "配对"
+  },
+  "revoke": {
+    "message": "撤销配对"
+  },
+  "paused": {
+    "message": "暂停所有浏览器操作"
+  },
+  "domains": {
+    "message": "允许的域名"
+  },
+  "saveDomains": {
+    "message": "保存白名单"
+  },
+  "security": {
+    "message": "配对服务器可以读取这些网站的登录态并执行操作。仅配对你信任的服务器。"
+  },
+  "logs": {
+    "message": "最近 20 条操作"
+  },
+  "online": {
+    "message": "已连接"
+  },
+  "offline": {
+    "message": "未连接"
+  },
+  "server": {
+    "message": "服务器"
+  },
+  "unpaired": {
+    "message": "未配对"
+  },
+  "failed": {
+    "message": "操作失败，请检查连接和配对信息"
+  },
+  "INVALID_PAIR": {
+    "message": "配对串无效"
+  },
+  "TLS_REQUIRED": {
+    "message": "远程服务器必须使用 HTTPS / WSS"
+  },
+  "INVALID_DOMAIN": {
+    "message": "域名无效"
+  },
+  "PROTOCOL_MISMATCH": {
+    "message": "插件协议版本不兼容，请更新"
+  },
+  "UNAUTHORIZED": {
+    "message": "配对已失效，请重新配对"
+  },
+  "CONNECTION_FAILED": {
+    "message": "连接失败，正在重试"
+  },
+  "address": {
+    "message": "连接地址"
+  },
+  "saveAddress": {
+    "message": "保存"
+  },
+  "addressHint": {
+    "message": "插件连 NoBot 用的地址，例如 VPN IP：http://192.168.1.10:3000。只换地址，不用重新配对；内网 / VPN 地址可以用 http，其他必须 https。"
+  },
+  "pausedHint": {
+    "message": "暂停时拒绝 NoBot 的所有操作，连接保持"
+  },
+  "pairTitle": {
+    "message": "配对"
+  },
+  "repairTitle": {
+    "message": "重新配对"
+  },
+  "pausedState": {
+    "message": "已暂停"
+  },
+  "domainsHint": {
+    "message": "每行一个，含子域名"
+  },
+  "noLogs": {
+    "message": "还没有操作"
+  },
+  "revokeConfirm": {
+    "message": "撤销后插件断开并删除配对信息，确定吗？"
+  },
+  "INVALID_ENDPOINT": {
+    "message": "地址格式不对，例如 http://192.168.1.10:3000"
+  }
+}

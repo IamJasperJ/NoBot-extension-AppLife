@@ -1,0 +1,741 @@
+/* 应用生活：样式只作用于 al- 前缀的容器；配色对齐宿主（zinc + violet），深色模式跟随 html.dark */
+.al {
+  --al-accent: #7c3aed;
+  --al-accent-soft: #f5f3ff;
+  --al-text: #18181b;
+  --al-muted: #71717a;
+  --al-line: #e4e4e7;
+  --al-card: #ffffff;
+  --al-soft: #fafafa;
+  --al-danger: #dc2626;
+  color: var(--al-text);
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
+}
+.dark .al {
+  --al-accent: #a78bfa;
+  --al-accent-soft: rgb(139 92 246 / 14%);
+  --al-text: #f4f4f5;
+  --al-muted: #a1a1aa;
+  --al-line: #3f3f46;
+  --al-card: #18181b;
+  --al-soft: rgb(255 255 255 / 3%);
+  --al-danger: #f87171;
+}
+.al *,
+.al *::before,
+.al *::after {
+  box-sizing: border-box;
+}
+.al h3,
+.al h4,
+.al p {
+  margin: 0;
+}
+
+/* 控件：32px 紧凑高度；次要按钮白底描边，主按钮紫色 */
+.al input[type="text"],
+.al input[type="number"],
+.al input[type="password"],
+.al input:not([type]),
+.al select,
+.al textarea {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--al-line);
+  border-radius: 8px;
+  background: var(--al-card);
+  color: inherit;
+  font: inherit;
+  outline: none;
+}
+.al textarea {
+  height: auto;
+  min-height: 64px;
+  padding: 6px 10px;
+  resize: vertical;
+  line-height: 1.6;
+}
+.al input:focus-visible,
+.al select:focus-visible,
+.al textarea:focus-visible {
+  border-color: var(--al-accent);
+  box-shadow: 0 0 0 3px var(--al-accent-soft);
+}
+.al input::placeholder,
+.al textarea::placeholder {
+  color: var(--al-muted);
+  opacity: 0.8;
+}
+.al-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--al-line);
+  border-radius: 8px;
+  background: var(--al-card);
+  color: inherit;
+  font: inherit;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+.al-btn:hover:not(:disabled) {
+  background: var(--al-soft);
+  border-color: color-mix(in srgb, var(--al-accent) 40%, var(--al-line));
+}
+.al-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.al-btn.primary {
+  border-color: var(--al-accent);
+  background: var(--al-accent);
+  color: #fff;
+}
+.dark .al-btn.primary {
+  color: #18181b;
+}
+.al-btn.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--al-accent) 88%, #000);
+}
+.al-btn.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--al-muted);
+}
+.al-btn.ghost:hover:not(:disabled) {
+  background: var(--al-soft);
+  color: var(--al-text);
+}
+.al-btn.danger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--al-danger) 50%, transparent);
+  color: var(--al-danger);
+}
+.al-btn.icon {
+  width: 32px;
+  padding: 0;
+}
+
+/* 开关 */
+.al-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 36px;
+  height: 20px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--al-line);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.al-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 20%);
+  transition: transform 0.15s;
+}
+.al-switch[aria-checked="true"] {
+  background: var(--al-accent);
+}
+.al-switch[aria-checked="true"]::after {
+  transform: translateX(16px);
+}
+.al-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 状态徽标 */
+.al-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--al-soft);
+  border: 1px solid var(--al-line);
+  color: var(--al-muted);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.al-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.al-pill.lurking {
+  color: var(--al-muted);
+}
+.al-pill.active {
+  color: #16a34a;
+  border-color: rgb(22 163 74 / 25%);
+  background: rgb(22 163 74 / 7%);
+}
+.al-pill.probing {
+  color: #d97706;
+  border-color: rgb(217 119 6 / 25%);
+  background: rgb(217 119 6 / 7%);
+}
+.al-pill.exiting {
+  color: #2563eb;
+  border-color: rgb(37 99 235 / 25%);
+  background: rgb(37 99 235 / 7%);
+}
+.al-pill.plain::before {
+  display: none;
+}
+
+/* 会话设置里的分组 */
+.al-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.al-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.al-row.between {
+  justify-content: space-between;
+}
+.al-row.wrap {
+  flex-wrap: wrap;
+}
+.al-grow {
+  flex: 1;
+  min-width: 0;
+}
+.al-muted {
+  color: var(--al-muted);
+  font-size: 12px;
+}
+.al-dense {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px 10px;
+}
+.al-dense label {
+  color: var(--al-muted);
+  font-size: 12px;
+}
+.al-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--al-accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.al-link:hover {
+  text-decoration: underline;
+}
+.al-error {
+  color: var(--al-danger);
+  font-size: 12px;
+}
+
+/* 扩展页面 */
+.al-page {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.al-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+}
+.al-head h3 {
+  font-size: 16px;
+  font-weight: 600;
+}
+.al-split {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.al-card {
+  border: 1px solid var(--al-line);
+  border-radius: 12px;
+  background: var(--al-card);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.al-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.al-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.al-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.al-item:hover {
+  background: var(--al-soft);
+}
+.al-item[aria-current="true"] {
+  border-color: color-mix(in srgb, var(--al-accent) 35%, transparent);
+  background: var(--al-accent-soft);
+}
+.al-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.al-edit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.al-edit-row > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+.al-member {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr) 32px;
+  gap: 8px;
+  align-items: start;
+}
+.al-empty {
+  padding: 28px 16px;
+  border: 1px dashed var(--al-line);
+  border-radius: 12px;
+  color: var(--al-muted);
+  text-align: center;
+  line-height: 1.8;
+}
+.al-tabs {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--al-soft);
+  border: 1px solid var(--al-line);
+}
+.al-tab {
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--al-muted);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.al-tab[aria-selected="true"] {
+  background: var(--al-card);
+  color: var(--al-text);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+}
+.al-count {
+  margin-left: 4px;
+  color: var(--al-accent);
+  font-size: 11px;
+}
+.al-slang {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr) auto;
+  gap: 8px 10px;
+  align-items: start;
+  padding: 10px 0;
+  border-top: 1px solid var(--al-line);
+}
+.al-slang:first-child {
+  border-top: 0;
+}
+.al-term {
+  font-weight: 600;
+  word-break: break-all;
+  padding-top: 5px;
+}
+.al-example {
+  margin-top: 4px;
+  color: var(--al-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+.al-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 720px) {
+  .al-page {
+    padding: 14px 12px 32px;
+  }
+  .al-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .al-member {
+    grid-template-columns: minmax(0, 1fr) 32px;
+  }
+  .al-member > :nth-child(2) {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .al-slang {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .al-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* ───────── 应用生活专用 ───────── */
+.al-hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.al-avatar {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fb7299, #7c3aed);
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  overflow: hidden;
+}
+.al-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.al-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.al-stat {
+  padding: 10px 12px;
+  border: 1px solid var(--al-line);
+  border-radius: 10px;
+  background: var(--al-soft);
+  min-width: 0;
+}
+.al-stat strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+}
+.al-stat span {
+  color: var(--al-muted);
+  font-size: 12px;
+}
+.al-grid2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.al-kv {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 6px 12px;
+  font-size: 13px;
+}
+.al-kv dt {
+  color: var(--al-muted);
+}
+.al-kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.al-meter {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--al-line);
+  overflow: hidden;
+}
+.al-meter > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--al-accent);
+}
+.al-meter.warn > i {
+  background: #d97706;
+}
+.al-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgb(217 119 6 / 30%);
+  background: rgb(217 119 6 / 7%);
+  font-size: 13px;
+}
+.al-banner.danger {
+  border-color: color-mix(in srgb, var(--al-danger) 30%, transparent);
+  background: color-mix(in srgb, var(--al-danger) 7%, transparent);
+}
+.al-banner .al-grow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.al-qr {
+  display: grid;
+  place-items: center;
+  width: 220px;
+  height: 220px;
+  padding: 10px;
+  border: 1px solid var(--al-line);
+  border-radius: 12px;
+  background: #fff;
+}
+.al-qr svg {
+  width: 100%;
+  height: 100%;
+}
+.al-qr.expired {
+  opacity: 0.25;
+}
+.al-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 0;
+  border-top: 1px solid var(--al-line);
+}
+.al-entry:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.al-entry-body {
+  white-space: pre-wrap;
+  line-height: 1.8;
+}
+.al-video {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 12px 0;
+  border-top: 1px solid var(--al-line);
+}
+.al-video:first-child {
+  border-top: 0;
+}
+.al-score {
+  display: grid;
+  place-items: center;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--al-soft);
+  border: 1px solid var(--al-line);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.al-score.high {
+  color: var(--al-accent);
+  border-color: color-mix(in srgb, var(--al-accent) 35%, transparent);
+  background: var(--al-accent-soft);
+}
+.al-video a {
+  color: inherit;
+  font-weight: 500;
+  text-decoration: none;
+}
+.al-video a:hover {
+  color: var(--al-accent);
+}
+.al-btn.on {
+  border-color: var(--al-accent);
+  color: var(--al-accent);
+  background: var(--al-accent-soft);
+}
+.al-pref {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 72px 32px;
+  gap: 8px;
+  align-items: center;
+}
+.al-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.al-check .ok {
+  color: #16a34a;
+}
+.al-check .bad {
+  color: var(--al-danger);
+}
+
+@media (max-width: 720px) {
+  .al-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .al-grid2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .al-video {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+  .al-video > :last-child {
+    grid-column: 2;
+  }
+  .al-pref {
+    grid-template-columns: 80px minmax(0, 1fr) 32px;
+  }
+  .al-pref > :nth-child(3) {
+    display: none;
+  }
+}
+.al-details > summary {
+  width: fit-content;
+  color: var(--al-accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.al-details[open] > summary {
+  margin-bottom: 12px;
+}
+
+/* 监听卡片：私信 / 评论 / 直播一路一行 */
+.al-listen {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.al-listen-row {
+  display: grid;
+  grid-template-columns: 40px auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.al-listen-row .al-muted {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 待审回复里引用的原话 */
+.al-quote {
+  padding: 6px 10px;
+  border-left: 3px solid var(--al-line);
+  background: var(--al-soft);
+  border-radius: 0 8px 8px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.al-quote > span {
+  display: block;
+  color: var(--al-muted);
+  font-size: 12px;
+}
+
+/* 互动记录 */
+.al-activity {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 10px 0;
+  border-top: 1px solid var(--al-line);
+}
+.al-activity:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.al-activity .al-pill {
+  justify-self: start;
+}
+.al-activity-text {
+  margin-top: 2px;
+  color: var(--al-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 抖音浏览器当前页面的截图（排查验证码页） */
+.al-shot {
+  cursor: crosshair;
+  touch-action: none;
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  border: 1px solid var(--al-line);
+  border-radius: 8px;
+}
+
+/* Chrome 插件配对：配对串是一长串 base64，等宽并允许任意处断行 */
+.al textarea.al-pairing {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  resize: none;
+}
+.al-steps {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+}

@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["bun"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "allowJs": true
+  },
+  "include": ["core/**/*.ts", "apps/**/*.ts", "*.ts", "browser/**/*.ts", "chrome/**/*.ts"]
+}
