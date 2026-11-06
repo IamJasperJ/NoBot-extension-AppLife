@@ -340,13 +340,14 @@ class Service {
     this.kv.set('home', { chatId: chat.id, characterId: s.characterId })
     return chat.id
   }
-  async trigger(chatId: string, instruction: string) {
-    this.signal?.throwIfAborted()
+  async trigger(chatId: string, instruction: string, signal = this.signal) {
+    signal?.throwIfAborted()
     await this.ctx.host.waitIdle(chatId, 120000)
+    signal?.throwIfAborted()
     const before = new Set(this.ctx.host.getChatInfo(chatId, 100).messages.map((m) => m.id))
     this.ctx.host.trigger(chatId, { instruction })
     await this.ctx.host.waitIdle(chatId, 120000)
-    this.signal?.throwIfAborted()
+    signal?.throwIfAborted()
     const message = this.ctx.host
       .getChatInfo(chatId, 100)
       .messages.filter((m) => m.role === 'assistant' && !before.has(m.id) && m.status !== 'error')
@@ -354,7 +355,7 @@ class Service {
     if (!message) throw new RouteError('GENERATION', t('未找到本轮角色回复'))
     return { id: message.id, text: message.content }
   }
-  ports(app: string): DayPorts {
+  ports(app: string, signal = this.signal): DayPorts {
     const { adapter, guard } = this.platform(app)
     return {
       sleep: this.rt.sleep,
@@ -365,7 +366,7 @@ class Service {
       settings: scopedSettings(this.s, app, this.kv.get<OwnerCache>('douyin-owner')),
       loggedIn: () => this.loggedIn(app),
       home: async () => this.home(),
-      trigger: (id, text) => this.trigger(id, text),
+      trigger: (id, text) => this.trigger(id, text, signal),
       quietPrompt: (opts) => this.ctx.host.quietPrompt(opts),
       note: (id, text) => {
         this.ctx.host.appendMessage(id, { role: 'system', content: text })
@@ -375,15 +376,15 @@ class Service {
       waitIdle: (id, ms) => this.ctx.host.waitIdle(id, ms),
     }
   }
-  mainPorts(): DayPorts {
+  mainPorts(signal = this.signal): DayPorts {
     return {
-      ...this.ports(this.s.app),
+      ...this.ports(this.s.app, signal),
       settings: this.s,
-      platforms: () => enabledApps(this.s).map((id) => ({ id, ports: this.ports(id) })),
+      platforms: () => enabledApps(this.s).map((id) => ({ id, ports: this.ports(id, signal) })),
     }
   }
-  socialPorts(app: string): SocialPorts {
-    return { ...this.ports(app), paused: () => this.paused(app), account: () => this.account(app) }
+  socialPorts(app: string, signal = this.signal): SocialPorts {
+    return { ...this.ports(app, signal), paused: () => this.paused(app), account: () => this.account(app) }
   }
   async exclusive<T>(work: () => Promise<T>): Promise<T> {
     if (this.running || this.dmBusy || this.replying) throw new RouteError('BUSY', t('正在运行，请稍后重试'))
@@ -440,12 +441,12 @@ class Service {
     // wake 在首次 await 前占用同一运行锁，路由返回后 tick 和重复请求也不能插入。
     void this.wake(true).catch(this.log)
   }
-  async wake(force = false) {
+  async wake(force = false, signal = this.signal, propagateError = false) {
     if (this.running || this.dmBusy || this.replying) return false
     this.running = true
     let plan: import('./core/plan').Plan | undefined
     try {
-      this.signal?.throwIfAborted()
+      signal?.throwIfAborted()
       const now = this.rt.now()
       plan = makePlan(this.s, this.kv.get('plan'), now, this.rt.random)
       this.kv.set('plan', plan)
@@ -474,10 +475,10 @@ class Service {
       if (this.s.douyinEnabled) await this.ensureDouyinOwner()
       try {
         await runDay(
-          this.mainPorts(),
+          this.mainPorts(signal),
           now,
           this.rt.random,
-          this.signal,
+          signal,
           force ? 'wake' : plan.action === 'skip' ? 'skip' : 'wake',
         )
       } finally {
@@ -493,44 +494,64 @@ class Service {
         summary: t('今日流程未完成'),
         error: error instanceof Error ? error.message : t('未知错误'),
       })
+      // 手动唤醒与旧宿主保留容错；宿主任务必须收到异常才能记录 failed。
+      if (propagateError) throw error
       return false
     } finally {
       this.running = false
     }
   }
-  async tick() {
-    if (this.signal?.aborted || this.running || this.dmBusy || this.replying) return
-    await this.wake()
+  // 只为本轮合并取消信号，不覆盖手动唤醒、回复和会话清理使用的生命周期。
+  roundSignal(signal?: AbortSignal) {
+    return signal && this.signal ? AbortSignal.any([signal, this.signal]) : (signal ?? this.signal)
+  }
+  async tick(taskSignal?: AbortSignal) {
+    const signal = this.roundSignal(taskSignal)
+    if (signal?.aborted || this.running || this.dmBusy || this.replying) return
+    await this.wake(false, signal, !!taskSignal)
+    signal?.throwIfAborted()
     for (const task of [judgeResponses, weeklyDigest]) {
-      if (this.signal?.aborted || this.running || this.dmBusy || this.replying) return
+      if (signal?.aborted || this.running || this.dmBusy || this.replying) return
       this.running = true
       try {
-        await task(this.mainPorts(), this.rt.now(), this.signal)
+        await task(this.mainPorts(signal), this.rt.now(), signal)
+        signal?.throwIfAborted()
       } catch (error) {
         this.log(error)
+        if (taskSignal) throw error
       } finally {
         this.running = false
       }
     }
-    await this.pollDm()
+    await this.pollDm(taskSignal)
   }
-  async pollDm() {
-    if (this.signal?.aborted || this.running || this.dmBusy || this.replying) return
+  async pollDm(taskSignal?: AbortSignal) {
+    const signal = this.roundSignal(taskSignal)
+    if (signal?.aborted || this.running || this.dmBusy || this.replying) return
     this.dmBusy = true
+    // 一个平台出错不影响其他平台本轮轮询；全部跑完后再把第一个错误交给宿主记录 failed
+    let failure: unknown
     try {
       for (const app of enabledApps(this.s)) {
+        signal?.throwIfAborted()
         if (!this.loggedIn(app)) continue
         try {
           if (app === 'douyin') await this.ensureDouyinOwner()
-          await pollOwnerDm(this.dmPorts(app), this.rt.now(), this.signal)
+          await pollOwnerDm(this.dmPorts(app), this.rt.now(), signal)
+          signal?.throwIfAborted()
           // 待回复私信只阻止所属平台的公开互动。
           if (dmOf(scopedKv(this.kv, app)).pendingReplies.length || this.replying) continue
-          await pollComments(this.socialPorts(app), this.rt.now(), this.signal)
-          await pollLive(this.socialPorts(app), this.rt.now(), this.signal)
+          await pollComments(this.socialPorts(app, signal), this.rt.now(), signal)
+          signal?.throwIfAborted()
+          await pollLive(this.socialPorts(app, signal), this.rt.now(), signal)
+          signal?.throwIfAborted()
         } catch (error) {
+          if (signal?.aborted) throw error
           this.log(error)
+          failure ??= error
         }
       }
+      if (taskSignal && failure !== undefined) throw failure
     } finally {
       this.dmBusy = false
     }
@@ -722,17 +743,48 @@ const extension: Extension = {
       const p = svc.ports(app)
       p.kv.set('live', { ...liveOf(p), seeded: false, nextAt: 0 })
     }
+    let timer: ReturnType<typeof setInterval> | undefined
+    let dmTimer: ReturnType<typeof setInterval> | undefined
     const tick = () => {
       service(ctx)
       void svc.tick().catch(svc.log)
     }
-    const timer = setInterval(tick, 60000)
-    timer.unref()
-    const dmTimer = setInterval(() => {
-      service(ctx)
-      void svc.pollDm().catch(svc.log)
-    }, 15000)
-    dmTimer.unref()
+    if (ctx.tasks?.register) {
+      // interval 取严格晚于当前时间的对齐点；首轮交给宿主在约一秒后执行并追踪。
+      const anchor = Date.now() + 1000
+      ctx.tasks.register(
+        {
+          id: 'day',
+          name: t('应用生活'),
+          schedule: { kind: 'interval', everyMs: 60000, anchor },
+          misfire: 'skip',
+        },
+        async (taskSignal) => {
+          service(ctx)
+          await svc.tick(taskSignal)
+        },
+      )
+      ctx.tasks.register(
+        {
+          id: 'messages',
+          name: t('应用生活私信'),
+          schedule: { kind: 'interval', everyMs: 15000, anchor },
+          misfire: 'skip',
+        },
+        async (taskSignal) => {
+          service(ctx)
+          await svc.pollDm(taskSignal)
+        },
+      )
+    } else {
+      timer = setInterval(tick, 60000)
+      timer.unref()
+      dmTimer = setInterval(() => {
+        service(ctx)
+        void svc.pollDm().catch(svc.log)
+      }, 15000)
+      dmTimer.unref()
+    }
     signal.addEventListener(
       'abort',
       () => {
@@ -745,7 +797,7 @@ const extension: Extension = {
       },
       { once: true },
     )
-    tick()
+    if (!ctx.tasks?.register) tick()
   },
   dispose() {
     for (const svc of services.values()) svc.signal = AbortSignal.abort()

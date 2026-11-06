@@ -361,6 +361,7 @@ en.所选连接已禁用图像 = 'Images are disabled for the selected connectio
 en['找不到 NoBot 源码目录'] = 'NoBot source tree was not found'
 Object.assign(en, {
   应用生活: 'App Life',
+  应用生活私信: 'App Life messages',
   让角色在外部应用中拥有自己的生活: 'Give characters a life on external apps',
   应用生活命令: 'App Life commands',
 })

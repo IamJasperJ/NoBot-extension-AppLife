@@ -1,5 +1,6 @@
 {
   "id": "app-life",
+  "apiVersion": 1,
   "name": "应用生活 / App Life",
   "version": "0.1.0",
   "description": "让角色在外部应用中拥有自己的生活 / Give characters a life on external apps",

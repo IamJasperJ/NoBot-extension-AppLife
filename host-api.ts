@@ -27,6 +27,17 @@ export interface ExtensionContext {
   storage: KV
   settings: Record<string, unknown>
   chatId: string
+  tasks?: {
+    register(
+      definition: {
+        id: string
+        name: string
+        schedule: { kind: 'interval'; everyMs: number; anchor: number }
+        misfire: 'skip' | 'once'
+      },
+      run: (signal: AbortSignal) => void | Promise<void>,
+    ): void
+  }
 }
 export interface Extension {
   id: string

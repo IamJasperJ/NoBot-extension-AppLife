@@ -153,7 +153,9 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
             body: body === undefined ? undefined : JSON.stringify(body),
           }),
         )
-      // 后台启动时立即持久化计划；无需调用 /status 才启动。
+      // 首轮由宿主追踪；直接执行已注册任务，无需等待调度器的一秒检查。
+      const { runScheduledTask } = await import('../../apps/server/src/extensions/tasks')
+      await runScheduledTask('app-life:day')
       const { getSetting } = await import('../../apps/server/src/db/client')
       expect(getSetting('extdata:app-life:plan')).toBeTruthy()
       const status = await (await request('/status')).json()
@@ -538,11 +540,11 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
         return socket
       })
       try {
-        registry.updateExtension('app-life', { settings: { ...savedSettings, douyinEnabled: true } })
+        await registry.configureExtension('app-life', { settings: { ...savedSettings, douyinEnabled: true } })
         const noProxy = (await (await request('/diagnose', {})).json()).checks
         expect(noProxy.some((c) => c.name === '抖音 浏览器代理')).toBe(false)
         expect(proxyConnections).toEqual([])
-        registry.updateExtension('app-life', {
+        await registry.configureExtension('app-life', {
           settings: { ...savedSettings, douyinEnabled: true, douyinBrowserProxy: ' socks5://192.168.1.20:1080 ' },
         })
         for (const ok of [true, false]) {
@@ -560,7 +562,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
         ])
       } finally {
         connectProxy.mockRestore()
-        registry.updateExtension('app-life', { settings: savedSettings })
+        await registry.configureExtension('app-life', { settings: savedSettings })
       }
       const page = await (await request(`/diary?before=${diary.entries[0].id}&limit=1`)).json()
       expect(page.entries).toHaveLength(1)
@@ -584,33 +586,23 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
       releaseDiscover()
       expect((await waitFinished()).lastRun).toMatchObject({ ok: true })
       await request('/skip-today', {})
-      registry.updateExtension('app-life', { enabled: false })
-      // 捕获实际后台检查回调，使用注入时钟推进轮询，无需等待真实十五秒。
-      const callbacks = []
-      const nativeInterval = globalThis.setInterval
-      globalThis.setInterval = (callback, delay, ...args) => {
-        if (delay === 15000) callbacks.push(callback)
-        return nativeInterval(callback, delay, ...args)
-      }
-      try {
-        registry.updateExtension('app-life', {
-          enabled: true,
-          settings: {
-            characterId: character.id,
-            dmListen: false,
-            frames: false,
-            maxVideos: 1,
-            deepReads: 0,
-            commentListen: true,
-            commentPollSeconds: 60,
-            listenAllDay: true,
-            ownerId: '7',
-            liveRoom: '1',
-          },
-        })
-      } finally {
-        globalThis.setInterval = nativeInterval
-      }
+      await registry.configureExtension('app-life', { enabled: false })
+      await registry.configureExtension('app-life', {
+        enabled: true,
+        settings: {
+          characterId: character.id,
+          dmListen: false,
+          frames: false,
+          maxVideos: 1,
+          deepReads: 0,
+          commentListen: true,
+          commentPollSeconds: 60,
+          listenAllDay: true,
+          ownerId: '7',
+          liveRoom: '1',
+        },
+      })
+      await runScheduledTask('app-life:messages')
       const waitFor = async (predicate) => {
         for (let i = 0; i < 500; i++) {
           if (await predicate()) return
@@ -640,7 +632,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
       clock += 61000
       notices = [makeNotice(201, 7), makeNotice(202, 8)]
       danmaku = [{ id_str: 'live-new', uid: 7, nickname: '主人', text: '新弹幕', timeline: '2026-10-29 12:20:00' }]
-      callbacks.at(-1)()
+      await runScheduledTask('app-life:messages')
       await waitFor(
         async () =>
           (await (await request('/drafts')).json()).drafts.length === 1 && publicPosts.some((p) => p.has('roomid')),
