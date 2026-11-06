@@ -152,6 +152,8 @@ export class Controller {
       return { tabs: [...this.tabs.keys()].map((key) => ({ key, attached: this.attached.has(key) })) }
     if (op === 'notify') {
       if (typeof v.title !== 'string' || typeof v.message !== 'string') throw new Error('INVALID_MESSAGE')
+      // 部分安卓浏览器没有系统通知 API，此时只靠前面切换标签页提醒
+      if (typeof this.api.notifications?.create !== 'function') return { unsupported: true }
       await this.api.notifications.create({
         type: 'basic',
         iconUrl: this.api.runtime.getURL('icon.png'),
@@ -182,7 +184,9 @@ export class Controller {
     }
     if (op === 'tab.focus') {
       await this.api.tabs.update(id, { active: true })
-      await this.api.windows.update(tab.windowId, { focused: true })
+      // 安卓上的 Chromium（Quetta、Kiwi 等）没有 windows API，切到标签页就够了
+      if (typeof this.api.windows?.update === 'function')
+        await this.api.windows.update(tab.windowId, { focused: true }).catch(() => {})
       return {}
     }
     if (op === 'cdp.attach') {

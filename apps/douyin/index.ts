@@ -331,12 +331,20 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
         api.ensure(response, payload)
       },
       async shareVideo(peerId, itemId, signal, opts) {
+        let searchTerms = opts?.searchTerms ?? []
+        // 主人直接填 sec_uid 时没有抖音号 / 昵称可搜；按 sec_uid 读一次主页补上（只读，失败就不带搜索词）
+        if (opts && !searchTerms.length) {
+          try {
+            const user = obj((await api.get('/aweme/v1/web/user/profile/other/', { sec_user_id: peerId }, signal)).user)
+            searchTerms = [str(user.unique_id) || str(user.short_id), str(user.nickname)].filter(Boolean).slice(0, 2)
+          } catch {}
+        }
         const response = await deps.guardedFetch(`${BASE}/__ui/im/share`, {
           method: 'POST',
           // 明确未发送的补发仍等待保护层冷却，不绕过预算或去重。
           waitWriteMs: 180000,
           headers: { cookie: cookieHeader(deps.credentials()), 'content-type': 'application/json' },
-          body: JSON.stringify({ peer: peerId, itemId, searchTerms: opts?.searchTerms }),
+          body: JSON.stringify({ peer: peerId, itemId, searchTerms }),
           signal,
         })
         const payload = await response

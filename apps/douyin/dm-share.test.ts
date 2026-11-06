@@ -183,6 +183,26 @@ test('dm 端口把可选搜索词传入分享 body', async () => {
   expect(body).toEqual({ peer: 'owner', itemId: '123', searchTerms: ['handle', '昵称'] })
 })
 
+test('没有搜索词时按 sec_uid 读主人主页，补抖音号和昵称', async () => {
+  const f = fixture()
+  let body: unknown
+  const urls: string[] = []
+  const adapter = createDouyinAdapter({
+    ...f.deps,
+    guardedFetch: async (input, init) => {
+      const url = String(input)
+      urls.push(url)
+      if (url.includes('/user/profile/other/'))
+        return Response.json({ status_code: 0, user: { unique_id: 'owner_handle', nickname: '主人' } })
+      body = JSON.parse(String(init?.body))
+      return Response.json({ status_code: 0 })
+    },
+  })
+  await adapter.directMessages.shareVideo!('owner', '123', undefined, { searchTerms: [] })
+  expect(urls[0]).toContain('sec_user_id=owner')
+  expect(body).toEqual({ peer: 'owner', itemId: '123', searchTerms: ['owner_handle', '主人'] })
+})
+
 for (const stage of ['reattach-found', 'reattach-missing', 'reattach-detached', 'detach-before'] as const) {
   test(`调试断开只重新附加回读一次：${stage}`, async () => {
     const f = setup(stage)

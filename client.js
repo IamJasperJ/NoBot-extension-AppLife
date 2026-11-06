@@ -208,6 +208,8 @@ const en = {
     'The extension will disconnect immediately and must be paired again. Continue?',
   已复制: 'Copied',
   复制配对串: 'Copy pairing code',
+  '浏览器不允许自动复制，配对串已选中，请长按手动复制':
+    'The browser blocked automatic copying. The pairing code is selected; long-press to copy it.',
   '配对串里有密钥，别发给别人；重新配对后旧的立即失效。':
     'The pairing code contains a secret—don’t share it. Pairing again invalidates the old one immediately.',
   'Chrome 插件': 'Chrome extension',
@@ -847,9 +849,34 @@ export default function activate(api) {
       setPairing(data.pairing)
       setCopied(false)
     }
+    // http 明文访问（局域网 IP、手机浏览器）时 navigator.clipboard 不存在，退回 execCommand；再不行就选中让用户手动复制
     const copy = async () => {
-      await navigator.clipboard.writeText(pairing)
-      setCopied(true)
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(pairing)
+          setCopied(true)
+          return
+        }
+      } catch {}
+      const box = document.querySelector('.al-pairing')
+      const temp = document.createElement('textarea')
+      temp.value = pairing
+      temp.setAttribute('readonly', '')
+      temp.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none'
+      document.body.appendChild(temp)
+      temp.select()
+      temp.setSelectionRange(0, pairing.length)
+      let ok = false
+      try {
+        ok = document.execCommand('copy')
+      } catch {}
+      temp.remove()
+      if (ok) return setCopied(true)
+      if (box) {
+        box.focus()
+        box.select()
+      }
+      throw new Error(t('浏览器不允许自动复制，配对串已选中，请长按手动复制'))
     }
     const manage = h(
       'div',

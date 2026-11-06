@@ -8,6 +8,9 @@ const text = (/** @type {string} */ key) => api.i18n.getMessage(key)
 const element = (/** @type {string} */ id) => /** @type {HTMLElement} */ (document.getElementById(id))
 const field = (/** @type {string} */ id) => /** @type {HTMLInputElement} */ (document.getElementById(id))
 for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = text(el.getAttribute('data-i18n') || '')
+// 没有 chrome.debugger 的浏览器（部分安卓 Chromium）连上也做不了事，直接提示
+element('unsupported').hidden =
+  typeof (/** @type {{ debugger?: { attach?: unknown } }} */ (api).debugger?.attach) === 'function'
 
 /** 配对串里存的是 ws(s)://主机/hooks/...；输入框里只给用户看「http(s)://主机」，改起来直观 */
 function displayAddress(/** @type {string} */ endpoint) {

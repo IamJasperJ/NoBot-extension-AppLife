@@ -94,5 +94,8 @@
   },
   "INVALID_ENDPOINT": {
     "message": "地址格式不对，例如 http://192.168.1.10:3000"
+  },
+  "noDebugger": {
+    "message": "这个浏览器不支持调试接口（chrome.debugger），插件无法操作网页。"
   }
 }
