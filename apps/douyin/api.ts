@@ -13,11 +13,12 @@ import {
   type AppCredentials,
   type BrowserPage,
   type BrowserSession,
+  BrowserSkippedError,
   type ContentItem,
   TrafficError,
 } from '../../core/types'
 import { t } from '../../i18n'
-import { blockedScript, loginScript, readConversation, sendMessage } from './im'
+import { blockedScript, confirmVideoShare, loginScript, readConversation, sendMessage, shareVideo } from './im'
 import { CaptchaError, captchaMessage, douyinRiskPolicy, UI_CODES } from './risk'
 
 export const BASE = 'https://www.douyin.com'
@@ -160,6 +161,7 @@ export function createTransport(
     const url = new URL(input instanceof Request ? input.url : input)
     if (url.hostname !== 'www.douyin.com') return fallback(input, init)
     const path = url.pathname
+    const imWrite = path === '/__ui/im/send' || path === '/__ui/im/share'
     const method = (init.method ?? 'GET').toUpperCase()
     const body =
       typeof init.body === 'string' ? init.body : init.body instanceof URLSearchParams ? init.body.toString() : null
@@ -173,17 +175,18 @@ export function createTransport(
       await syncCookies()
     }
     // 其他接口保留原先准备阶段的异常语义，只为私信发送扩大捕获范围。
-    if (path !== '/__ui/im/send') await prepare()
+    if (!imWrite) await prepare()
     // ready() 也会在回调前失败，因此提交标记必须由传输层持有。
     let committed = false
+    let committedAt = 0
     return Promise.resolve()
       .then(async () => {
-        if (path === '/__ui/im/send') {
+        if (imWrite) {
           if (opts.blocked()) return synthetic(path, { status_code: UI_CODES.LOGIN })
           await prepare()
         }
         return browser.run(async (page) => {
-          if (path === '/__ui/im/list' || path === '/__ui/im/send') {
+          if (path === '/__ui/im/list' || imWrite) {
             const peer =
               path === '/__ui/im/list' ? str(url.searchParams.get('peer')) : str(obj(JSON.parse(body ?? '{}')).peer)
             if (path === '/__ui/im/list') {
@@ -193,10 +196,35 @@ export function createTransport(
                 return synthetic(path, { status_code: UI_CODES.FAILED, status_msg: read.reason })
               return read.status === 'login' ? synthetic(path, { status_code: UI_CODES.LOGIN }) : verify()
             }
-            const result = await sendMessage(page, peer, str(obj(JSON.parse(body ?? '{}')).text), () => {
+            const data = obj(JSON.parse(body ?? '{}'))
+            const searchTerms = data.searchTerms
+            if (
+              path === '/__ui/im/share' &&
+              searchTerms !== undefined &&
+              (!Array.isArray(searchTerms) ||
+                searchTerms.length > 2 ||
+                searchTerms.some((term) => typeof term !== 'string' || !term.trim() || term.length > 30))
+            )
+              return synthetic(path, {
+                status_code: UI_CODES.FAILED,
+                status_msg: t('分享搜索词必须是最多两项、每项 1 到 30 字的字符串数组'),
+              })
+            const onCommit = () => {
               committed = true
-            })
-            if (result.status === 'sent') return synthetic(path, { status_code: 0, sid: result.sid })
+              committedAt = Date.now()
+            }
+            const result =
+              path === '/__ui/im/share'
+                ? await shareVideo(page, str(data.itemId), peer, onCommit, searchTerms as string[] | undefined)
+                : await sendMessage(page, peer, str(data.text), onCommit)
+            if ('disconnected' in result && result.disconnected && committed && path === '/__ui/im/share')
+              throw new BrowserSkippedError(result.reason, false)
+            if (result.status === 'sent')
+              return synthetic(path, {
+                status_code: 0,
+                ...('sid' in result ? { sid: result.sid } : {}),
+                ...('confirmedBy' in result ? { confirmedBy: result.confirmedBy } : {}),
+              })
             if (result.status === 'not-sent')
               return synthetic(path, { status_code: UI_CODES.FAILED, status_msg: result.reason })
             if (result.status === 'login') return synthetic(path, { status_code: UI_CODES.LOGIN })
@@ -210,15 +238,19 @@ export function createTransport(
               ? new URLSearchParams(body ?? '').get('aweme_id')
               : null
           await ensureOrigin(page, awemeId ? `${BASE}/video/${awemeId}` : `${BASE}/`)
-          if (await page.evaluate(blockedScript, null)) return verify()
-          if (method !== 'GET' && (await page.evaluate(loginScript, null)))
+          if (await page.evaluate(blockedScript, null, { readonly: true })) return verify()
+          if (method !== 'GET' && (await page.evaluate(loginScript, null, { readonly: true })))
             return synthetic(path, { status_code: UI_CODES.LOGIN })
-          const result = await page.evaluate(xhrScript, {
-            method,
-            path: `${path}${url.search}`,
-            body,
-            type: body === null ? null : 'application/x-www-form-urlencoded',
-          })
+          const result = await page.evaluate(
+            xhrScript,
+            {
+              method,
+              path: `${path}${url.search}`,
+              body,
+              type: body === null ? null : 'application/x-www-form-urlencoded',
+            },
+            { readonly: method === 'GET' },
+          )
           if (!result.status) throw new Error(t('浏览器请求失败：{reason}', { reason: result.error ?? '' }))
           return new Response(result.text, {
             status: result.status,
@@ -226,16 +258,38 @@ export function createTransport(
           })
         }, init.signal ?? undefined)
       })
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
+        if (path === '/__ui/im/share' && committed && error instanceof BrowserSkippedError) {
+          // 必须先退出旧 run，避免在同一个串行会话里等待自己；本次恢复只读且最多一次。
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 3000))
+            init.signal?.throwIfAborted()
+            const data = obj(JSON.parse(body ?? '{}'))
+            const confirmed = await browser.run(
+              (page) => confirmVideoShare(page, str(data.itemId), str(data.peer), committedAt),
+              init.signal ?? undefined,
+            )
+            if (confirmed) {
+              console.info('[app-life/douyin/share]', {
+                awemeId: str(data.itemId),
+                ownerSecUid: str(data.peer),
+                status: 'sent',
+                confirmedBy: 'readback-reattach',
+              })
+              return synthetic(path, { status_code: 0, confirmedBy: 'readback-reattach' })
+            }
+          } catch (readError) {
+            return synthetic(path, { status_msg: readError instanceof Error ? readError.message : String(readError) })
+          }
+          return synthetic(path, { status_msg: error.message })
+        }
         if (error instanceof CaptchaError)
           return synthetic(path, {
             status_code: UI_CODES.VERIFY,
             status_msg: error.message,
-            ...((path === '/__ui/im/send' ? committed : error.uncertain) && method !== 'GET'
-              ? { uncertain: true }
-              : {}),
+            ...((imWrite ? committed : error.uncertain) && method !== 'GET' ? { uncertain: true } : {}),
           })
-        if (path === '/__ui/im/send' && !committed)
+        if (imWrite && !committed)
           return synthetic(path, {
             status_code: UI_CODES.FAILED,
             status_msg: error instanceof Error ? error.message : String(error),

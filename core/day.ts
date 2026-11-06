@@ -1,10 +1,11 @@
 import { t } from '../i18n'
-import { deliver } from './deliver'
+import { type DeliveryResult, deliver } from './deliver'
 import { heart } from './heart'
 import { dayOf } from './plan'
 import { affinity, keywords, selectItems } from './prefs'
 import {
   DEEP_PROMPT,
+  DM_SHARE_PROMPT,
   digestMaterial,
   LETTER_PROMPT,
   PRIVATE_DIARY_PROMPT,
@@ -14,7 +15,7 @@ import {
   SHARE_PROMPT,
   SKIP_PROMPT,
 } from './prompts'
-import { attachSaid, loadShares, recordShare, ShareError, settleShares, shareState } from './share'
+import { attachSaid, loadShares, recordShare, ShareError, settleShares, shareState, unrecordShare } from './share'
 import { addDiary, type HistoryItem, remember, type Settings, watchedHistory } from './state'
 import {
   type AppAdapter,
@@ -380,18 +381,58 @@ export async function runDay(
       if (records.some((e) => e.itemId === entry.id || (e.authorId === entry.author.id && dayOf(e.at) === dayOf(now))))
         continue
       signal?.throwIfAborted()
-      // 先占账再触发；生成结果不确定时宁可少分享，也不自动重发。
+      // 先占账防止并发重复；只有确定失败才释放名额。
       recordShare(kv, entry.id, entry.author.id, now)
-      const share = await p.trigger(
-        home,
-        `${SHARE_PROMPT}\n${responseTone(current)}\n${rawMaterial(entry.app ?? '', { app: entry.app, title: entry.title, url: entry.url, reason: entry.reason, notes: entry.notes, heart: entry.heart, enjoy: entry.enjoy, forOwner: entry.forOwner, urge: entry.urge })}`,
-      )
-      attachSaid(kv, entry.id, share.text)
-      entry.shared = true
-      entry.delivered = [{ via: 'home', ok: true, at: now }]
+      const ports = portsOf(entry)
+      const material = rawMaterial(entry.app ?? '', {
+        app: entry.app,
+        title: entry.title,
+        url: entry.url,
+        reason: entry.reason,
+        notes: entry.notes,
+        heart: entry.heart,
+        enjoy: entry.enjoy,
+        forOwner: entry.forOwner,
+        urge: entry.urge,
+      })
+      entry.delivered = []
+      let result: DeliveryResult
+      if (ports.settings.shareVia === 'home') {
+        try {
+          const share = await p.trigger(home, `${SHARE_PROMPT}\n${responseTone(current)}\n${material}`)
+          if (!share.text.trim()) throw new Error(t('模型未生成有效回复'))
+          entry.delivered.push({ via: 'home', ok: true, at: now })
+          result = { status: 'sent', text: share.text }
+        } catch (error) {
+          p.log(error)
+          const reason = error instanceof Error ? error.message : String(error)
+          entry.delivered.push({ via: 'home', ok: false, at: now, error: reason })
+          p.note(home, t('分享投递失败：{title}\n{reason}', { title: entry.title, reason }))
+          // 绑定会话里的生成可能已经落了消息：一律按不确定保留占账，宁可少分享也不重复分享
+          result = { status: 'uncertain' }
+        }
+      } else {
+        result = await deliver(
+          ports,
+          entry,
+          () =>
+            p.quietPrompt({
+              chatId: home,
+              instruction: `${DM_SHARE_PROMPT}\n${responseTone(current)}\n${material}`,
+              includeHistory: true,
+              connectionId: s.connectionId || undefined,
+              model: s.model || undefined,
+              signal,
+            }),
+          now,
+          signal,
+        )
+      }
+      entry.shared = result.status !== 'failed'
+      if (result.status === 'failed') unrecordShare(kv, entry.id, now)
+      if (result.status === 'sent') attachSaid(kv, entry.id, result.text)
       remember(kv, entry)
-      await deliver(portsOf(entry), entry, share.text, now, signal)
-      remember(kv, entry)
+      if (result.status === 'failed') break
       current = shareState(kv, s, now)
     }
     signal?.throwIfAborted()

@@ -1,4 +1,27 @@
 const en: Record<string, string> = {
+  'Chrome 自动重新附加次数已达上限': 'Chrome automatic reattach limit reached',
+  '分享面板里的主人不在可视区域，无法点击':
+    'The owner in the sharing panel is outside the visible area and cannot be clicked',
+  分享面板搜索框拿不到焦点: 'Could not focus the sharing panel search field',
+  没有找到分享面板搜索框: 'Could not find the sharing panel search field',
+  '搜索时分享面板消失，重新打开后仍不可用':
+    'The sharing panel disappeared during search and remained unavailable after reopening',
+  '分享面板搜索后没有找到主人（搜索词：{terms}）': 'Owner not found after searching the sharing panel (terms: {terms})',
+  '分享搜索词必须是最多两项、每项 1 到 30 字的字符串数组':
+    'Sharing search terms must be an array of at most two strings, each 1 to 30 characters long',
+
+  当前浏览器不支持原生视频分享: 'This browser does not support native video sharing',
+  没有找到视频分享按钮: 'Video share button not found',
+  分享面板的联系人列表没有加载出来: 'The sharing panel contact list did not finish loading',
+  视频分享面板没有出现: 'Video sharing panel did not appear',
+  '分享面板里没有主人，请先在抖音里和主人聊过':
+    'Owner is missing from the share panel. Please chat with the owner on Douyin first.',
+  主人的分享按钮当前不可用: 'The owner’s share button is currently unavailable',
+  视频卡片点击后未能确认发送结果: 'Could not confirm the video card after clicking Share',
+  '视频卡片结果不确定，已停止补发：{reason}': 'Video card result uncertain; stopped further sending: {reason}',
+  '视频卡片未发送，回退文字链接：{reason}': 'Video card not sent; falling back to text and link: {reason}',
+  '视频卡片已分享，补充文字发送失败：{reason}': 'Video card shared; follow-up text failed: {reason}',
+
   'Chrome 插件版本无效': 'Invalid Chrome extension version',
   'Chrome 插件压缩包过大': 'Chrome extension archive is too large',
   '空闲时关闭 Chrome 专用标签': 'Close the dedicated Chrome tab when idle',
@@ -14,6 +37,7 @@ const en: Record<string, string> = {
   'Chrome 插件不在线': 'Chrome extension is offline',
   插件已暂停: 'Extension is paused',
   '插件版本太旧，请更新': 'Extension protocol is incompatible. Please update the extension.',
+  'Chrome 调试已断开（{reason}），本轮已跳过': 'Chrome debugging disconnected ({reason}). This round was skipped.',
   'Chrome 调试已取消，本轮已跳过': 'Chrome debugging was cancelled. This round was skipped.',
   '不允许设置此域名的 Cookie': 'Cookies for this domain are not allowed',
   抖音需要验证: 'Douyin needs verification',
@@ -397,5 +421,11 @@ Object.assign(en, {
   留一部分名额给偏好之外的视频: 'Reserve some slots for videos outside existing preferences',
   '连续这么多次分享都没有回应就只写信不主动分享；0 表示不启用':
     'After this many consecutive ignored shares, only write letters; 0 disables quiet mode',
+  '评论区 @ 主人：只发评论': 'Mention owner in comments: comments only',
+  '私信给主人：只发私信，不在绑定会话里说': 'DM to owner: direct messages only, no message in the bound chat',
+  '每次只通过所选渠道分享；私信和评论区分享不会在绑定会话里发言':
+    'Share only through the selected channel; DM and comment shares do not post in the bound chat',
+  '每次只通过所选渠道分享；私信和评论不在绑定会话里发言，评论区会按 sec_uid 自动查昵称并 @ 你':
+    'Share only through the selected channel; DM and comment shares do not post in the bound chat. Comments look up your nickname by sec_uid and mention you',
 })
 export default en

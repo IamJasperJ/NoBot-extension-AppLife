@@ -21,7 +21,7 @@ const num = (x: unknown) =>
   typeof x === 'number' && Number.isFinite(x) ? x : typeof x === 'string' && /^-?\d+$/.test(x) ? Number(x) : null
 export const douyinRiskPolicy: RiskPolicy = {
   guards: (url) => url.hostname === 'www.douyin.com',
-  isDirectMessage: (url) => url.pathname === '/__ui/im/send',
+  isDirectMessage: (url) => ['/__ui/im/send', '/__ui/im/share'].includes(url.pathname),
   volatileFields: /^(a_bogus|msToken|X-Bogus|verifyFp|fp|_signature|ts|timestamp)$/,
   accountOf: (headers) => headers.get('cookie')?.match(/(?:^|;)\s*sessionid=([^;]*)/i)?.[1] ?? '',
   judge(response, payload, authenticated) {

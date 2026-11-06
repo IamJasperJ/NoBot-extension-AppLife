@@ -91,6 +91,9 @@ test('筛 maxVideos、深读 deepReads，无图仍能精读；额度、信件 id
   const history = x.f.kv.get<HistoryItem[]>('history')!
   expect(history).toHaveLength(5)
   expect(history.filter((e) => e.shared)).toHaveLength(2)
+  expect(
+    history.filter((e) => e.shared).every((e) => e.delivered?.length === 1 && e.delivered[0]?.via === 'home'),
+  ).toBe(true)
   expect(x.f.kv.get<DiaryEntry[]>('diary')).toMatchObject([
     { kind: 'letter', text: 'letter text' },
     { kind: 'private' },
@@ -180,11 +183,11 @@ test('文字深读降分后不从初筛补分享；未启用深读时可分享�
   }
 })
 
-test('评论闸拦截仍先写绑定会话分享和账本，历史保留投递结果及单次系统提示', async () => {
+test('评论闸拦截先占账但不写绑定会话分享和账本，历史保留投递结果及单次系统提示', async () => {
   const x = setup()
   x.p.settings.shareVia = 'comment'
   x.p.settings.aiCommentGuard = true
-  x.p.settings.maxVideos = 1
+  x.p.settings.maxVideos = 3
   x.p.settings.deepReads = 0
   let posts = 0
   x.p.adapter.comments.post = async () => {
@@ -203,7 +206,7 @@ test('评论闸拦截仍先写绑定会话分享和账本，历史保留投递�
   const quiet = x.p.quietPrompt
   x.p.quietPrompt = async (opts) => {
     if (!opts.instruction.includes('Assess only the supplied sample')) return quiet(opts)
-    expect(x.triggers).toHaveLength(1)
+    expect(x.triggers).toHaveLength(0)
     expect(x.f.kv.get<{ entries: unknown[] }>('shares')?.entries).toHaveLength(1)
     const rows = JSON.parse(opts.instruction.split('<raw_material>\n')[1]!.split('\n</raw_material>')[0]!) as {
       id: string
@@ -211,17 +214,15 @@ test('评论闸拦截仍先写绑定会话分享和账本，历史保留投递�
     return JSON.stringify({ labels: rows.map((r) => ({ id: r.id, label: 'suspected', reason: 'concrete evidence' })) })
   }
   await runDay(x.p, now, () => 0)
+  expect(x.f.kv.get('shares')).toEqual({ entries: [] })
   expect(posts).toBe(0)
-  // 只有一条分享触发；信静默生成
-  expect(x.triggers).toHaveLength(1)
+  // 渠道互斥，评论闸失败撤账，后续条目本轮不再尝试。
+  expect(x.triggers).toHaveLength(0)
   expect(x.notes).toHaveLength(1)
-  expect(x.f.kv.get<HistoryItem[]>('history')?.[0]).toMatchObject({
-    shared: true,
+  expect(x.f.kv.get<HistoryItem[]>('history')?.find((e) => e.gate)).toMatchObject({
+    shared: false,
     gate: { status: 'blocked' },
-    delivered: [
-      { via: 'home', ok: true },
-      { via: 'comment', ok: false },
-    ],
+    delivered: [{ via: 'comment', ok: false }],
   })
 })
 
@@ -311,14 +312,16 @@ test('候选池搜索最多三个去重词、近30天排除，模型收到主人
   expect(x.f.kv.get<HistoryItem[]>('history')).toHaveLength(8)
 })
 
-test('trigger 失败仍保留 pending 占账，不把不确定生成重新发送', async () => {
+test('trigger 明确返回 UNCERTAIN 时保留 pending 占账并视为已分享', async () => {
   const x = setup()
+  x.p.settings.shareDaily = 1
   x.p.trigger = async () => {
-    throw new Error('generation uncertain')
+    throw new TrafficError('generation uncertain', 'UNCERTAIN')
   }
   await runDay(x.p, now, () => 0)
   expect(x.f.kv.get<{ entries: unknown[] }>('shares')!.entries).toHaveLength(1)
-  expect(x.f.kv.get('lastRun')).toMatchObject({ ok: false, error: 'generation uncertain' })
+  expect(x.f.kv.get<HistoryItem[]>('history')?.filter((e) => e.shared)).toHaveLength(1)
+  expect(x.f.kv.get('lastRun')).toMatchObject({ ok: true })
 })
 
 test('两个平台按名额分配，历史带平台且共用总额度', async () => {
@@ -380,4 +383,136 @@ test('所有已登录平台均暂停时不写信', async () => {
   expect(x.requests).toHaveLength(0)
   expect(x.triggers).toHaveLength(0)
   expect(x.f.kv.get('diary')).toBeUndefined()
+})
+
+test('私信渠道静默生成正文并附链接，只记私信投递和实际正文', async () => {
+  const x = setup()
+  x.p.settings.shareVia = 'dm'
+  x.p.settings.ownerId = 'owner'
+  x.p.settings.shareDaily = 1
+  x.p.settings.connectionId = 'text-connection'
+  x.p.settings.model = 'text-model'
+  const sent: string[] = []
+  x.p.adapter.directMessages.mutual = async () => true
+  x.p.adapter.directMessages.send = async (peer, text) => {
+    expect(peer).toBe('owner')
+    expect(x.f.kv.get<{ entries: unknown[] }>('shares')?.entries).toHaveLength(1)
+    sent.push(text)
+  }
+  await runDay(x.p, now, () => 0)
+  expect(x.triggers).toEqual([])
+  const request = x.requests.find((r) => r.instruction.startsWith('Write a short direct message'))!
+  expect(request).toMatchObject({
+    chatId: 'home',
+    includeHistory: true,
+    connectionId: 'text-connection',
+    model: 'text-model',
+  })
+  expect(request.instruction).not.toContain('{{user}}')
+  expect(request.instruction).toContain('Do not include a link')
+  expect(request.instruction).toContain('Write in the same language as the conversation.')
+  expect(request.instruction).toContain('<raw_material>')
+  const entry = x.f.kv.get<HistoryItem[]>('history')!.find((e) => e.shared)!
+  expect(sent).toEqual([`private diary\n${entry.url}`])
+  expect(entry.delivered).toEqual([{ via: 'dm', ok: true, at: now }])
+  expect(x.f.kv.get('shares')).toMatchObject({ entries: [{ said: 'private diary' }] })
+})
+
+test('评论渠道只生成公开短评，不触发绑定会话，并记实际评论正文', async () => {
+  const x = setup()
+  x.p.settings.shareVia = 'comment'
+  x.p.settings.ownerId = 'owner'
+  x.p.settings.shareDaily = 1
+  const posts: string[] = []
+  x.p.adapter.lookup = async () => ({
+    id: 'id0',
+    title: 'video',
+    author: { id: 'a', name: 'a' },
+    url: 'url',
+    tags: [],
+    stats: { aid: 42 },
+    source: 'feed',
+  })
+  x.p.adapter.comments.post = async (_target, text, _signal, mention) => {
+    expect(mention?.id).toBe('owner')
+    posts.push(text)
+    return { id: 'comment' }
+  }
+  await runDay(x.p, now, () => 0)
+  expect(x.triggers).toEqual([])
+  expect(posts).toEqual(['private diary'])
+  expect(x.f.kv.get<HistoryItem[]>('history')!.find((e) => e.shared)?.delivered).toEqual([
+    { via: 'comment', ok: true, at: now, commentId: 'comment' },
+  ])
+  expect(x.f.kv.get('shares')).toMatchObject({ entries: [{ said: posts[0] }] })
+})
+
+for (const failure of ['ordinary', 'UNCERTAIN', 'empty', 'generation'] as const) {
+  test(`私信 ${failure}：确定失败撤账并停止本轮，结果不确定保留占账`, async () => {
+    const x = setup()
+    x.p.settings.shareVia = 'dm'
+    x.p.settings.ownerId = 'owner'
+    x.p.settings.deepReads = 0
+    x.p.adapter.directMessages.mutual = async () => true
+    let sends = 0
+    x.p.adapter.directMessages.send = async () => {
+      sends++
+      if (failure === 'UNCERTAIN') throw new TrafficError('unknown', 'UNCERTAIN')
+      throw new Error('failed')
+    }
+    const quiet = x.p.quietPrompt
+    let generations = 0
+    x.p.quietPrompt = async (opts) => {
+      if (opts.instruction.startsWith('Write a short direct message')) {
+        generations++
+        if (failure === 'empty') return '  '
+        if (failure === 'generation') throw new Error('generation failed')
+      }
+      return quiet(opts)
+    }
+    await runDay(x.p, now, () => 0)
+    const uncertain = failure === 'UNCERTAIN'
+    expect(x.triggers).toEqual([])
+    expect(generations).toBe(uncertain ? 3 : 1)
+    expect(sends).toBe(failure === 'empty' || failure === 'generation' ? 0 : uncertain ? 3 : 1)
+    expect(x.f.kv.get<{ entries: unknown[] }>('shares')?.entries).toHaveLength(uncertain ? 3 : 0)
+    expect(x.f.kv.get<HistoryItem[]>('history')!.filter((e) => e.shared)).toHaveLength(uncertain ? 3 : 0)
+    expect(x.notes[0]).toContain('分享投递失败')
+    expect(x.f.kv.get<DiaryEntry[]>('diary')?.some((e) => e.kind === 'letter')).toBe(true)
+  })
+}
+
+test('按条目所属平台选择渠道，全局 home 设置不覆盖抖音私信', async () => {
+  const x = setup(),
+    y = setup()
+  x.p.settings.shareVia = 'home'
+  x.p.settings.shareDaily = 2
+  x.p.settings.deepReads = 0
+  x.p.settings.maxVideos = 2
+  y.p.settings.shareVia = 'dm'
+  y.p.settings.ownerId = 'douyin-owner'
+  y.p.kv = x.p.kv
+  const discover = y.p.adapter.discover
+  y.p.adapter = {
+    ...y.p.adapter,
+    id: 'douyin',
+    discover: async (opts) =>
+      (await discover(opts)).map((e) => ({ ...e, id: `dy-${e.id}`, author: { id: `dy-${e.author.id}`, name: 'a' } })),
+  }
+  const sent: string[] = []
+  y.p.adapter.directMessages.mutual = async () => true
+  y.p.adapter.directMessages.send = async (peer, text) => {
+    expect(peer).toBe('douyin-owner')
+    sent.push(text)
+  }
+  x.p.platforms = () => [
+    { id: 'bilibili', ports: x.p },
+    { id: 'douyin', ports: y.p },
+  ]
+  await runDay(x.p, now, () => 0)
+  expect(x.triggers).toHaveLength(1)
+  expect(sent).toHaveLength(1)
+  const history = x.p.kv.get<HistoryItem[]>('history')!
+  expect(history.find((e) => e.app === 'douyin')?.delivered).toEqual([{ via: 'dm', ok: true, at: now }])
+  expect(history.find((e) => e.app === 'bilibili')?.delivered).toEqual([{ via: 'home', ok: true, at: now }])
 })

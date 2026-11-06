@@ -1,6 +1,15 @@
 import { expect, test } from 'bun:test'
 import { memory } from '../test-utils'
-import { loadShares, ownerSpoke, recordShare, resetShares, type ShareRecord, settleShares, shareState } from './share'
+import {
+  loadShares,
+  ownerSpoke,
+  recordShare,
+  resetShares,
+  type ShareRecord,
+  settleShares,
+  shareState,
+  unrecordShare,
+} from './share'
 import { defaults } from './state'
 
 const now = new Date(2026, 9, 29, 21).getTime()
@@ -74,4 +83,17 @@ test('结构损坏拒绝、旧ledger忽略、保留最多500条，重置只清�
   resetShares(kv)
   expect(loadShares(kv).entries).toHaveLength(0)
   expect(kv.get('ledger')).toBe('old')
+})
+
+test('撤账只移除指定作品和时刻，释放每日与作者名额', () => {
+  const kv = memory()
+  recordShare(kv, 'same', 'a', now - 1)
+  recordShare(kv, 'same', 'a', now)
+  recordShare(kv, 'other', 'b', now)
+  unrecordShare(kv, 'same', now)
+  expect(loadShares(kv).entries.map((e) => [e.itemId, e.at])).toEqual([
+    ['same', now - 1],
+    ['other', now],
+  ])
+  expect(shareState(kv, defaults, now).shares).toBe(2)
 })

@@ -1,4 +1,5 @@
 import type { AttachmentDTO, MessageMeta } from '../../../packages/shared/src'
+import { type OwnerCache, parseOwnerInput } from '../apps/douyin/owner'
 // 专属私信规则改编自 dsh-bili-whale/tools/commands/dm.mjs（MIT），见 NOTICE.md。
 import { t } from '../i18n'
 import { dayOf, inWindow } from './plan'
@@ -158,18 +159,7 @@ async function sendDmParts(
   signal?: AbortSignal,
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>,
 ) {
-  const d = dmOf(p.kv)
-  assertOwnerDm(peerId, p.settings.ownerId)
-  if (!p.loggedIn() || p.paused()) throw new Error(t('私信已暂停'))
-  if (d.lockedDate === dayOf(now) && d.lockedPeer !== peerId) throw new Error(t('今天已锁定其他私信收件人'))
-  if (!d.mutual || d.mutual.peerId !== peerId || now - d.mutual.at >= 6 * 3600000) {
-    d.mutual = { peerId: peerId, at: now, ok: await p.adapter.directMessages.mutual(peerId, signal) }
-    p.kv.set('dm', d)
-  }
-  if (!d.mutual.ok) throw new Error(t('私信需要双方互相关注'))
-  d.lockedDate = dayOf(now)
-  d.lockedPeer = peerId
-  p.kv.set('dm', d)
+  await prepareOwnerDm(p, peerId, now, signal)
   let retried = false
   for (const part of parts) {
     signal?.throwIfAborted()
@@ -185,4 +175,51 @@ async function sendDmParts(
       await p.adapter.directMessages.send(peerId, part, signal)
     }
   }
+}
+
+/** 卡片与文字共享主人校验和当日收件人锁，卡片本身不自动重试。 */
+export async function shareOwnerVideo(
+  p: Pick<DmPorts, 'kv' | 'settings' | 'adapter' | 'loggedIn' | 'paused'>,
+  peerId: string,
+  itemId: string,
+  now: number,
+  signal?: AbortSignal,
+) {
+  await prepareOwnerDm(p, peerId, now, signal)
+  signal?.throwIfAborted()
+  const share = p.adapter.directMessages.shareVideo
+  if (!share) throw new DmNotSentError(t('当前浏览器不支持原生视频分享'))
+  const owner = p.kv.get<OwnerCache>('douyin-owner')
+  const parsed = parseOwnerInput(p.settings.douyinOwnerId)
+  const searchTerms = [
+    ...new Set(
+      [
+        ...(parsed.kind === 'handle' ? [parsed.keyword] : []),
+        ...(owner?.secUid === peerId && owner.nickname ? [owner.nickname] : []),
+      ]
+        .map((term) => term.trim().slice(0, 30))
+        .filter(Boolean),
+    ),
+  ].slice(0, 2)
+  await share.call(p.adapter.directMessages, peerId, itemId, signal, { searchTerms })
+}
+
+async function prepareOwnerDm(
+  p: Pick<DmPorts, 'kv' | 'settings' | 'adapter' | 'loggedIn' | 'paused'>,
+  peerId: string,
+  now: number,
+  signal?: AbortSignal,
+) {
+  const d = dmOf(p.kv)
+  assertOwnerDm(peerId, p.settings.ownerId)
+  if (!p.loggedIn() || p.paused()) throw new Error(t('私信已暂停'))
+  if (d.lockedDate === dayOf(now) && d.lockedPeer !== peerId) throw new Error(t('今天已锁定其他私信收件人'))
+  if (!d.mutual || d.mutual.peerId !== peerId || now - d.mutual.at >= 6 * 3600000) {
+    d.mutual = { peerId: peerId, at: now, ok: await p.adapter.directMessages.mutual(peerId, signal) }
+    p.kv.set('dm', d)
+  }
+  if (!d.mutual.ok) throw new Error(t('私信需要双方互相关注'))
+  d.lockedDate = dayOf(now)
+  d.lockedPeer = peerId
+  p.kv.set('dm', d)
 }

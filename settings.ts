@@ -26,11 +26,12 @@ export function settingsSchema(): ExtensionSettingField[] {
   const shareVia = (key: 'shareVia' | 'douyinShareVia'): ExtensionSettingField => ({
     key,
     label: t('分享渠道'),
+    hint: t('每次只通过所选渠道分享；私信和评论区分享不会在绑定会话里发言'),
     type: 'select',
     options: [
       { value: 'home', label: t('绑定会话') },
-      { value: 'comment', label: t('评论区 @ 主人') },
-      { value: 'dm', label: t('私信给主人') },
+      { value: 'comment', label: t('评论区 @ 主人：只发评论') },
+      { value: 'dm', label: t('私信给主人：只发私信，不在绑定会话里说') },
     ],
   })
   // 交互开关单独成组：表单按三列排，和账号类设置混在一组会交错得很乱
@@ -129,7 +130,10 @@ export function settingsSchema(): ExtensionSettingField[] {
       ...string('douyinOwnerId', '主人抖音账号'),
       hint: t('填分享主页的链接（推荐）、主页链接、抖音号或 sec_uid，会自动换算'),
     },
-    { ...shareVia('douyinShareVia'), hint: t('评论区分享会按 sec_uid 自动查你的昵称并 @ 你') },
+    {
+      ...shareVia('douyinShareVia'),
+      hint: t('每次只通过所选渠道分享；私信和评论不在绑定会话里发言，评论区会按 sec_uid 自动查昵称并 @ 你'),
+    },
     ...tools('douyin'),
     heading('schedule', '作息'),
     {

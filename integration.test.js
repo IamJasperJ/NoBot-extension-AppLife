@@ -132,7 +132,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
       const character = createCharacter({ name: '她', description: 'A curious companion.' })
       const { createApiPreset } = await import('../../apps/server/src/services/connections')
       createApiPreset({ name: 'mock', baseUrl: model.url, model: 'mock-one', provider: 'openai', apiKey: 'test' })
-      registry.updateExtension('app-life', {
+      await registry.configureExtension('app-life', {
         approvePermissions: true,
         enabled: true,
         settings: {

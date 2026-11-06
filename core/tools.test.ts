@@ -4,7 +4,7 @@ import { draftsOf, todayCount } from './social'
 import { socialFixture } from './social-test-utils'
 import { defaults, scopedKv, settingsOf, toolsFor, watchedHistory } from './state'
 import { commentTarget, commentTool, homeToolPrompt, homeTools, prefer, shareTool, type ToolService } from './tools'
-import type { ContentItem } from './types'
+import { type ContentItem, TrafficError } from './types'
 
 const item: ContentItem = {
   id: 'BV1',
@@ -107,6 +107,9 @@ test('分享调用现有投递流程并保存成功或失败结果', async () =>
       }
     expect(await shareTool(x.p, 'BV1', '给你看', 100)).toContain(fail ? 'failed' : '成功')
     expect(watchedHistory(x.p.kv)[0]?.delivered?.at(-1)?.ok).toBe(!fail)
+    expect(watchedHistory(x.p.kv)[0]?.shared).toBe(!fail)
+    expect(x.p.kv.get<{ entries: unknown[] }>('shares')?.entries).toHaveLength(fail ? 0 : 1)
+    if (!fail) expect(x.p.kv.get('shares')).toMatchObject({ entries: [{ said: '公开回复' }] })
   }
 })
 test('草稿内容、原文、唯一 id、每日上限与平台计数隔离', async () => {
@@ -261,4 +264,21 @@ test('家工具提示只列实际工具，评论与分享说明按开关出现',
   x.svc.s.douyinToolBrowse = true
   x.svc.loggedIn = () => false
   expect(homeToolPrompt(x.svc)).toBe('')
+})
+
+test('分享工具私信确定失败释放名额、允许下次重试；UNCERTAIN 保留去重记录', async () => {
+  for (const uncertain of [false, true]) {
+    const x = setup()
+    x.p.settings.shareVia = 'dm'
+    x.p.adapter.directMessages.mutual = async () => true
+    x.p.adapter.directMessages.send = async () => {
+      if (uncertain) throw new TrafficError('unknown', 'UNCERTAIN')
+      throw new Error('failed')
+    }
+    await shareTool(x.p, 'BV1', '给你看', 100)
+    expect(x.p.kv.get<{ entries: unknown[] }>('shares')?.entries).toHaveLength(uncertain ? 1 : 0)
+    expect(watchedHistory(x.p.kv)[0]?.shared).toBe(uncertain)
+    x.p.adapter.directMessages.send = async () => {}
+    expect(await shareTool(x.p, 'BV1', '给你看', 101)).toContain(uncertain ? '已经分享' : '成功')
+  }
 })

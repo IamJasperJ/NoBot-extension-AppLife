@@ -1,30 +1,78 @@
 import { t } from '../i18n'
 import type { DayPorts } from './day'
-import { sendOwnerDm } from './dm'
+import { sendOwnerDm, shareOwnerVideo } from './dm'
 import { GATE_TTL, gateKey, runGate } from './gate'
 import { COMMENT_SHARE_PROMPT } from './prompts'
 import { activity, errorText, publicText } from './social'
 import type { HistoryItem } from './state'
-export async function deliver(p: DayPorts, item: HistoryItem, text: string, now: number, signal?: AbortSignal) {
+import { DmNotSentError, TrafficError } from './types'
+
+export type DeliveryResult = { status: 'sent'; text: string } | { status: 'failed' | 'uncertain' }
+/** 私信正文延迟到投递时生成，评论渠道完全不调用私信生成器，生成失败也返回明确状态。 */
+export async function deliver(
+  p: DayPorts,
+  item: HistoryItem,
+  text: string | (() => Promise<string>),
+  now: number,
+  signal?: AbortSignal,
+): Promise<DeliveryResult> {
   const s = p.settings,
     via = s.shareVia
-  if (!s.shareEnabled || via === 'home') return
+  if (!s.shareEnabled || via === 'home') return { status: 'failed' }
   try {
     if (via === 'dm') {
-      await sendOwnerDm(
-        {
-          ...p,
-          paused: () => {
-            const traffic = p.guard.status()
-            return !!(traffic.manual.length || (traffic.pausedUntil && traffic.pausedUntil > now))
-          },
-          displayText: p.displayText,
+      text = (typeof text === 'function' ? await text() : text).trim()
+      if (!text) throw new Error(t('模型未生成有效回复'))
+      const dmPorts = {
+        ...p,
+        paused: () => {
+          const traffic = p.guard.status()
+          return !!(traffic.manual.length || (traffic.pausedUntil && traffic.pausedUntil > now))
         },
-        s.ownerId,
-        `${text}\n${item.url}`,
-        now,
-        signal,
-      )
+        displayText: p.displayText,
+      }
+      let card = false
+      let uncertain = false
+      if (p.adapter.directMessages.shareVideo) {
+        try {
+          await shareOwnerVideo(dmPorts, s.ownerId, item.id, now, signal)
+          card = true
+        } catch (error) {
+          if (error instanceof TrafficError && error.code === 'UNCERTAIN') {
+            card = true
+            uncertain = true
+          } else if (!(error instanceof DmNotSentError)) throw error
+          p.log(error)
+          activity(p, {
+            at: now,
+            kind: 'dm-share',
+            ok: card,
+            title: item.title,
+            text: '',
+            url: item.url,
+            error: card
+              ? t('视频卡片结果不确定，已停止补发：{reason}', { reason: errorText(error) })
+              : t('视频卡片未发送，回退文字链接：{reason}', { reason: errorText(error) }),
+          })
+        }
+      }
+      if (!uncertain) {
+        try {
+          await sendOwnerDm(dmPorts, s.ownerId, card ? text : `${text}\n${item.url}`, now, signal)
+        } catch (error) {
+          if (!card) throw error
+          p.log(error)
+          activity(p, {
+            at: now,
+            kind: 'dm-share',
+            ok: false,
+            title: item.title,
+            text,
+            url: item.url,
+            error: t('视频卡片已分享，补充文字发送失败：{reason}', { reason: errorText(error) }),
+          })
+        }
+      }
     } else {
       if (s.aiCommentGuard) {
         const gate = await runGate(p, item, now, signal)
@@ -45,7 +93,7 @@ export async function deliver(p: DayPorts, item: HistoryItem, text: string, now:
             p.kv.set(key, now)
           }
           item.delivered?.push({ via, ok: false, at: now, error: gate.reason })
-          return
+          return { status: 'failed' }
         }
       }
       const comment = await publicText(
@@ -74,10 +122,11 @@ export async function deliver(p: DayPorts, item: HistoryItem, text: string, now:
       )
       item.delivered?.push({ via, ok: true, at: now, commentId: result.id })
       activity(p, { at: now, kind: 'comment-share', ok: true, title: item.title, text: comment, url: item.url })
-      return
+      return { status: 'sent', text: comment }
     }
     item.delivered?.push({ via, ok: true, at: now })
     activity(p, { at: now, kind: 'dm-share', ok: true, title: item.title, text, url: item.url })
+    return { status: 'sent', text }
   } catch (error) {
     p.log(error)
     const message = errorText(error)
@@ -92,5 +141,6 @@ export async function deliver(p: DayPorts, item: HistoryItem, text: string, now:
       error: message,
     })
     p.note(await p.home(), t('分享投递失败：{title}\n{reason}', { title: item.title, reason: message }))
+    return { status: error instanceof TrafficError && error.code === 'UNCERTAIN' ? 'uncertain' : 'failed' }
   }
 }

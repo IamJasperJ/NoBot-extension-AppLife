@@ -185,3 +185,20 @@ test('周记在近三天之后注入、先裁最旧周记、关闭不注入并�
   expect(settingsOf({ memoryWeeks: 99 }).memoryWeeks).toBe(8)
   expect(settingsOf({ memoryWeeks: -1 }).memoryWeeks).toBe(0)
 })
+
+test('近期已分享记录注明实际渠道，设置更改不影响旧分享，失败不标渠道', () => {
+  const kv = memory()
+  kv.set('history', [
+    item('dm', now, { shared: true, delivered: [{ via: 'dm', ok: true, at: now }] }),
+    item('comment', now, { shared: true, delivered: [{ via: 'comment', ok: true, at: now }] }),
+    item('home', now, { shared: true, delivered: [{ via: 'home', ok: true, at: now }] }),
+    item('failed', now, { delivered: [{ via: 'dm', ok: false, at: now }] }),
+    item('uncertain', now, { shared: true, delivered: [{ via: 'dm', ok: false, at: now, error: 'unknown' }] }),
+  ])
+  const rows = payload(lifeMemory(kv, { ...defaults, shareVia: 'home', memoryChars: 6000 }, 'bilibili', now)).recent!
+  expect(rows[0]).toHaveProperty('share_channel', 'shared via direct message')
+  expect(rows[1]).toHaveProperty('share_channel', 'shared in the comments')
+  expect(rows[2]).toHaveProperty('share_channel', 'shared in the bound conversation')
+  expect(rows[3]).not.toHaveProperty('share_channel')
+  expect(rows[4]).toHaveProperty('share_channel', 'shared via direct message')
+})

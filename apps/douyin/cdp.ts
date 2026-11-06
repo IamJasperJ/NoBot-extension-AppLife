@@ -52,7 +52,13 @@ window.chrome = window.chrome || { runtime: {} };
 
 /** 一条到页面的 CDP 连接。 */
 export interface CdpTransport {
-  send(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>>
+  send(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    options?: { retryOnDetach?: boolean },
+  ): Promise<Record<string, unknown>>
+  readonly reattachVersion?: number
   on(method: string, fn: Listener): () => void
   readonly closed: boolean
 }
@@ -209,6 +215,7 @@ export class NavigationTimeoutError extends Error {
 /** BrowserPage 的 CDP 实现（只实现适配器用到的部分）。 */
 export class CdpPage implements BrowserPage {
   private current = 'about:blank'
+  private mousePosition = { x: 0, y: 0 }
   private responseListeners = new Set<(r: Response) => void>()
   constructor(
     private c: CdpTransport,
@@ -239,6 +246,42 @@ export class CdpPage implements BrowserPage {
       for (const fn of this.responseListeners) fn(response)
     })
   }
+  readonly mouse = {
+    move: async (x: number, y: number, opts: { steps?: number } = {}) => {
+      const start = this.mousePosition
+      const steps = Math.max(1, Math.floor(opts.steps ?? 1))
+      for (let i = 1; i <= steps; i++) {
+        const point =
+          i === steps
+            ? { x, y }
+            : { x: start.x + ((x - start.x) * i) / steps, y: start.y + ((y - start.y) * i) / steps }
+        await this.c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point, button: 'none', buttons: 0 })
+        this.mousePosition = point
+      }
+    },
+    click: async (x: number, y: number) => {
+      // 沿当前位置移入面板并留出悬停时间，让页面收到完整的鼠标交互。
+      await this.mouse.move(x, y, { steps: 8 })
+      await this.waitForTimeout(80)
+      await this.c.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x,
+        y,
+        button: 'left',
+        buttons: 1,
+        clickCount: 1,
+      })
+      await this.waitForTimeout(60)
+      await this.c.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x,
+        y,
+        button: 'left',
+        buttons: 0,
+        clickCount: 1,
+      })
+    },
+  }
   get backend() {
     return this.opts.backend ?? 'headless'
   }
@@ -256,10 +299,11 @@ export class CdpPage implements BrowserPage {
     return this.current
   }
   async refreshUrl() {
-    this.current = await this.evaluate(() => location.href, null)
+    this.current = await this.evaluate(() => location.href, null, { readonly: true })
     return this.current
   }
   async goto(url: string, opts: { waitUntil?: 'load' | 'domcontentloaded'; timeout?: number } = {}) {
+    const version = this.c.reattachVersion
     const event = opts.waitUntil === 'load' ? 'Page.loadEventFired' : 'Page.domContentEventFired'
     let off = () => {}
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -278,7 +322,23 @@ export class CdpPage implements BrowserPage {
     try {
       const result = await this.c.send('Page.navigate', { url })
       if (result.errorText) throw new Error(t('页面打开失败：{reason}', { reason: String(result.errorText) }))
-      await loaded
+      const ready = async () => {
+        const state = await this.evaluate(() => ({ ready: document.readyState, href: location.href }), null, {
+          readonly: true,
+        })
+        if (!state || !['interactive', 'complete'].includes(state.ready) || typeof state.href !== 'string') return false
+        if (new URL(state.href).href !== new URL(url).href) return false
+        this.current = state.href
+        return true
+      }
+      // 换进程后加载事件可能早于重新订阅；以新文档的地址和就绪状态补证。
+      if (version === this.c.reattachVersion || !(await ready())) {
+        try {
+          await loaded
+        } catch (error) {
+          if (!(error instanceof NavigationTimeoutError) || !(await ready())) throw error
+        }
+      }
       this.current = url
       await this.checkCaptcha()
     } finally {
@@ -286,7 +346,7 @@ export class CdpPage implements BrowserPage {
       off()
     }
   }
-  async evaluate<R, A>(fn: (arg: A) => R | Promise<R>, arg: A): Promise<R> {
+  async evaluate<R, A>(fn: (arg: A) => R | Promise<R>, arg: A, opts: { readonly?: boolean } = {}): Promise<R> {
     // 函数源码 + 参数 JSON 拼成表达式在页面里执行；函数不能引用外部变量
     await this.checkCaptcha()
     let result: Record<string, unknown>
@@ -299,6 +359,7 @@ export class CdpPage implements BrowserPage {
           returnByValue: true,
         },
         90000,
+        { retryOnDetach: opts.readonly === true },
       )
     } catch (error) {
       if (error instanceof CommandTimeoutError) {
@@ -331,6 +392,7 @@ export class CdpPage implements BrowserPage {
           returnByValue: true,
         },
         5000,
+        { retryOnDetach: true },
       )
       visible = !result.exceptionDetails && (result.result as { value?: unknown } | undefined)?.value === true
     } catch {

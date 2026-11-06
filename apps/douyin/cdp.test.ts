@@ -929,3 +929,78 @@ test('手动重开等待后台任务，后续截图使用替换后的页面', as
     await f.close()
   }
 })
+
+test('卡片鼠标能力使用 CSS 坐标和 CDP 真实左键事件，两个后端一致', async () => {
+  for (const backend of ['chrome', 'headless'] as const) {
+    const f = setup()
+    const page = new CdpPage(f.conn, { backend })
+    const waits = spyOn(page, 'waitForTimeout').mockImplementation(async (ms) => {
+      f.actions.push(`wait:${ms}`)
+    })
+    try {
+      await page.mouse.move(12.5, 34.5)
+      await page.mouse.click(56, 78)
+      expect(f.sends).toEqual([
+        {
+          method: 'Input.dispatchMouseEvent',
+          params: { type: 'mouseMoved', x: 12.5, y: 34.5, button: 'none', buttons: 0 },
+        },
+        ...Array.from({ length: 8 }, (_, i) => ({
+          method: 'Input.dispatchMouseEvent',
+          params: {
+            type: 'mouseMoved',
+            x: 12.5 + ((56 - 12.5) * (i + 1)) / 8,
+            y: 34.5 + ((78 - 34.5) * (i + 1)) / 8,
+            button: 'none',
+            buttons: 0,
+          },
+        })),
+        {
+          method: 'Input.dispatchMouseEvent',
+          params: { type: 'mousePressed', x: 56, y: 78, button: 'left', buttons: 1, clickCount: 1 },
+        },
+        {
+          method: 'Input.dispatchMouseEvent',
+          params: { type: 'mouseReleased', x: 56, y: 78, button: 'left', buttons: 0, clickCount: 1 },
+        },
+      ])
+      expect(f.actions).toEqual([
+        ...Array.from({ length: 9 }, () => 'Input.dispatchMouseEvent'),
+        'wait:80',
+        'Input.dispatchMouseEvent',
+        'wait:60',
+        'Input.dispatchMouseEvent',
+      ])
+      f.sends.length = 0
+      await page.mouse.move(60, 70, { steps: 2 })
+      expect(f.sends.map((call) => [call.params.x, call.params.y])).toEqual([
+        [58, 74],
+        [60, 70],
+      ])
+    } finally {
+      waits.mockRestore()
+    }
+  }
+})
+
+test('鼠标从初始位置逐步移动，后续移动从上次终点插值', async () => {
+  const f = setup()
+  const page = new CdpPage(f.conn)
+  await page.mouse.move(12, 8, { steps: 4 })
+  await page.mouse.move(4, 12, { steps: 2 })
+  await page.mouse.move(1.5, 2.5)
+  expect(f.sends).toEqual(
+    [
+      [3, 2],
+      [6, 4],
+      [9, 6],
+      [12, 8],
+      [8, 10],
+      [4, 12],
+      [1.5, 2.5],
+    ].map(([x, y]) => ({
+      method: 'Input.dispatchMouseEvent',
+      params: { type: 'mouseMoved', x, y, button: 'none', buttons: 0 },
+    })),
+  )
+})

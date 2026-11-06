@@ -14,10 +14,15 @@ export class ExtensionSession implements BrowserSession {
   private page?: CdpPage
   private transport?: CdpTransport
   private generation = 0
+  private needsAttach = false
+  private detachVersion = 0
+  private attachCount = 0
+  private lastDisconnect?: { event: string; reason?: string; code?: string | number; at: number }
   private subscriptions: (() => void)[] = []
   private clearPage() {
     for (const off of this.subscriptions) off()
     this.subscriptions = []
+    this.needsAttach = false
     this.page = undefined
     this.transport = undefined
   }
@@ -31,10 +36,27 @@ export class ExtensionSession implements BrowserSession {
         event.event === 'disconnected' ||
         (event.key === this.key && ['tab.closed', 'tab.blocked', 'cdp.detached'].includes(String(event.event)))
       ) {
-        this.generation++
-        this.clearPage()
+        this.lastDisconnect = {
+          event: String(event.event),
+          ...(typeof event.reason === 'string' ? { reason: event.reason } : {}),
+          ...(typeof event.code === 'string' || typeof event.code === 'number' ? { code: event.code } : {}),
+          at: Date.now(),
+        }
+        console.warn(`[app-life/chrome/disconnect] ${JSON.stringify({ key: this.key, ...this.lastDisconnect })}`)
+        if (event.event === 'cdp.detached' && event.reason === 'target_closed' && this.transport) {
+          this.needsAttach = true
+          this.detachVersion++
+        } else {
+          this.generation++
+          this.clearPage()
+        }
       }
     })
+  }
+  private disconnectedError() {
+    const last = this.lastDisconnect
+    const reason = [last?.event, last?.reason, last?.code].filter((value) => value !== undefined).join(': ')
+    return new BrowserSkippedError(t('Chrome 调试已断开（{reason}），本轮已跳过', { reason }), false)
   }
   private get key() {
     return this.opts.key ?? 'douyin'
@@ -70,18 +92,91 @@ export class ExtensionSession implements BrowserSession {
     const bridge = this.bridge
     const key = this.key
     const current = () => this.generation === generation
+    let attaching: Promise<void> | undefined
+    const ensureAttached = async () => {
+      if (!current()) throw this.disconnectedError()
+      if (attaching) return attaching
+      if (!this.needsAttach) return
+      attaching = (async () => {
+        try {
+          if (++this.attachCount > 3) throw new Error(t('Chrome 自动重新附加次数已达上限'))
+          // 直接初始化协议域，避免通过 transport.send 再次等待自身。
+          while (this.needsAttach) {
+            const version = this.detachVersion
+            await bridge.request('cdp.attach', { key })
+            for (const method of ['Page.enable', 'Network.enable', 'Runtime.enable']) {
+              if (!current()) throw this.disconnectedError()
+              await bridge.request('cdp.send', { key, method, params: {} })
+            }
+            if (!current()) throw this.disconnectedError()
+            if (version !== this.detachVersion) {
+              if (++this.attachCount > 3) throw new Error(t('Chrome 自动重新附加次数已达上限'))
+              continue
+            }
+            this.needsAttach = false
+          }
+          console.info(
+            `[app-life/chrome/reattach] ${JSON.stringify({ key, status: 'success', attempt: this.attachCount })}`,
+          )
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          console.warn(
+            `[app-life/chrome/reattach] ${JSON.stringify({ key, status: 'failed', attempt: this.attachCount, reason })}`,
+          )
+          if (current()) {
+            this.lastDisconnect = { ...this.lastDisconnect, event: 'cdp.reattach', reason, at: Date.now() }
+            this.generation++
+            this.clearPage()
+          }
+          throw this.disconnectedError()
+        }
+      })()
+      try {
+        await attaching
+      } finally {
+        attaching = undefined
+      }
+    }
+    const session = this
     const transport: CdpTransport = {
       get closed() {
         return !current() || !bridge.status().online
       },
-      send: (method, params = {}, timeoutMs) => {
-        // 用户取消调试后本轮停止；下一次 run 才可重新附加。
-        if (!current()) return Promise.reject(new BrowserSkippedError(t('Chrome 调试已取消，本轮已跳过'), false))
-        return bridge.request('cdp.send', { key, method, params }, timeoutMs).catch((error: unknown) => {
+      get reattachVersion() {
+        return session.detachVersion
+      },
+      send: async (method, params = {}, timeoutMs, options) => {
+        await ensureAttached()
+        if (!current()) throw this.disconnectedError()
+        const version = this.detachVersion
+        try {
+          const result = await bridge.request('cdp.send', { key, method, params }, timeoutMs)
+          if (!current()) throw this.disconnectedError()
+          return result
+        } catch (error: unknown) {
+          if (!current()) throw this.disconnectedError()
+          const retry =
+            method.startsWith('Page.') ||
+            ['Network.getCookies', 'Network.enable', 'Runtime.enable'].includes(method) ||
+            (method === 'Runtime.evaluate' && options?.retryOnDetach === true)
+          if (version !== this.detachVersion) {
+            if (!retry) throw this.disconnectedError()
+            await ensureAttached()
+            // 每条命令只重做一次；第二次断开留给下一条命令恢复。
+            try {
+              const result = await bridge.request('cdp.send', { key, method, params }, timeoutMs)
+              if (!current()) throw this.disconnectedError()
+              return result
+            } catch (retryError) {
+              if (!current() || this.needsAttach) throw this.disconnectedError()
+              if (retryError instanceof BrowserSkippedError) throw new BrowserSkippedError(retryError.message, false)
+              throw retryError
+            }
+          }
           // run 已开始后可能有先前写操作；此时断线不能再声明整轮没有交付。
           if (error instanceof BrowserSkippedError) throw new BrowserSkippedError(error.message, false)
           throw error
-        })
+        }
       },
       on: (method, fn) => {
         const off = bridge.on((event) => {
@@ -104,7 +199,17 @@ export class ExtensionSession implements BrowserSession {
       signal?.throwIfAborted()
       clearTimeout(this.idle)
       try {
-        return await fn(await this.ready())
+        this.attachCount = 0
+        const page = await this.ready()
+        const generation = this.generation
+        try {
+          const result = await fn(page)
+          if (generation !== this.generation) throw this.disconnectedError()
+          return result
+        } catch (error) {
+          if (generation !== this.generation) throw this.disconnectedError()
+          throw error
+        }
       } catch (error) {
         if (error instanceof CaptchaError) await this.verification()
         throw error

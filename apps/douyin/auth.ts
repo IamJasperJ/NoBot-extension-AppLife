@@ -144,7 +144,7 @@ export function createLogin(
     return { credentials, account }
   }
   async function verification() {
-    const state = await browser.run((page) => page.evaluate(verificationScript, null))
+    const state = await browser.run((page) => page.evaluate(verificationScript, null, { readonly: true }))
     if (state.step && current && !current.extended) {
       current.expiresAt = deps.runtime.now() + 600000
       current.extended = true
@@ -204,7 +204,7 @@ export function createLogin(
           throw result.error
         const text = result.response
           ? await result.response.text()
-          : await page.evaluate(qrScript, null).catch(() => '')
+          : await page.evaluate(qrScript, null, { readonly: true }).catch(() => '')
         let response: Record<string, unknown>
         try {
           response = obj(parseJson(text))

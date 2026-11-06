@@ -3,7 +3,7 @@ import { t } from '../i18n'
 import { deliver } from './deliver'
 import type { Preference, Preferences } from './prefs'
 import { digestMaterial, rawMaterial } from './prompts'
-import { attachSaid, loadShares, recordShare, shareState } from './share'
+import { attachSaid, loadShares, recordShare, shareState, unrecordShare } from './share'
 import { activity, countAttempt, draftsOf, errorText, type SocialPorts, todayCount } from './social'
 import {
   type DiaryEntry,
@@ -85,7 +85,6 @@ export async function shareTool(p: SocialPorts, input: unknown, value: unknown, 
   if (loadShares(p.kv).entries.some((e) => e.itemId === item.id)) return t('这个作品已经分享过了')
   writable(p)
   recordShare(p.kv, item.id, item.author.id, now)
-  attachSaid(p.kv, item.id, text)
   const history = watchedHistory(p.kv).find((e) => e.id === item.id)
   const entry = {
     ...(history ?? manualItem(item, p.adapter.id, now)),
@@ -94,8 +93,14 @@ export async function shareTool(p: SocialPorts, input: unknown, value: unknown, 
     delivered: history?.delivered ?? [],
   }
   remember(p.kv, entry)
-  if (p.settings.shareVia === 'home') return t('你正在和主人聊天，直接在回复里分享即可')
-  await deliver(p, entry, text, now, signal)
+  if (p.settings.shareVia === 'home') {
+    attachSaid(p.kv, item.id, text)
+    return t('你正在和主人聊天，直接在回复里分享即可')
+  }
+  const delivery = await deliver(p, entry, text, now, signal)
+  entry.shared = delivery.status !== 'failed'
+  if (delivery.status === 'failed') unrecordShare(p.kv, item.id, now)
+  if (delivery.status === 'sent') attachSaid(p.kv, item.id, delivery.text)
   remember(p.kv, entry)
   const result = entry.delivered.at(-1)
   return result?.ok ? t('分享投递成功') : t('分享投递失败：{reason}', { reason: result?.error ?? t('未知错误') })

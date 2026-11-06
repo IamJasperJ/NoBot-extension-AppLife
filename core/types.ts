@@ -271,12 +271,16 @@ export interface AdapterDeps {
  * 只声明用到的方法，测试里可以用假对象替换，也不让核心代码依赖 playwright 的类型。
  */
 export interface BrowserPage {
+  mouse?: {
+    move(x: number, y: number, opts?: { steps?: number }): Promise<void>
+    click(x: number, y: number): Promise<void>
+  }
   readonly backend?: BrowserBackend
   url(): string
   /** 读取页面实际地址并同步本地导航缓存。 */
   refreshUrl?(): Promise<string>
   goto(url: string, opts?: { waitUntil?: 'load' | 'domcontentloaded'; timeout?: number }): Promise<unknown>
-  evaluate<R, A>(fn: (arg: A) => R | Promise<R>, arg: A): Promise<R>
+  evaluate<R, A>(fn: (arg: A) => R | Promise<R>, arg: A, opts?: { readonly?: boolean }): Promise<R>
   waitForTimeout(ms: number): Promise<void>
   waitForResponse(
     match: (response: { url(): string }) => boolean,
@@ -369,6 +373,7 @@ export interface AppAdapter {
     ): Promise<DirectMessage[]>
     captureImages?(peerId: string, message: DirectMessage, signal?: AbortSignal): Promise<Uint8Array[]>
     send(peerId: string, text: string, signal?: AbortSignal): Promise<void>
+    shareVideo?(peerId: string, itemId: string, signal?: AbortSignal, opts?: { searchTerms?: string[] }): Promise<void>
     /** 双方是否互相关注（B 站私信专线的硬性前提） */
     mutual(peerId: string, signal?: AbortSignal): Promise<boolean>
   }

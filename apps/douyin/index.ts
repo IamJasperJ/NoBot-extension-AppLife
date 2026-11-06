@@ -330,6 +330,30 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
           throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(obj(payload).status_msg) }))
         api.ensure(response, payload)
       },
+      async shareVideo(peerId, itemId, signal, opts) {
+        const response = await deps.guardedFetch(`${BASE}/__ui/im/share`, {
+          method: 'POST',
+          // 明确未发送的补发仍等待保护层冷却，不绕过预算或去重。
+          waitWriteMs: 180000,
+          headers: { cookie: cookieHeader(deps.credentials()), 'content-type': 'application/json' },
+          body: JSON.stringify({ peer: peerId, itemId, searchTerms: opts?.searchTerms }),
+          signal,
+        })
+        const payload = await response
+          .text()
+          .then(parseJson)
+          .catch(() => undefined)
+        if (payload && typeof payload === 'object' && !('status_code' in payload))
+          throw new TrafficError(
+            t('私信可能已发出但无法确认（{reason}），已禁止自动重发，请到抖音里看一眼', {
+              reason: str(obj(payload).status_msg),
+            }),
+            'UNCERTAIN',
+          )
+        if (obj(payload).status_code === UI_CODES.FAILED)
+          throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(obj(payload).status_msg) }))
+        api.ensure(response, payload)
+      },
       // 抖音不强制互关才能私信；会话列表里没有主人时由页面操作报错
       mutual: async () => true,
     },

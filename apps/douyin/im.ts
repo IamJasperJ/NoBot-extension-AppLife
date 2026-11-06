@@ -7,7 +7,7 @@
  *   - CDP 的鼠标 / 键盘事件在这个页面上点不动、回车不发送，统一在页面内 dispatchEvent
  *   - 发送前核对输入框里正好是这段正文，发送后回读「我发的」条数增加才算成功
  */
-import type { BrowserPage } from '../../core/types'
+import { type BrowserPage, BrowserSkippedError } from '../../core/types'
 import { t } from '../../i18n'
 import { NavigationTimeoutError } from './cdp'
 import { CaptchaError } from './risk'
@@ -189,7 +189,7 @@ export async function captureMessageImages(page: BrowserPage, sid: string, count
   for (let index = 0; index < Math.min(4, count); index++) {
     try {
       if (page.backend === 'chrome') {
-        const base64 = await page.evaluate(imageBytesScript, { sid, index }).catch(() => '')
+        const base64 = await page.evaluate(imageBytesScript, { sid, index }, { readonly: true }).catch(() => '')
         if (base64) {
           const bytes = new Uint8Array(Buffer.from(base64, 'base64'))
           if (bytes.length && bytes.length <= 5 * 1024 * 1024) {
@@ -200,7 +200,7 @@ export async function captureMessageImages(page: BrowserPage, sid: string, count
       }
       await page.evaluate(imageRectScript, { sid, index, scroll: true })
       await page.waitForTimeout(200)
-      const clip = await page.evaluate(imageRectScript, { sid, index, scroll: false })
+      const clip = await page.evaluate(imageRectScript, { sid, index, scroll: false }, { readonly: true })
       if (!clip) continue
       // 内置 CdpPage 的截图方法目前只支持整页，因此在这里复用连接，严格限制截图范围。
       const cdp = (page as unknown as { c?: { send(method: string, params: unknown): Promise<{ data?: unknown }> } }).c
@@ -367,21 +367,23 @@ export async function openConversation(page: BrowserPage, secUid: string): Promi
     } catch (error) {
       if (!(error instanceof NavigationTimeoutError)) throw error
       // Chrome 可能漏报加载事件；只在实际地址正确时继续等待会话列表。
-      const href = page.refreshUrl ? await page.refreshUrl() : await page.evaluate(() => location.href, null)
+      const href = page.refreshUrl
+        ? await page.refreshUrl()
+        : await page.evaluate(() => location.href, null, { readonly: true })
       const url = new URL(href)
       if (url.origin !== 'https://www.douyin.com' || url.pathname !== '/chat') throw error
     }
     await sleep(page, 3000)
   }
-  if (await page.evaluate(blockedScript, null)) return { status: 'verify' }
-  if (await page.evaluate(hasEditorScript, null)) {
-    if ((await page.evaluate(currentScript, null)) === secUid) return { status: 'open' }
+  if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify' }
+  if (await page.evaluate(hasEditorScript, null, { readonly: true })) {
+    if ((await page.evaluate(currentScript, null, { readonly: true })) === secUid) return { status: 'open' }
   }
   let list: ReturnType<typeof listScript> = []
   for (let i = 0; i < 20 && !list.length; i++) {
-    list = await page.evaluate(listScript, null)
+    list = await page.evaluate(listScript, null, { readonly: true })
     if (!list.length) {
-      if (await page.evaluate(loginScript, null)) return { status: 'login' }
+      if (await page.evaluate(loginScript, null, { readonly: true })) return { status: 'login' }
       await sleep(page, 750)
     }
   }
@@ -391,17 +393,17 @@ export async function openConversation(page: BrowserPage, secUid: string): Promi
   await page.evaluate(clickScript, { x: hits[0]!.x, y: hits[0]!.y })
   for (let i = 0; i < 24; i++) {
     await sleep(page, 500)
-    if (await page.evaluate(hasEditorScript, null)) break
+    if (await page.evaluate(hasEditorScript, null, { readonly: true })) break
   }
   await sleep(page, 600)
-  const current = await page.evaluate(currentScript, null)
+  const current = await page.evaluate(currentScript, null, { readonly: true })
   if (current !== secUid) return { status: 'failed', reason: '打开的会话对端不是主人，已中止' }
   return { status: 'open' }
 }
 export async function readConversation(page: BrowserPage, secUid: string) {
   const opened = await openConversation(page, secUid)
   if (opened.status !== 'open') return opened
-  return { status: 'open' as const, messages: attribute(await page.evaluate(readScript, null)) }
+  return { status: 'open' as const, messages: attribute(await page.evaluate(readScript, null, { readonly: true })) }
 }
 export async function sendMessage(
   page: BrowserPage,
@@ -415,13 +417,13 @@ export async function sendMessage(
   const want = norm(text)
   const mine = (rows: ChatMessage[]) =>
     rows.filter((m) => m.from === 'me' && (norm(m.text) === want || norm(m.text).startsWith(want.slice(0, 20))))
-  const before = mine(attribute(await page.evaluate(readScript, null)))
+  const before = mine(attribute(await page.evaluate(readScript, null, { readonly: true })))
   if (!(await page.evaluate(focusScript, null))) return { status: 'not-sent', reason: '输入框拿不到焦点' }
   await sleep(page, 200)
   await page.keyboard.insertText(text)
   await sleep(page, 800)
   // 框里不是这段正文（旧残文、没输进去）就绝不按回车
-  if (norm(await page.evaluate(typedScript, null)) !== want)
+  if (norm(await page.evaluate(typedScript, null, { readonly: true })) !== want)
     return { status: 'not-sent', reason: '输入框里的正文和要发的不一致' }
   // 从这里开始可能已经发出去了：后面任何失败都只能算「不确定」，由人核查
   try {
@@ -445,4 +447,315 @@ export async function sendMessage(
     }
     return { status: 'uncertain', reason: error instanceof Error ? error.message : String(error) }
   }
+}
+
+export type ShareResult =
+  | { status: 'sent'; confirmedBy: 'button' | 'readback' | 'readback-reattach' }
+  | { status: 'not-sent' | 'uncertain'; reason: string; disconnected?: boolean }
+  | { status: 'login' }
+  | { status: 'verify' }
+
+/** 视频分享需要真实鼠标悬停；零尺寸的同组入口不能用于定位。 */
+const shareIconScript = (align: boolean) => {
+  const el = document.querySelector<HTMLElement>('[data-e2e="video-share-icon-container"]')
+  if (!el) return null
+  if (align) {
+    el.scrollIntoView({ block: 'end' })
+    const r = el.getBoundingClientRect()
+    // 面板向上弹出，按钮下方只留少量空间，把视口高度让给联系人列表。
+    window.scrollBy(0, r.bottom - (innerHeight - 40))
+  }
+  const r = el.getBoundingClientRect()
+  if (r.width <= 0 || r.height <= 0) return null
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+}
+
+/** 每次重新按 sec_uid 找联系人，避免重名、排序变化或 React 重建节点导致误发。 */
+const sharePanelScript = (secUid: string) => {
+  const text = (el: Element) => (el.textContent || '').replace(/\s+/g, '')
+  const visible = (el: Element) => {
+    const r = el.getBoundingClientRect()
+    const style = getComputedStyle(el)
+    return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+  }
+  const title = Array.from(document.querySelectorAll('*')).find(
+    (el) => !el.children.length && text(el) === '分享给朋友' && visible(el),
+  )
+  if (!title) return { panel: false, loaded: false, owner: 'missing' as const, top: 0, bottom: 0, button: null }
+  let root = title.parentElement
+  while (
+    root &&
+    !root.querySelector('input[placeholder="搜索"]') &&
+    !Array.from(root.querySelectorAll('*')).some((el) => ['分享', '捎句话'].includes(text(el)))
+  )
+    root = root.parentElement
+  if (!root) return { panel: false, loaded: false, owner: 'missing' as const, top: 0, bottom: 0, button: null }
+  const { top, bottom } = root.getBoundingClientRect()
+  const elements = Array.from(root.querySelectorAll('*')).filter(visible)
+  const buttons = elements.filter((el) => ['分享', '捎句话'].includes(text(el)))
+  const finished = elements.some(
+    (el) => !el.children.length && (text(el) === '暂时没有更多了' || /没有找到|暂无|无结果/.test(text(el))),
+  )
+  const loading = elements.some((el) => {
+    if (text(el)) return false
+    const r = el.getBoundingClientRect()
+    if (r.width > 100 || r.height > 100) return false
+    if (typeof el.className === 'string' && /loading|spin/i.test(el.className)) return true
+    // 抖音也会用两个彩色圆点表示加载，不一定带有 loading 类名。
+    const dots = Array.from(el.children).filter((child) => {
+      if (!visible(child) || text(child)) return false
+      const rect = child.getBoundingClientRect()
+      const style = getComputedStyle(child)
+      return (
+        rect.width <= 20 &&
+        rect.height <= 20 &&
+        Math.abs(rect.width - rect.height) <= 2 &&
+        parseFloat(style.borderRadius) >= rect.width / 2 &&
+        !!style.backgroundColor &&
+        !['transparent', 'rgba(0, 0, 0, 0)'].includes(style.backgroundColor)
+      )
+    })
+    return dots.length >= 2
+  })
+  // 明确的结束或空状态优先；仅靠按钮判断时必须排除仍在加载的旧列表。
+  const loaded = finished || (buttons.length > 0 && !loading)
+  // 行与按钮分别定位：按钮消失或重建后，仍要用 sec_uid 确认主人行留在面板中。
+  const row = elements.find((node) => {
+    const key = Object.keys(node).find((key) => key.startsWith('__reactFiber$'))
+    type Fiber = { memoizedProps?: { user?: { sec_uid?: unknown } }; return?: Fiber }
+    let fiber = key ? (node as unknown as Record<string, Fiber>)[key] : undefined
+    for (let depth = 0; fiber && depth <= 8; depth++, fiber = fiber.return) {
+      if (fiber.memoizedProps?.user?.sec_uid === secUid) return true
+    }
+    return false
+  })
+  if (row) {
+    const button =
+      buttons.find((button) => row.contains(button) && text(button) === '捎句话') ??
+      buttons.find((button) => row.contains(button))
+    if (!button) return { panel: true, loaded, owner: 'ok' as const, top, bottom, button: null }
+    const r = button.getBoundingClientRect()
+    const x = r.left + r.width / 2,
+      y = r.top + r.height / 2
+    if (
+      x < 0 ||
+      y < 0 ||
+      x >= innerWidth ||
+      y >= innerHeight ||
+      !(() => {
+        const hit = document.elementFromPoint(x, y)
+        return hit && (button.contains(hit) || hit.contains(button))
+      })()
+    )
+      return { panel: true, loaded, owner: 'offscreen' as const, top, bottom, button: null }
+    return { panel: true, loaded, owner: 'ok' as const, top, bottom, button: { text: text(button), x, y } }
+  }
+  return { panel: true, loaded, owner: 'missing' as const, top, bottom, button: null }
+}
+
+/** 搜索框必须从可见面板标题向上寻找，不能误用页面上的全局搜索框。 */
+const shareSearchScript = (clear: boolean) => {
+  const title = Array.from(document.querySelectorAll('*')).find((el) => {
+    const r = el.getBoundingClientRect()
+    return !el.children.length && el.textContent?.trim() === '分享给朋友' && r.width > 0 && r.height > 0
+  })
+  let root = title?.parentElement
+  while (root) {
+    const input = root.querySelector<HTMLInputElement>('input[placeholder="搜索"]')
+    if (input) {
+      const r = input.getBoundingClientRect()
+      if (r.width <= 0 || r.height <= 0) return null
+      if (clear) {
+        if (document.activeElement !== input) return null
+        // 使用原生 setter 绕过 React 值追踪，让受控输入收到清空事件。
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+    }
+    root = root.parentElement
+  }
+  return null
+}
+
+/** 点击即可能发出卡片；越过提交边界后绝不返回明确未发送。 */
+export async function shareVideo(
+  page: BrowserPage,
+  awemeId: string,
+  ownerSecUid: string,
+  onCommit: () => void = () => {},
+  searchTerms: string[] = [],
+): Promise<ShareResult> {
+  if (!page.mouse) return { status: 'not-sent', reason: t('当前浏览器不支持原生视频分享') }
+  let committed = false
+  const confirmed = (confirmedBy: 'button' | 'readback'): ShareResult => {
+    console.info('[app-life/douyin/share]', { awemeId, ownerSecUid, status: 'sent', confirmedBy })
+    return { status: 'sent', confirmedBy }
+  }
+  try {
+    const target = `https://www.douyin.com/video/${awemeId}`
+    try {
+      await page.goto(target, { timeout: 30000 })
+    } catch (error) {
+      if (!(error instanceof NavigationTimeoutError)) throw error
+      const href = page.refreshUrl
+        ? await page.refreshUrl()
+        : await page.evaluate(() => location.href, null, { readonly: true })
+      const url = new URL(href)
+      if (url.origin !== 'https://www.douyin.com' || url.pathname !== `/video/${awemeId}`) throw error
+    }
+    await sleep(page, 3000)
+    if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify' }
+    if (await page.evaluate(loginScript, null, { readonly: true })) return { status: 'login' }
+    let icon = await page.evaluate(shareIconScript, true)
+    if (!icon) return { status: 'not-sent', reason: t('没有找到视频分享按钮') }
+    const hoverAndWait = async () => {
+      await page.mouse!.move(icon!.x, icon!.y)
+      let result: ReturnType<typeof sharePanelScript> = {
+        panel: false,
+        loaded: false,
+        owner: 'missing',
+        top: 0,
+        bottom: 0,
+        button: null,
+      }
+      for (let i = 0; i < 12; i++) {
+        await sleep(page, 500)
+        result = await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })
+        if (result.panel) break
+      }
+      if (!result.panel) throw new Error(t('视频分享面板没有出现'))
+      for (let i = 0; !result.loaded && i < 20; i++) {
+        await sleep(page, 500)
+        result = await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })
+      }
+      if (!result.loaded) throw new Error(t('分享面板的联系人列表没有加载出来'))
+      return result
+    }
+    let adjustments = 0
+    const ensureVisible = async (
+      result: ReturnType<typeof sharePanelScript>,
+    ): Promise<ReturnType<typeof sharePanelScript>> => {
+      while (result.owner === 'offscreen' || result.top < 0) {
+        if (adjustments >= 2) throw new Error(t('分享面板里的主人不在可视区域，无法点击'))
+        adjustments++
+        await page.evaluate((top: number) => window.scrollBy(0, top - 20), result.top)
+        // 滚动会收起面板；只重取按钮坐标，不能再次底部对齐而抵消本次调整。
+        icon = await page.evaluate(shareIconScript, false, { readonly: true })
+        if (!icon) throw new Error(t('没有找到视频分享按钮'))
+        result = await hoverAndWait()
+      }
+      return result
+    }
+    let panel = await ensureVisible(await hoverAndWait())
+    const terms = [
+      ...new Set(
+        searchTerms
+          .map((term) => term.trim())
+          .filter(Boolean)
+          .map((term) => term.slice(0, 30)),
+      ),
+    ].slice(0, 2)
+    let reopened = false
+    const searched: string[] = []
+    if (panel.owner === 'missing') {
+      for (const term of terms) {
+        searched.push(term)
+        // 面板消失时只恢复一次；重新输入当前词，不能拿旧搜索结果提交。
+        for (;;) {
+          const input = await page.evaluate(shareSearchScript, false, { readonly: true })
+          if (input) {
+            await page.mouse.move(input.x, input.y)
+            await page.mouse.click(input.x, input.y)
+            if (!(await page.evaluate(shareSearchScript, true))) {
+              if ((await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })).panel)
+                return { status: 'not-sent', reason: t('分享面板搜索框拿不到焦点') }
+            } else {
+              await page.keyboard.insertText(term)
+              for (let i = 0; i < 12; i++) {
+                await sleep(page, 500)
+                panel = await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })
+                if (!panel.panel || panel.loaded || panel.button) break
+              }
+              if (panel.panel) {
+                if (!panel.loaded && !panel.button)
+                  return { status: 'not-sent', reason: t('分享面板的联系人列表没有加载出来') }
+                break
+              }
+            }
+          } else if ((await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })).panel) {
+            return { status: 'not-sent', reason: t('没有找到分享面板搜索框') }
+          }
+          if (reopened) return { status: 'not-sent', reason: t('搜索时分享面板消失，重新打开后仍不可用') }
+          reopened = true
+          await page.mouse.move(icon.x, icon.y)
+          await sleep(page, 500)
+        }
+        panel = await ensureVisible(panel)
+        if (panel.owner !== 'missing') break
+      }
+      if (!panel.button)
+        return {
+          status: 'not-sent',
+          reason: searched.length
+            ? t('分享面板搜索后没有找到主人（搜索词：{terms}）', { terms: searched.join('、') })
+            : t('分享面板里没有主人，请先在抖音里和主人聊过'),
+        }
+    }
+    // 点击前重新取坐标、核对可见性和文案，不能使用先前渲染的行。
+    const current = await ensureVisible(await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true }))
+    if (current.button?.text !== '分享') return { status: 'not-sent', reason: t('主人的分享按钮当前不可用') }
+    const clickedAt = Date.now()
+    committed = true
+    onCommit()
+    await page.mouse.click(current.button.x, current.button.y)
+    for (let i = 0; i < 10; i++) {
+      await sleep(page, 500)
+      const result = await page.evaluate(sharePanelScript, ownerSecUid, { readonly: true })
+      if (result.button?.text === '捎句话' || (result.panel && result.owner === 'ok' && result.button?.text !== '分享'))
+        return confirmed('button')
+    }
+    if (await confirmVideoShare(page, awemeId, ownerSecUid, clickedAt)) return confirmed('readback')
+    return { status: 'uncertain', reason: t('视频卡片点击后未能确认发送结果') }
+  } catch (error) {
+    if (!committed && error instanceof CaptchaError) return { status: 'verify' }
+    return {
+      status: committed ? 'uncertain' : 'not-sent',
+      ...(error instanceof BrowserSkippedError ? { disconnected: true } : {}),
+      reason: error instanceof Error ? error.message : String(error),
+    }
+  } finally {
+    // 清理失败不能改变已经确认的发送结果。
+    await page.mouse.move(0, 0).catch(() => {})
+  }
+}
+
+/** 首次确认与重新附加共用同一回读规则；这里只打开会话，绝不发送卡片。 */
+export async function confirmVideoShare(
+  page: BrowserPage,
+  awemeId: string,
+  ownerSecUid: string,
+  clickedAt: number,
+): Promise<boolean> {
+  const opened = await openConversation(page, ownerSecUid)
+  if (opened.status === 'open') {
+    const rows = await page.evaluate(readScript, null, { readonly: true })
+    // attribute 按旧到新继承头像方向；与原始内容按反序一一对应，不信任 isMyMessage。
+    const messages = attribute(rows)
+    const contents = rows.slice().reverse()
+    const mine = messages
+      .map((message, index) => ({ message, content: contents[index]?.parsedContent }))
+      .filter(({ message }) => message.from === 'me')
+      .slice(-5)
+    if (
+      mine.some(({ message, content }) => {
+        if (message.at && message.at < clickedAt - 120000) return false
+        if (!content || typeof content !== 'object') return false
+        const pc = content as Record<string, unknown>
+        return pc.aweType === 800 && String(pc.itemId ?? pc.item_id ?? pc.aweme_id ?? '') === awemeId
+      })
+    )
+      return true
+  }
+  return false
 }

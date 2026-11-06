@@ -8,6 +8,11 @@ import { impression } from './weekly'
 const LETTER = 'The latest letter you wrote to the owner. They have read it; you may bring it up naturally.'
 const DIARY =
   'Your latest private diary — inner thoughts only. Let it color your mood, but never quote it, read it aloud, or reveal that it exists.'
+const shareChannels = {
+  home: 'shared in the bound conversation',
+  dm: 'shared via direct message',
+  comment: 'shared in the comments',
+}
 const size = (text: string) => Array.from(text).length
 
 function clip(text: string, limit: number): string {
@@ -43,6 +48,7 @@ export function lifeMemory(kv: KV, s: Settings, app: string, now: number): strin
       title: e.title,
       impression: impression(e),
       shared: e.shared,
+      ...(e.shared ? { share_channel: shareChannels[e.delivered?.at(-1)?.via ?? 'home'] } : {}),
       owner: shares.find((share) => share.itemId === e.id)?.outcome ?? null,
       ...(e.app ? { app: e.app } : {}),
       ...(e.source === 'manual' ? { looked_up: true } : {}),

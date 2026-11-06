@@ -134,6 +134,11 @@ export function recordShare(kv: KV, itemId: string, authorId: string, now: numbe
   shares.entries.push({ itemId, authorId, at: now, outcome: 'pending' })
   kv.set('shares', { entries: shares.entries.slice(-500) })
 }
+/** 只撤销这次尝试的占账，保留同一作品其他时间的记录。 */
+export function unrecordShare(kv: KV, itemId: string, at: number) {
+  const shares = loadShares(kv)
+  kv.set('shares', { entries: shares.entries.filter((e) => e.itemId !== itemId || e.at !== at) })
+}
 /** 分享发出后把她说的话（截 300 字）记到这条分享上，判断主人是否回应时要用。 */
 export function attachSaid(kv: KV, itemId: string, text: string) {
   const shares = loadShares(kv)

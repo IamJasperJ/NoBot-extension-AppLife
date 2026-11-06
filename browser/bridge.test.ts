@@ -1,4 +1,4 @@
-import { describe, expect, jest, test } from 'bun:test'
+import { describe, expect, jest, spyOn, test } from 'bun:test'
 import { douyinRiskPolicy } from '../apps/douyin/risk'
 import { decodePair, proof } from '../chrome/protocol.js'
 import { RISK_DEFAULTS } from '../core/limits'
@@ -101,7 +101,10 @@ describe('Chrome 桥鉴权', () => {
 })
 
 /** 假插件仍走桥的鉴权、请求关联和事件分发，不绕过 CdpPage。 */
-async function sessionFixture(idleMs = 60000) {
+async function sessionFixture(
+  idleMs = 60000,
+  intercept?: (command: Record<string, unknown>, receive: (value: Record<string, unknown>) => void) => boolean,
+) {
   const f = bridgeFixture()
   await f.hello()
   const commands: Record<string, unknown>[] = []
@@ -116,6 +119,7 @@ async function sessionFixture(idleMs = 60000) {
           const command = f.messages[seen++]!
           if (!command.op) continue
           commands.push(command)
+          if (intercept?.(command, (value) => f.connection.receive(JSON.stringify(value)))) continue
           let result: Record<string, unknown> = {}
           if (command.method === 'Runtime.evaluate')
             result = {
@@ -221,10 +225,12 @@ test('会话串行、用户取消本轮不重附加，下一轮及空闲后才�
       }),
     ])
     expect(order).toEqual([1, 2, 3])
-    await f.session.run(async (page) => {
-      f.connection.receive(JSON.stringify({ event: 'cdp.detached', key: 'douyin', reason: 'canceled_by_user' }))
-      await expect(page.evaluate(() => 42, null)).rejects.toThrow('调试已取消')
-    })
+    await expect(
+      f.session.run(async (page) => {
+        f.connection.receive(JSON.stringify({ event: 'cdp.detached', key: 'douyin', reason: 'canceled_by_user' }))
+        await expect(page.evaluate(() => 42, null)).rejects.toThrow('canceled_by_user')
+      }),
+    ).rejects.toThrow('canceled_by_user')
     expect(f.commands.filter((c) => c.op === 'cdp.attach')).toHaveLength(1)
     await f.session.run(async () => {})
     expect(f.commands.filter((c) => c.op === 'cdp.attach')).toHaveLength(2)
@@ -407,3 +413,202 @@ test('已认证的连接不占未认证名额：插件重连时不会被误判�
   expect(rejected).toBe(1)
   f.bridge.close()
 })
+
+for (const event of [
+  { event: 'cdp.detached', reason: 'canceled_by_user' },
+  { event: 'tab.closed', reason: 'target_closed' },
+  { event: 'tab.blocked', code: 'DOMAIN_DENIED' },
+  { event: 'disconnected' },
+]) {
+  test(`ExtensionSession 记录断开事件与原因：${event.event}`, async () => {
+    const f = await sessionFixture()
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(
+        f.session.run(async (page) => {
+          f.connection.receive(JSON.stringify({ ...event, key: 'douyin' }))
+          await page.evaluate(() => 42, null)
+        }),
+      ).rejects.toThrow(event.reason ?? event.code ?? event.event)
+      const line = String(warn.mock.calls[0]?.[0])
+      expect(line).toStartWith('[app-life/chrome/disconnect] ')
+      expect(JSON.parse(line.slice(line.indexOf(' ') + 1))).toEqual({
+        ...event,
+        key: 'douyin',
+        at: expect.any(Number),
+      })
+    } finally {
+      await f.close()
+      warn.mockRestore()
+    }
+  })
+}
+
+const targetClosed = { event: 'cdp.detached', key: 'douyin', reason: 'target_closed' }
+
+test('target_closed 保留本轮和按 key 过滤的订阅，恢复协议域并重置每轮次数', async () => {
+  const f = await sessionFixture()
+  try {
+    for (let round = 0; round < 2; round++) {
+      await f.session.run(async (page) => {
+        for (let i = 0; i < 3; i++) {
+          f.connection.receive(JSON.stringify(targetClosed))
+          expect(await page.evaluate(() => 42, null, { readonly: true })).toBe(42)
+        }
+        f.connection.receive(
+          JSON.stringify({
+            event: 'cdp.event',
+            key: 'other',
+            method: 'Page.frameNavigated',
+            params: { frame: { url: 'wrong' } },
+          }),
+        )
+        expect(page.url()).not.toBe('wrong')
+        const response = page.waitForResponse((r) => r.url().endsWith('/reattached'))
+        for (const [method, params] of [
+          ['Page.frameNavigated', { frame: { url: 'https://www.douyin.com/video/42' } }],
+          ['Network.responseReceived', { requestId: 'new', response: { url: 'https://www.douyin.com/reattached' } }],
+          ['Network.loadingFinished', { requestId: 'new' }],
+        ])
+          f.connection.receive(JSON.stringify({ event: 'cdp.event', key: 'douyin', method, params }))
+        expect(page.url()).toBe('https://www.douyin.com/video/42')
+        expect(await (await response).text()).toContain('status_code')
+      })
+    }
+    expect(f.commands.filter((c) => c.op === 'tab.open')).toHaveLength(1)
+    expect(f.commands.filter((c) => c.op === 'cdp.attach')).toHaveLength(7)
+    for (const method of ['Page.enable', 'Network.enable', 'Runtime.enable'])
+      expect(f.commands.filter((c) => c.method === method)).toHaveLength(7)
+  } finally {
+    await f.close()
+  }
+})
+
+for (const kind of ['readonly', 'write', 'input', 'twice'] as const) {
+  test(`发出命令后断开：${kind} 只允许明确只读脚本重做一次`, async () => {
+    let failures = 0
+    let attempts = 0
+    const f = await sessionFixture(60000, (command, receive) => {
+      const expression = String((command.params as Record<string, unknown> | undefined)?.expression)
+      if (
+        !(kind === 'input'
+          ? command.method === 'Input.dispatchMouseEvent'
+          : command.method === 'Runtime.evaluate' && expression.includes('42'))
+      )
+        return false
+      attempts++
+      if (failures++ >= (kind === 'twice' ? 2 : 1)) return false
+      receive(targetClosed)
+      receive({ id: command.id, ok: false, code: 'CDP_ERROR', message: 'target gone' })
+      return true
+    })
+    try {
+      await f.session.run(async (page) => {
+        const action =
+          kind === 'input' ? page.mouse!.move(1, 1) : page.evaluate(() => 42, null, { readonly: kind !== 'write' })
+        if (kind === 'readonly') expect(await action).toBe(42)
+        else await expect(action).rejects.toMatchObject({ beforeDispatch: false })
+        expect(attempts).toBe(kind === 'readonly' || kind === 'twice' ? 2 : 1)
+        // 写操作失败后不重放，后续独立读取仍可恢复。
+        expect(await page.evaluate(() => 42, null, { readonly: true })).toBe(42)
+      })
+    } finally {
+      await f.close()
+    }
+  })
+}
+
+test('同轮第四次恢复放弃，下一轮重新建立会话', async () => {
+  const f = await sessionFixture()
+  try {
+    await expect(
+      f.session.run(async (page) => {
+        for (let i = 0; i < 4; i++) {
+          f.connection.receive(JSON.stringify(targetClosed))
+          await page.evaluate(() => 42, null, { readonly: true })
+        }
+      }),
+    ).rejects.toThrow('次数已达上限')
+    expect(f.commands.filter((c) => c.op === 'cdp.attach')).toHaveLength(4)
+    await f.session.run(async () => {})
+    expect(f.commands.filter((c) => c.op === 'tab.open')).toHaveLength(2)
+  } finally {
+    await f.close()
+  }
+})
+
+test('重新附加失败记录原因并使本轮失效', async () => {
+  let attaches = 0
+  const f = await sessionFixture(60000, (command, receive) => {
+    if (command.op !== 'cdp.attach' || ++attaches === 1) return false
+    receive({ id: command.id, ok: false, code: 'TAB_MISSING', message: 'tab missing' })
+    return true
+  })
+  const warn = spyOn(console, 'warn').mockImplementation(() => {})
+  try {
+    await expect(
+      f.session.run(async (page) => {
+        f.connection.receive(JSON.stringify(targetClosed))
+        await page.evaluate(() => 42, null, { readonly: true })
+      }),
+    ).rejects.toThrow('TAB_MISSING')
+    expect(
+      warn.mock.calls.some(
+        (call) => String(call[0]).includes('"status":"failed"') && String(call[0]).includes('TAB_MISSING'),
+      ),
+    ).toBe(true)
+  } finally {
+    await f.close()
+    warn.mockRestore()
+  }
+})
+
+for (const event of ['tab.closed', 'tab.blocked']) {
+  test(`target_closed 与 ${event} 同时到达仍放弃`, async () => {
+    const f = await sessionFixture()
+    try {
+      await expect(
+        f.session.run(async (page) => {
+          f.connection.receive(JSON.stringify(targetClosed))
+          f.connection.receive(JSON.stringify({ event, key: 'douyin' }))
+          await page.evaluate(() => 42, null, { readonly: true })
+        }),
+      ).rejects.toThrow(event)
+      expect(f.commands.filter((c) => c.op === 'cdp.attach')).toHaveLength(1)
+    } finally {
+      await f.close()
+    }
+  })
+}
+
+for (const reattachDuringNavigate of [true, false]) {
+  test(`goto 丢失加载事件时读取就绪状态：导航内恢复=${reattachDuringNavigate}`, async () => {
+    let navigates = 0
+    const url = 'https://www.douyin.com/video/42'
+    const f = await sessionFixture(60000, (command, receive) => {
+      if (command.method === 'Page.navigate') {
+        if (reattachDuringNavigate && navigates++ === 0) {
+          receive(targetClosed)
+          receive({ id: command.id, ok: false, code: 'CDP_ERROR', message: 'target gone' })
+        } else receive({ id: command.id, ok: true, result: {} })
+        return true
+      }
+      if (
+        command.method === 'Runtime.evaluate' &&
+        String((command.params as Record<string, unknown>).expression).includes('document.readyState')
+      ) {
+        receive({ id: command.id, ok: true, result: { result: { value: { ready: 'interactive', href: url } } } })
+        return true
+      }
+      return false
+    })
+    try {
+      await f.session.run(async (page) => {
+        await page.goto(url, { timeout: 5 })
+        expect(page.url()).toBe(url)
+      })
+    } finally {
+      await f.close()
+    }
+  })
+}

@@ -26,9 +26,9 @@ const item = (): HistoryItem => ({
   watchedAt: 1,
   shared: true,
   verdict: null,
-  delivered: [{ via: 'home', ok: true, at: 1 }],
+  delivered: [],
 })
-test('评论分享另写公开短评并 @ 主人，失败只记投递错误；关闭分享不投任何渠道', async () => {
+test('评论分享另写公开短评并 @ 主人，返回实际正文与明确投递状态；关闭分享不投任何渠道', async () => {
   const x = socialFixture(),
     e = item()
   x.p.settings.shareVia = 'comment'
@@ -48,9 +48,9 @@ test('评论分享另写公开短评并 @ 主人，失败只记投递错误；�
   expect(x.notes).toHaveLength(1)
   x.p.settings.shareEnabled = false
   await deliver(x.p, e, 'x', 3)
-  expect(e.delivered).toHaveLength(3)
+  expect(e.delivered).toHaveLength(2)
 })
-test('被闸拦截不发评论，保留绑定会话投递并每视频六小时只通知一次', async () => {
+test('被闸拦截不发评论，每视频六小时只通知一次', async () => {
   const x = socialFixture(),
     e = item()
   x.p.settings.shareVia = 'comment'
@@ -74,7 +74,7 @@ test('被闸拦截不发评论，保留绑定会话投递并每视频六小时�
   await deliver(x.p, e, 'home share', 2)
   expect(e.gate).toMatchObject({ status: 'blocked', allow: false })
   expect(x.p.kv.get<Activity[]>('activity')).toMatchObject([{ kind: 'gate', title: e.title, url: e.url, ok: false }])
-  expect(e.delivered?.[0]).toEqual({ via: 'home', ok: true, at: 1 })
+  expect(e.delivered?.every((d) => d.via === 'comment')).toBe(true)
   expect(x.posts).toHaveLength(0)
   expect(x.notes).toHaveLength(1)
   expect(x.notes[0]).toContain('不是身份鉴定')
@@ -164,7 +164,41 @@ test('明确未发送重试仍失败时只记录一次失败，重试期间暂�
     }
     await deliver(x.p, e, 'hello', 1)
     expect(sends).toBe(paused ? 1 : 2)
-    expect(e.delivered).toHaveLength(2)
+    expect(e.delivered).toHaveLength(1)
     expect(x.notes).toHaveLength(1)
   }
 })
+
+for (const mode of ['sent', 'text-failed', 'not-sent', 'uncertain', 'bilibili'] as const) {
+  test(`私信卡片投递 ${mode} 的后续文字和回退规则`, async () => {
+    const x = socialFixture(),
+      e = item(),
+      calls: string[] = []
+    x.p.settings.shareVia = 'dm'
+    x.p.adapter.directMessages.mutual = async () => true
+    if (mode !== 'bilibili')
+      x.p.adapter.directMessages.shareVideo = async (peer, id) => {
+        expect(peer).toBe('owner')
+        expect(id).toBe(e.id)
+        expect(dmOf(x.p.kv).lockedPeer).toBe('owner')
+        calls.push('card')
+        if (mode === 'not-sent') throw new DmNotSentError('主人不在面板')
+        if (mode === 'uncertain') throw new TrafficError('点击后未知', 'UNCERTAIN')
+      }
+    x.p.adapter.directMessages.send = async (_peer, text) => {
+      calls.push(text)
+      if (mode === 'text-failed') throw new Error('文字失败')
+    }
+    expect(await deliver(x.p, e, '随手一句', 1)).toEqual({ status: 'sent', text: '随手一句' })
+    expect(calls).toEqual(
+      mode === 'bilibili'
+        ? [`随手一句\n${e.url}`]
+        : mode === 'uncertain'
+          ? ['card']
+          : ['card', mode === 'not-sent' ? `随手一句\n${e.url}` : '随手一句'],
+    )
+    expect(e.delivered).toMatchObject([{ ok: true }])
+    if (['text-failed', 'not-sent', 'uncertain'].includes(mode))
+      expect(x.p.kv.get<Activity[]>('activity')?.some((a) => !!a.error)).toBe(true)
+  })
+}

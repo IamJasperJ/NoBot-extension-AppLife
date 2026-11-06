@@ -249,8 +249,11 @@ settings 为未保存表单草稿，与保存值合并：
 
 ## AL4：分享投递、评论草稿与直播
 
-绑定会话分享总是先生成并登记共享账本。`shareVia` 默认为 `home`，选 `comment` 或 `dm`
-时再额外投递；关闭 `shareEnabled` 阻止全部分享渠道。外部发送失败记录到历史与互动，
+分享先登记共享账本。`shareVia` 默认为 `home`，三种渠道互斥：`home` 在绑定会话发言，
+`dm` 静默生成简短正文，B 站附链接私信给主人，抖音优先原生卡片后补一句文字，`comment` 独立生成公开短评并 @ 主人；后两者不在绑定会话发言。
+确定失败（包括生成为空、评论闸拦截）撤销占账并标记未分享，日常流程停止本轮后续分享；
+`TrafficError` 的 `UNCERTAIN` 保留占账并视为已分享。分享工具遵循相同撤账规则。
+成功投递的实际正文记入分享账本，近期生活记忆标记分享渠道。关闭 `shareEnabled` 阻止全部分享渠道。外部发送失败记录到历史与互动，
 不自动重试；未知写结果继续由 `traffic.unknownOperations` 核查。
 
 `GET /history` 每项新增：
@@ -271,7 +274,7 @@ type GateResult = {
 评估从模型回复中提取首个完整 JSON 对象，容忍正文或代码围栏包裹，仍严格校验每个 ID 恰好一次、分类及疑似理由。
 初轮与扩样轮各自在无效评估后附加英文提醒重试一次；仍无效则暂缓。
 不足 20 条允许，采样失败暂缓，其余遵循 suspected / uncertain 判定表。
-阻止外部评论时绑定会话分享仍保留，每视频每六小时最多一条绑定会话系统说明。
+阻止外部评论时撤销分享占账，每视频每六小时最多一条绑定会话系统说明。
 
 `GET /status` 中 `apps[].comments` 与顶层 B 站 `live` 的结构：
 
@@ -395,3 +398,22 @@ type Activity = {
 
 两个接口均返回 `cache-control: no-store`，每次请求读取当前磁盘文件，无需重启。ZIP 使用固定时间戳及 UTF-8 文件名，
 保留 `_locales/`、README.md、PROTOCOL.md；排除隐藏文件/目录、`*.test.ts`、`test-utils.ts`、`tsconfig.json`、`*.d.ts`，不跟随符号链接。
+
+
+### 抖音原生私信分享（浏览器内部伪接口）
+
+`POST /__ui/im/share`，JSON body：`{ "peer": "<主人 sec_uid>", "itemId": "<awemeId>" }`。
+这是浏览器传输层消费的内部路径，不是宿主 HTTP 路由；与 `/__ui/im/send` 一样经过私信写预算、冷却和 operation 保护。
+
+打开 `https://www.douyin.com/video/<awemeId>` 后检查验证码与登录态，滚动并通过 CDP 真鼠标悬停
+`[data-e2e="video-share-icon-container"]`。最多等待 6 秒找到「分享给朋友」，以包含标题且包含分享按钮的最近祖先为面板根。
+联系人通过行内 React fiber 向上最多 8 层的 `memoizedProps.user.sec_uid === peer` 识别，不使用昵称。
+点击前重新检查按钮可见、文字为「分享」，并调用 `onCommit` 标记提交；点击后最多 5 秒重新按 sec_uid 查找，
+按钮变成「捎句话」才返回 `status_code: 0`。结束只把鼠标移到页面角落，不导航回私信页。
+
+提交前失败返回 `UI_CODES.FAILED`，保护层删除 operation，适配器抛 `DmNotSentError`；没有鼠标能力也属于明确未发送。
+登录或验证沿用 `UI_CODES.LOGIN` / `VERIFY`。提交后的异常或未确认返回无业务码响应，进入 `UNCERTAIN`，保留待核查 operation。
+
+投递使用与文字相同的主人校验、互关缓存和每日收件人锁。卡片成功后通过 `sendOwnerDm` 补发不带链接的一句话，
+补充文字失败仅记日志与 activity，仍算已分享；卡片明确未发送时记录原因，回退「正文 + 换行 + 链接」。
+卡片结果不确定同样视为已分享并保留名额，不重试、不补文字。B 站仍发送正文和链接。

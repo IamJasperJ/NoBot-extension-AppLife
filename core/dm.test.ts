@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { createBilibiliAdapter } from '../apps/bilibili'
 import { fixture } from '../test-utils'
-import { type DmPorts, pollOwnerDm, replyOwnerDm, splitDm } from './dm'
+import { type DmPorts, pollOwnerDm, replyOwnerDm, shareOwnerVideo, splitDm } from './dm'
 import { loadShares, recordShare } from './share'
 import { defaults, dmOf } from './state'
 import type { DirectMessage } from './types'
@@ -205,4 +205,19 @@ test('私信禁止渠道转发，图片成功保存为附件，截图和保存�
     expect(saved).toHaveLength(mode === 'success' || mode === 'save-failed' ? 1 : 0)
     expect(x.counts().triggers).toBe(1)
   }
+})
+
+test('原生分享搜索词按抖音号、缓存昵称排序，忽略其他主人的缓存', async () => {
+  const { p } = setup()
+  p.settings.douyinOwnerId = '@handle'
+  p.kv.set('douyin-owner', { input: '@handle', secUid: 'owner', nickname: '昵称', at: now })
+  const calls: unknown[] = []
+  p.adapter.directMessages.shareVideo = async (...args) => {
+    calls.push(args)
+  }
+  await shareOwnerVideo(p, 'owner', '123', now)
+  expect(calls[0]).toEqual(['owner', '123', undefined, { searchTerms: ['handle', '昵称'] }])
+  p.kv.set('douyin-owner', { secUid: 'other', nickname: '他人' })
+  await shareOwnerVideo(p, 'owner', '123', now)
+  expect(calls[1]).toEqual(['owner', '123', undefined, { searchTerms: ['handle'] }])
 })
