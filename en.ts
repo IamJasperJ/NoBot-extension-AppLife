@@ -1,4 +1,20 @@
 const en: Record<string, string> = {
+  抖音私信: 'Douyin DMs',
+  '抖音私信分会话（渠道）': 'Separate Douyin DM chats (channels)',
+  '每位联系人单独建会话；新联系人需要在渠道页批准，网页自动化有风控和封号风险':
+    'Create a separate chat per contact. Approve new contacts on the Channels page. Web automation risks restrictions and account bans.',
+  每人每日渠道回复上限: 'Daily channel reply limit per person',
+  '每位联系人每天最多发送的回复段数，0 表示不发送':
+    'Maximum reply segments sent to each contact per day. Set 0 to disable sending.',
+  '抖音网页自动化存在风控和封号风险，请谨慎开启':
+    'Douyin web automation risks restrictions and account bans. Enable with care.',
+  '渠道每日回复上限已达到，本条未发送且不再补发':
+    'Daily channel reply limit reached; this message was not sent and will not be retried',
+  渠道未开启: 'Channel is disabled',
+  宿主不支持: 'Host does not support channels',
+  '已连接（{id}）': 'Connected ({id})',
+  去渠道页批准联系人: 'Go to the Channels page to approve contacts',
+
   'Chrome 自动重新附加次数已达上限': 'Chrome automatic reattach limit reached',
   '分享面板里的主人不在可视区域，无法点击':
     'The owner in the sharing panel is outside the visible area and cannot be clicked',

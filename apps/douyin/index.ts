@@ -269,6 +269,26 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
       return digest
     },
     directMessages: {
+      async conversations({ signal }) {
+        const response = await deps.guardedFetch(`${BASE}/__ui/im/conversations`, {
+          headers: { cookie: cookieHeader(deps.credentials()) },
+          signal,
+        })
+        const payload = await response.text().then(parseJson)
+        api.ensure(response, payload)
+        return arr(obj(payload).conversations)
+          .map((value) => {
+            const row = obj(value)
+            return {
+              peerId: str(row.peerId),
+              name: str(row.name),
+              lastAt: num(row.lastAt),
+              unread: num(row.unread),
+              isGroup: row.isGroup === true,
+            }
+          })
+          .filter((row) => row.peerId)
+      },
       async list(peerId, { afterSeq, limit, signal }) {
         const response = await deps.guardedFetch(`${BASE}/__ui/im/list?peer=${encodeURIComponent(peerId)}`, {
           headers: { cookie: cookieHeader(deps.credentials()) },
@@ -340,6 +360,7 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
         if (obj(payload).status_code === UI_CODES.FAILED)
           throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(obj(payload).status_msg) }))
         api.ensure(response, payload)
+        return str(obj(payload).sid) ? { id: str(obj(payload).sid) } : undefined
       },
       async shareVideo(peerId, itemId, signal, opts) {
         let searchTerms = opts?.searchTerms ?? []

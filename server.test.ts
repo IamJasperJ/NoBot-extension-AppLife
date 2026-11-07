@@ -318,3 +318,168 @@ test('旧宿主保留两个定时器、启动立即 tick，生命周期结束清
     dm.mockRestore()
   }
 })
+
+test('渠道只在能力存在且设置开启时注册，账号带固定角色，生命周期可中止', async () => {
+  for (const supported of [false, true]) {
+    for (const enabled of [false, true]) {
+      const f = backgroundFixture()
+      const providers: import('./host-api').ChannelProvider[] = []
+      const ensureAccount = mock(async () => ({ accountId: 'douyin-account', characterFollowed: true }))
+      f.ctx.settings = { ...f.ctx.settings, bilibiliEnabled: false, douyinEnabled: true, douyinChannel: enabled }
+      if (supported)
+        f.ctx.channels = {
+          registerProvider: (provider) => {
+            providers.push(provider)
+            return { unregister() {} }
+          },
+          lookup: () => null,
+          lookupAll: () => [],
+          ensureAccount,
+        }
+      try {
+        extension.startBackground(f.ctx, f.lifetime.signal)
+        await Promise.resolve()
+        expect(providers).toHaveLength(supported && enabled ? 1 : 0)
+        if (supported && enabled) {
+          expect(ensureAccount).toHaveBeenCalledWith('app-life.douyin', { name: '抖音私信', characterId: 'character' })
+          const controller = new AbortController()
+          const io = {
+            emit: mock(async () => {}),
+            status: mock(() => {}),
+            saveCursor: mock(() => {}),
+            setOwner: mock(() => {}),
+          }
+          const started = providers[0]!.start({ id: 'douyin-account', config: {}, cursor: null }, io, controller.signal)
+          expect(io.status).toHaveBeenCalledWith('offline', undefined)
+          controller.abort()
+          await started
+        } else expect(ensureAccount).not.toHaveBeenCalled()
+      } finally {
+        f.close()
+      }
+    }
+  }
+})
+
+test('访客 hook 与工具隔离，ownerPresent 不走访客分支，家里会话不变', async () => {
+  const f = backgroundFixture()
+  const personas = spyOn(host, 'listPersonas').mockReturnValue([])
+  f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
+  f.ctx.settings = { ...f.ctx.settings, douyinEnabled: true, injectDiary: false }
+  let ownerPresent = false
+  const channels: NonNullable<ExtensionContext['channels']> = {
+    registerProvider: () => ({ unregister() {} }),
+    lookupAll: () => [],
+    ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
+    lookup: () => ({
+      provider: 'app-life.douyin',
+      accountId: 'account',
+      bindingId: 'binding',
+      scope: 'private',
+      external: { chat: 'peer', title: 'Peer' },
+      actors: [],
+      ownerPresent,
+    }),
+  }
+  const ctx: ExtensionContext = { ...f.ctx, chatId: 'visitor', channels }
+  const input = { preset: { samplers: { functionCalling: true } }, injections: [] } as unknown as Parameters<
+    typeof extension.hooks.beforePrompt
+  >[0]
+  try {
+    f.ctx.storage.set('diary', [{ text: 'SECRET DIARY' }])
+    const result = extension.hooks.beforePrompt(input, ctx)
+    expect(result.injections).toHaveLength(1)
+    expect(result.injections![0]).toMatchObject({ position: 'after_char', depth: 0, role: 'system' })
+    expect(result.injections![0]!.content).toContain('not your owner')
+    expect(result.injections![0]!.content).not.toContain('SECRET DIARY')
+    expect(extension.tools(ctx).map((tool) => tool.name)).toEqual(['douyin_search', 'douyin_watch'])
+    await extension.hooks.onEvent(
+      {
+        type: 'message:saved',
+        message: { chatId: 'home', role: 'user', content: 'secret' } as import('../../packages/shared/src').MessageDTO,
+      },
+      ctx,
+    )
+    expect(f.ctx.storage.get('feedback')).toBeUndefined()
+    ownerPresent = true
+    expect(extension.hooks.beforePrompt(input, ctx)).toBe(input)
+    expect(extension.tools(ctx)).toEqual([])
+    const home = { ...ctx, chatId: 'home' }
+    expect(extension.hooks.beforePrompt(input, home)).toEqual(
+      extension.hooks.beforePrompt(input, { ...home, channels: undefined }),
+    )
+    expect(extension.tools(home).map((tool) => tool.name)).toEqual(
+      extension.tools({ ...home, channels: undefined }).map((tool) => tool.name),
+    )
+  } finally {
+    personas.mockRestore()
+    f.close()
+  }
+})
+
+test('后台运行中开启渠道会在下一轮消息任务注册，角色变更重新 ensure，关闭后不重复注册', async () => {
+  const f = backgroundFixture()
+  const providers: import('./host-api').ChannelProvider[] = []
+  const ensureAccount = mock(async () => ({ accountId: 'account', characterFollowed: true }))
+  f.ctx.settings = { ...f.ctx.settings, bilibiliEnabled: false, douyinEnabled: true, douyinChannel: false }
+  f.ctx.channels = {
+    registerProvider: (provider) => {
+      providers.push(provider)
+      return { unregister() {} }
+    },
+    lookup: () => null,
+    lookupAll: () => [],
+    ensureAccount,
+  }
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    expect(providers).toHaveLength(0)
+    f.ctx.settings.douyinChannel = true
+    await f.registrations.find((item) => item.definition.id === 'messages')!.run(new AbortController().signal)
+    expect(providers).toHaveLength(1)
+    expect(ensureAccount).toHaveBeenCalledWith('app-life.douyin', { name: '抖音私信', characterId: 'character' })
+    f.ctx.settings.characterId = 'next-character'
+    await f.registrations.find((item) => item.definition.id === 'messages')!.run(new AbortController().signal)
+    expect(ensureAccount).toHaveBeenLastCalledWith('app-life.douyin', {
+      name: '抖音私信',
+      characterId: 'next-character',
+    })
+    f.ctx.settings.douyinChannel = false
+    await f.registrations.find((item) => item.definition.id === 'messages')!.run(new AbortController().signal)
+    expect(providers).toHaveLength(1)
+  } finally {
+    f.close()
+  }
+})
+
+test('v2 宿主：关闭渠道时注销平台，重新开启再注册', async () => {
+  const f = backgroundFixture()
+  const providers: import('./host-api').ChannelProvider[] = []
+  const unregister = mock(() => {})
+  const ensureAccount = mock(async () => ({ accountId: 'account', characterFollowed: true }))
+  f.ctx.settings = { ...f.ctx.settings, bilibiliEnabled: false, douyinEnabled: true, douyinChannel: true }
+  f.ctx.channels = {
+    lookup: () => null,
+    lookupAll: () => [],
+    registerProvider: (provider) => {
+      providers.push(provider)
+      return { unregister }
+    },
+    ensureAccount,
+  }
+  const run = () => f.registrations.find((item) => item.definition.id === 'messages')!.run(new AbortController().signal)
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    expect(providers).toHaveLength(1)
+    f.ctx.settings.douyinChannel = false
+    await run()
+    expect(unregister).toHaveBeenCalledTimes(1)
+    await run()
+    expect(unregister).toHaveBeenCalledTimes(1)
+    f.ctx.settings.douyinChannel = true
+    await run()
+    expect(providers).toHaveLength(2)
+  } finally {
+    f.close()
+  }
+})

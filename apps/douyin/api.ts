@@ -18,7 +18,15 @@ import {
   TrafficError,
 } from '../../core/types'
 import { t } from '../../i18n'
-import { blockedScript, confirmVideoShare, loginScript, readConversation, sendMessage, shareVideo } from './im'
+import {
+  blockedScript,
+  confirmVideoShare,
+  loginScript,
+  readConversation,
+  readConversations,
+  sendMessage,
+  shareVideo,
+} from './im'
 import { CaptchaError, captchaMessage, douyinRiskPolicy, UI_CODES } from './risk'
 
 export const BASE = 'https://www.douyin.com'
@@ -186,6 +194,11 @@ export function createTransport(
           await prepare()
         }
         return browser.run(async (page) => {
+          if (path === '/__ui/im/conversations') {
+            const read = await readConversations(page)
+            if (read.status === 'open') return synthetic(path, { status_code: 0, conversations: read.conversations })
+            return read.status === 'login' ? synthetic(path, { status_code: UI_CODES.LOGIN }) : verify()
+          }
           if (path === '/__ui/im/list' || imWrite) {
             const peer =
               path === '/__ui/im/list' ? str(url.searchParams.get('peer')) : str(obj(JSON.parse(body ?? '{}')).peer)

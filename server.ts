@@ -7,6 +7,7 @@ import { ensureOwner, type OwnerCache } from './apps/douyin/owner'
 import { BridgeOfflineError, BridgePausedError, ChromeBridge } from './browser/bridge'
 import { ExtensionSession } from './browser/extension-session'
 import { chromeExtensionVersion, chromeExtensionZip } from './browser/zip'
+import { DouyinChannel, visitorMemory } from './core/channel'
 import { commentsOf, DraftError, pollComments, sendDraft } from './core/comments'
 import { type DayPorts, runDay } from './core/day'
 import { type DmPorts, pollOwnerDm, replyOwnerDm } from './core/dm'
@@ -63,6 +64,10 @@ import { setLanguageSource, t } from './i18n'
 import { settingsSchema } from './settings'
 
 setLanguageSource(getLanguage)
+function isVisitor(ctx: ExtensionContext) {
+  const binding = ctx.channels?.lookup?.(ctx.chatId)
+  return binding?.provider === 'app-life.douyin' && !binding.ownerPresent
+}
 type Context = Omit<ExtensionContext, 'chatId'>
 const runtime: Runtime = {
   fetch,
@@ -100,11 +105,12 @@ const runtime: Runtime = {
   },
 }
 const testRuntimeKey = Symbol.for('nobot.app-life.test-runtime')
-const testGlobals = globalThis as typeof globalThis & { [testRuntimeKey]?: Runtime }
-/** 仅离线测试可替换网络；生产环境没有路由能触及此入口。 */
-export function setTestRuntime(value: Runtime) {
+type TestRuntime = Runtime & { adapters?: Partial<typeof apps> }
+const testGlobals = globalThis as typeof globalThis & { [testRuntimeKey]?: TestRuntime }
+/** 仅离线测试可替换网络和平台适配器；生产环境没有路由能触及此入口。 */
+export function setTestRuntime(value: Runtime, adapters?: Partial<typeof apps>) {
   if (process.env.APP_LIFE_TEST_RUNTIME !== '1') throw new Error('Test runtime is disabled')
-  testGlobals[testRuntimeKey] = value
+  testGlobals[testRuntimeKey] = { ...value, adapters }
 }
 /** 只探测代理的 TCP 端口，不访问外站，也不触碰浏览器里的风控现场。 */
 export function browserProxyReachable(proxy: string): Promise<boolean> {
@@ -209,6 +215,51 @@ function service(ctx: Context): Service {
   return svc
 }
 class Service {
+  channel?: DouyinChannel
+  channelHandle?: { unregister(): void }
+  registerChannel() {
+    // 设置关掉后主动注销平台（v2 宿主），渠道页立即显示「平台不可用」，数据保留；之后重新开启会再注册。
+    if (this.channel && (!this.s.douyinEnabled || !this.s.douyinChannel || !this.signal || this.signal.aborted)) {
+      try {
+        this.channelHandle?.unregister()
+      } catch (error) {
+        this.log(error)
+      }
+      this.channelHandle = undefined
+      this.channel = undefined
+      // 关掉期间的私信不补投：下次打开重新以那时为界。
+      if (!this.s.douyinEnabled || !this.s.douyinChannel) this.kv.delete('channel-since')
+      return
+    }
+    if (
+      !this.channel &&
+      this.signal &&
+      !this.signal.aborted &&
+      this.s.douyinEnabled &&
+      this.s.douyinChannel &&
+      this.ctx.channels?.registerProvider
+    ) {
+      this.channel = new DouyinChannel(this.ctx.channels, {
+        settings: () => this.s,
+        dm: () => this.dmPorts('douyin'),
+        self: () => this.account('douyin')?.id ?? '',
+        now: () => this.rt.now(),
+        captcha: () => !!this.platform('douyin').guard.status().manual.length,
+        reason: () => {
+          const traffic = this.platform('douyin').guard.status()
+          if (traffic.manual.length) return t('抖音需要验证')
+          if (traffic.pausedUntil && traffic.pausedUntil > this.rt.now()) return traffic.pauseReason ?? t('私信已暂停')
+          return this.paused('douyin') ? t('私信已暂停') : null
+        },
+        exclusive: (work) => this.exclusive(work),
+        log: this.log,
+      })
+      this.channelHandle = this.ctx.channels.registerProvider(this.channel.provider())
+      // 以打开开关的时间为界：之后发来的私信都要投递，不等第一次读取成功（浏览器可能还没连上）。
+      if (this.kv.get<number>('channel-since') === undefined) this.kv.set('channel-since', this.rt.now())
+      void this.channel.ensure().catch(this.log)
+    }
+  }
   running = false
   dmBusy = false
   replying = false
@@ -225,7 +276,10 @@ class Service {
     return this.ctx.storage
   }
   platform(app: string) {
-    const factory = apps[app]
+    // 外置安装会复制到独立运行目录；测试适配器随已有全局测试运行时传递，生产环境不读取。
+    const factory =
+      (process.env.APP_LIFE_TEST_RUNTIME === '1' ? testGlobals[testRuntimeKey]?.adapters?.[app] : undefined) ??
+      apps[app]
     if (!Object.hasOwn(apps, app) || !factory) throw new RouteError('APP', t('不支持此应用'))
     const old = this.components.get(app)
     if (old) return old
@@ -526,6 +580,9 @@ class Service {
     await this.pollDm(taskSignal)
   }
   async pollDm(taskSignal?: AbortSignal) {
+    this.registerChannel()
+    await this.channel?.ensure()
+    this.channel?.sync()
     const signal = this.roundSignal(taskSignal)
     if (signal?.aborted || this.running || this.dmBusy || this.replying) return
     this.dmBusy = true
@@ -538,6 +595,7 @@ class Service {
         try {
           if (app === 'douyin') await this.ensureDouyinOwner()
           await pollOwnerDm(this.dmPorts(app), this.rt.now(), signal)
+          if (app === 'douyin') await this.channel?.poll(signal)
           signal?.throwIfAborted()
           // 待回复私信只阻止所属平台的公开互动。
           if (dmOf(scopedKv(this.kv, app)).pendingReplies.length || this.replying) continue
@@ -672,7 +730,25 @@ class Service {
     const plan = makePlan(s, this.kv.get('plan'), now, this.rt.random)
     this.kv.set('plan', plan)
     return {
-      apps: Object.keys(apps).map((app) => this.appStatus(app, now)),
+      apps: Object.keys(apps).map((app) => ({
+        ...this.appStatus(app, now),
+        ...(app === 'douyin'
+          ? {
+              channel: !s.douyinChannel
+                ? { label: t('渠道未开启') }
+                : !this.ctx.channels?.registerProvider
+                  ? { label: t('宿主不支持') }
+                  : {
+                      label:
+                        this.channel?.state === 'online' && this.channel.sessions.size
+                          ? t('已连接（{id}）', {
+                              id: this.channel.accountId ?? [...this.channel.sessions.keys()][0] ?? '',
+                            })
+                          : (this.channel?.reason ?? t('未登录')),
+                    },
+            }
+          : {}),
+      })),
       home: homeDto,
       character: listCharacters().find((c) => c.id === s.characterId)
         ? { id: s.characterId, name: listCharacters().find((c) => c.id === s.characterId)!.name }
@@ -739,6 +815,9 @@ const extension: Extension = {
   startBackground(ctx, signal) {
     const svc = service(ctx)
     svc.signal = signal
+    svc.channel = undefined
+    svc.channelHandle = undefined
+    svc.registerChannel()
     for (const app of enabledApps(svc.s)) {
       const p = svc.ports(app)
       p.kv.set('live', { ...liveOf(p), seeded: false, nextAt: 0 })
@@ -812,6 +891,21 @@ const extension: Extension = {
   },
   hooks: {
     beforePrompt(input, ctx) {
+      if (isVisitor(ctx))
+        return {
+          ...input,
+          injections: [
+            ...(input.injections ?? []),
+            {
+              id: 'app-life-visitor',
+              label: 'App Life',
+              content: visitorMemory(ctx.storage),
+              position: 'after_char',
+              role: 'system',
+              depth: 0,
+            },
+          ],
+        }
       const svc = service(ctx),
         home = ctx.storage.get<{ chatId: string; characterId: string }>('home')
       if (!home || ctx.chatId !== home.chatId || home.characterId !== svc.s.characterId) return input
@@ -857,7 +951,7 @@ const extension: Extension = {
       }
     },
     async onEvent(event, ctx) {
-      if (event.type !== 'message:saved' || !event.message) return
+      if (isVisitor(ctx) || event.type !== 'message:saved' || !event.message) return
       const svc = service(ctx),
         home = ctx.storage.get<{ chatId: string; characterId: string }>('home')
       if (!home || event.message.chatId !== home.chatId || home.characterId !== svc.s.characterId) return
@@ -885,6 +979,8 @@ const extension: Extension = {
     },
   },
   tools(ctx) {
+    if (isVisitor(ctx))
+      return homeTools(service(ctx)).filter((tool) => ['douyin_watch', 'douyin_search'].includes(tool.name))
     const svc = service(ctx),
       home = ctx.storage.get<{ chatId: string; characterId: string }>('home')
     if (!home || home.chatId !== ctx.chatId || home.characterId !== svc.s.characterId) return []

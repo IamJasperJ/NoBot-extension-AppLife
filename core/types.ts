@@ -375,13 +375,16 @@ export interface AppAdapter {
   ): Promise<ContentDigest>
 
   directMessages: {
+    conversations?(opts: { signal?: AbortSignal }): Promise<DmConversation[]>
+
     /** 与某人的私信，只返回 seq 大于 afterSeq 的，按 seq 升序；afterSeq 为空时只返回最近 limit 条 */
     list(
       peerId: string,
       opts: { afterSeq: string | null; limit: number; signal?: AbortSignal },
     ): Promise<DirectMessage[]>
     captureImages?(peerId: string, message: DirectMessage, signal?: AbortSignal): Promise<Uint8Array[]>
-    send(peerId: string, text: string, signal?: AbortSignal): Promise<void>
+    // biome-ignore lint/suspicious/noConfusingVoidType: 保留旧适配器的 Promise<void>，渠道适配器可额外返回回执
+    send(peerId: string, text: string, signal?: AbortSignal): Promise<void | { id: string }>
     shareVideo?(peerId: string, itemId: string, signal?: AbortSignal, opts?: { searchTerms?: string[] }): Promise<void>
     /** 双方是否互相关注（B 站私信专线的硬性前提） */
     mutual(peerId: string, signal?: AbortSignal): Promise<boolean>
@@ -420,4 +423,12 @@ export interface AppAdapter {
 
   /** 依赖体检：例如 ffmpeg 是否可用（路径、版本） */
   diagnose(): Promise<{ name: string; ok: boolean; detail: string }[]>
+}
+
+export interface DmConversation {
+  peerId: string
+  name: string
+  lastAt: number
+  unread: number
+  isGroup: boolean
 }

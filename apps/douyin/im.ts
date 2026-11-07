@@ -10,6 +10,7 @@
 import { type BrowserPage, BrowserSkippedError, type SharedWork } from '../../core/types'
 import { t } from '../../i18n'
 import { NavigationTimeoutError } from './cdp'
+import { photoImageScript } from './photo-images'
 import { CaptchaError } from './risk'
 
 export interface ChatMessage {
@@ -232,6 +233,22 @@ const imageBytesScript = async (args: { sid: string; index: number }) => {
   }
   if (!image && !fallback) return ''
   const url = new URL(image ? image.currentSrc || image.src : fallback, location.href)
+  if (!fallback && url.protocol === 'data:') {
+    // 页面已解密的缩略图直接解析，避免网络请求，也限制解码前后的体积。
+    const match = /^data:image\/[^;,]+(;base64)?,([\s\S]*)$/i.exec(url.href)
+    const maxBytes = 5 * 1024 * 1024
+    if (!match?.[2] || match[2].length > maxBytes * 4) return ''
+    try {
+      const encoded = match[2]
+      const bytes = match[1]
+        ? atob(decodeURIComponent(encoded))
+        : encoded.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+      if (!bytes.length || bytes.length > maxBytes) return ''
+      return btoa(bytes)
+    } catch {
+      return ''
+    }
+  }
   const allowed = (url: URL) =>
     url.protocol === 'https:' && (url.hostname === 'douyinpic.com' || url.hostname.endsWith('.douyinpic.com'))
   if (fallback ? !allowed(url) : !['https:', 'http:', 'blob:'].includes(url.protocol)) return ''
@@ -256,7 +273,15 @@ export async function captureMessageImages(page: BrowserPage, sid: string, count
   const images: Uint8Array[] = []
   for (let index = 0; index < Math.min(4, count); index++) {
     try {
-      if (page.backend === 'chrome') {
+      const original = await page.evaluate(photoImageScript, { sid, index }, { readonly: true }).catch(() => '')
+      if (typeof original === 'string' && original) {
+        const bytes = new Uint8Array(Buffer.from(original, 'base64'))
+        if (bytes.length && bytes.length <= 5 * 1024 * 1024) {
+          images.push(bytes)
+          continue
+        }
+      }
+      if (page.backend === 'chrome' || original === '') {
         const base64 = await page.evaluate(imageBytesScript, { sid, index }, { readonly: true }).catch(() => '')
         if (base64) {
           const bytes = new Uint8Array(Buffer.from(base64, 'base64'))
@@ -834,4 +859,68 @@ export async function confirmVideoShare(
       return true
   }
   return false
+}
+
+/** 只信 fiber 的对端标识，昵称与 DOM 文本仅作展示。 */
+export const conversationsScript = () => {
+  const out: import('../../core/types').DmConversation[] = []
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  for (const node of Array.from(document.querySelectorAll('[data-e2e="conversation-item"]'))) {
+    const key = Object.keys(node).find((k) => k.startsWith('__reactFiber$'))
+    if (!key) continue
+    let fiber = object((node as unknown as Record<string, unknown>)[key])
+    for (let depth = 0; depth < 14 && Object.keys(fiber).length; depth++, fiber = object(fiber.return)) {
+      const conversation = object(object(fiber.memoizedProps).conversation)
+      const peerId = String(conversation.toParticipantSecUserId || '')
+      if (!peerId) continue
+      const last = object(conversation.lastMessage)
+      const participant = object(conversation.toParticipant)
+      const rawAt = Number(
+        conversation.lastMessageTime ?? conversation.updatedAt ?? last.createdAt ?? last.createTime ?? 0,
+      )
+      // 页面 IM 时间可能是秒、毫秒或微秒；不要用本轮时间伪造消息时间。
+      const lastAt = rawAt > 1e14 ? Math.floor(rawAt / 1000) : rawAt > 0 && rawAt < 1e11 ? rawAt * 1000 : rawAt
+      // biome-ignore lint/performance/useDomNodeTextContent: 昵称回退需要按页面可见换行取首行，不能拼入隐藏节点
+      const visibleName = (node as HTMLElement).innerText?.split('\n')[0]
+      out.push({
+        peerId,
+        name: String(
+          conversation.name || conversation.toParticipantName || participant.nickname || visibleName || peerId,
+        ),
+        lastAt: Number.isFinite(lastAt) ? lastAt : 0,
+        unread: Math.max(0, Number(conversation.unreadCount ?? conversation.unread ?? 0) || 0),
+        isGroup:
+          conversation.isGroup === true ||
+          Number(conversation.conversationType) === 2 ||
+          Number(conversation.type) === 2,
+      })
+      break
+    }
+  }
+  return out
+}
+
+export async function readConversations(page: BrowserPage) {
+  if (!page.url().startsWith('https://www.douyin.com/chat')) {
+    try {
+      await page.goto('https://www.douyin.com/chat', { timeout: 30000 })
+    } catch (error) {
+      if (!(error instanceof NavigationTimeoutError)) throw error
+      const href = page.refreshUrl
+        ? await page.refreshUrl()
+        : await page.evaluate(() => location.href, null, { readonly: true })
+      const url = new URL(href)
+      if (url.origin !== 'https://www.douyin.com' || url.pathname !== '/chat') throw error
+    }
+    await sleep(page, 3000)
+  }
+  for (let i = 0; i < 20; i++) {
+    if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify' as const }
+    if (await page.evaluate(loginScript, null, { readonly: true })) return { status: 'login' as const }
+    const conversations = await page.evaluate(conversationsScript, null, { readonly: true })
+    if (conversations.length) return { status: 'open' as const, conversations }
+    await sleep(page, 750)
+  }
+  return { status: 'open' as const, conversations: [] }
 }

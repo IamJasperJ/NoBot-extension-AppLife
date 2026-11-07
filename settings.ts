@@ -105,6 +105,14 @@ export function settingsSchema(): ExtensionSettingField[] {
     number('liveDailyReplies', '每日弹幕回复上限', 0, 30),
     heading('douyinHeading', '抖音'),
     {
+      ...bool('douyinChannel', '抖音私信分会话（渠道）'),
+      hint: t('每位联系人单独建会话；新联系人需要在渠道页批准，网页自动化有风控和封号风险'),
+    },
+    {
+      ...number('douyinChannelDaily', '每人每日渠道回复上限'),
+      hint: t('每位联系人每天最多发送的回复段数，0 表示不发送'),
+    },
+    {
       ...bool('douyinEnabled', '刷抖音'),
       hint: t('抖音需要无头浏览器：启用后在「今天」页安装浏览器组件（约 190 MB）'),
     },

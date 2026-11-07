@@ -6,6 +6,20 @@ const en = {
   '正在操作…': 'Applying input…',
   '可以直接在截图上点击或拖动（比如拖动滑块）':
     'Click or drag directly on the screenshot (for example, to move a slider)',
+  抖音私信: 'Douyin DMs',
+  '抖音私信分会话（渠道）': 'Separate Douyin DM chats (channels)',
+  '每位联系人单独建会话；新联系人需要在渠道页批准，网页自动化有风控和封号风险':
+    'Create a separate chat per contact. Approve new contacts on the Channels page. Web automation risks restrictions and account bans.',
+  每人每日渠道回复上限: 'Daily channel reply limit per person',
+  '每位联系人每天最多发送的回复段数，0 表示不发送':
+    'Maximum reply segments sent to each contact per day. Set 0 to disable sending.',
+  '抖音网页自动化存在风控和封号风险，请谨慎开启':
+    'Douyin web automation risks restrictions and account bans. Enable with care.',
+  渠道每日回复上限已达到: 'Daily channel reply limit reached',
+  渠道未开启: 'Channel is disabled',
+  宿主不支持: 'Host does not support channels',
+  '已连接（{id}）': 'Connected ({id})',
+  去渠道页批准联系人: 'Go to the Channels page to approve contacts',
   今天: 'Today',
   日记: 'Diary',
   看过的: 'Watched',
@@ -1825,6 +1839,20 @@ export default function activate(api) {
           ),
           a.account && h('span', null, `${a.account.name} · ${a.account.id}`),
         ),
+        a.id === 'douyin' &&
+          a.channel &&
+          h(
+            'div',
+            { className: 'al-row' },
+            h('span', { className: 'al-muted' }, a.channel.label),
+            typeof api.openView === 'function'
+              ? h(
+                  'button',
+                  { className: 'al-btn', onClick: () => api.openView('extensions', 'channels') },
+                  t('去渠道页批准联系人'),
+                )
+              : h('span', { className: 'al-muted' }, t('去渠道页批准联系人')),
+          ),
         a.id === 'douyin' &&
           a.owner &&
           h(

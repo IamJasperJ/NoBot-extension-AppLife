@@ -85,33 +85,16 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
           const watchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
           const ids = [...new Set(fresh.map((m) => m.shared?.itemId).filter((id): id is string => !!id))].slice(0, 2)
           for (const id of ids) {
-            try {
-              const digest = await abortable(() => watchWork(p, id, 'full', now, watchSignal), watchSignal)
-              let hasFrames = false
-              if (digest.frames && p.saveImage) {
-                try {
-                  const image = await abortable(() => p.saveImage!(digest.frames!.grid), watchSignal)
-                  images.push(image)
-                  hasFrames = true
-                } catch {
-                  // 保存失败时不能告诉模型它已经看到了画面。
-                }
-              }
-              watched.set(
-                id,
-                `${digestMaterial(p.adapter.id, digest, 3000, 3000)}\n${
-                  hasFrames
-                    ? `The owner shared this work; you have already watched it (${digest.subtitle?.trim() ? 'frames and subtitles above' : 'frames above; it has no subtitles'}); react to its actual content; do not search for it again.`
-                    : `The owner shared this work. Visual frames are unavailable; do not claim to have seen them. To inspect it, call ${p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id}_watch with id: ${id} and look: true.`
-                }`,
-              )
-            } catch (error) {
-              p.log(error)
-              watched.set(
-                id,
-                `The owner shared this work, but watching failed or timed out. Do not claim to have watched it. Call ${p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id}_watch with id: ${id} and look: true before commenting on its content.`,
-              )
-            }
+            watched.set(
+              id,
+              await sharedDmMaterial(p, id, now, watchSignal, 'The owner', async (bytes) => {
+                if (!p.saveImage) return false
+                const image = await p.saveImage(bytes)
+                watchSignal.throwIfAborted()
+                images.push(image)
+                return true
+              }),
+            )
             signal?.throwIfAborted()
           }
           for (const message of fresh) {
@@ -122,7 +105,9 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
               for (const bytes of shots.slice(0, 4 - images.length)) {
                 if (!bytes.length || bytes.length > 5 * 1024 * 1024) continue
                 try {
-                  images.push(await p.saveImage(bytes))
+                  const image = await p.saveImage(bytes)
+                  watchSignal.throwIfAborted()
+                  images.push(image)
                 } catch {
                   // 附件保存失败也保留文字占位，不阻断私信回复。
                 }
@@ -292,5 +277,36 @@ async function abortable<T>(run: () => Promise<T>, signal: AbortSignal): Promise
     return await Promise.race([run(), aborted])
   } finally {
     signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** 主人与渠道共用观看、超时及帧不可用的降级说明；来源称谓由调用方明确传入。 */
+export async function sharedDmMaterial(
+  p: Pick<DmPorts, 'adapter' | 'kv' | 'settings' | 'log'>,
+  id: string,
+  now: number,
+  signal: AbortSignal,
+  sender: 'The owner' | 'The sender',
+  save: (bytes: Uint8Array, mime: string) => Promise<boolean>,
+): Promise<string> {
+  const tool = p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id
+  try {
+    const digest = await abortable(() => watchWork(p, id, 'full', now, signal), signal)
+    let frames = false
+    if (digest.frames) {
+      try {
+        frames = await abortable(() => save(digest.frames!.grid, digest.frames!.mime), signal)
+      } catch {
+        /* 帧保存失败时不声称已看到画面。 */
+      }
+    }
+    return `${digestMaterial(p.adapter.id, digest, 3000, 3000)}\n${
+      frames
+        ? `${sender} shared this work; you have already watched it (${digest.subtitle?.trim() ? 'frames and subtitles above' : 'frames above; it has no subtitles'}); react to its actual content; do not search for it again.`
+        : `${sender} shared this work. Visual frames are unavailable; do not claim to have seen them. To inspect it, call ${tool}_watch with id: ${id} and look: true.`
+    }`
+  } catch (error) {
+    p.log(error)
+    return `${sender} shared this work, but watching failed or timed out. Do not claim to have watched it. Call ${tool}_watch with id: ${id} and look: true before commenting on its content.`
   }
 }

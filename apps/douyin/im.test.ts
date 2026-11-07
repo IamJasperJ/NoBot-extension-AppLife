@@ -80,8 +80,8 @@ test('局部截图使用消息定位和 CDP clip，失败或超限只跳过，�
   expect(await captureMessageImages(page, '123', 8)).toEqual([new Uint8Array([1, 2]), new Uint8Array([1, 2])])
   expect(clips).toHaveLength(4)
   expect(clips[0]).toMatchObject({ format: 'png', clip: { x: 10, y: 20, width: 100, height: 80, scale: 1 } })
-  expect(positions[0]).toEqual({ sid: '123', index: 0, scroll: true })
-  expect(positions[1]).toEqual({ sid: '123', index: 0, scroll: false })
+  expect(positions[1]).toEqual({ sid: '123', index: 0, scroll: true })
+  expect(positions[2]).toEqual({ sid: '123', index: 0, scroll: false })
   expect(await captureMessageImages(page, 'plain', 0)).toEqual([])
   expect(clips).toHaveLength(4)
 })
@@ -279,4 +279,42 @@ test('表情正文缺少 img 时只读取同条消息的 douyinpic 地址，禁�
     expect(images).toEqual(url.startsWith('https://fake.douyinpic.com/') ? [new Uint8Array([1, 2])] : [])
     expect(fetched).toBe(url.startsWith('https://fake.douyinpic.com/') ? 1 : 0)
   }
+})
+
+test('会话列表只从 fiber 取 sec_uid，识别群聊、未读与时间，缺标识跳过', async () => {
+  const { conversationsScript, readConversations } = await import('./im')
+  const node = (conversation: unknown, text = 'DOM nickname') => ({
+    __reactFiber$test: { memoizedProps: {}, return: { memoizedProps: { conversation } } },
+    innerText: text,
+  })
+  const rows = runInNewContext(`(${conversationsScript.toString()})()`, {
+    document: {
+      querySelectorAll: () => [
+        node({
+          toParticipantSecUserId: 'sec-1',
+          toParticipantName: 'Alice',
+          unreadCount: 3,
+          lastMessage: { createdAt: 1794000000 },
+        }),
+        node({ toParticipantSecUserId: 'group-id', name: 'Group', conversationType: 2, updatedAt: 1794000000000 }),
+        node({ name: 'sec-guess', unreadCount: 10 }),
+        node({ toParticipantSecUserId: 'sec-2', isGroup: true }),
+      ],
+    },
+  })
+  expect(JSON.parse(JSON.stringify(rows))).toEqual([
+    { peerId: 'sec-1', name: 'Alice', unread: 3, lastAt: 1794000000000, isGroup: false },
+    { peerId: 'group-id', name: 'Group', unread: 0, lastAt: 1794000000000, isGroup: true },
+    { peerId: 'sec-2', name: 'DOM nickname', unread: 0, lastAt: 0, isGroup: true },
+  ])
+  const calls: unknown[] = []
+  const page = {
+    url: () => 'https://www.douyin.com/chat',
+    evaluate: async (fn: unknown, _arg: unknown, options: unknown) => {
+      calls.push(options)
+      return fn === conversationsScript ? rows : false
+    },
+  } as unknown as BrowserPage
+  expect((await readConversations(page)).status).toBe('open')
+  expect(calls.every((opts) => (opts as { readonly: boolean }).readonly)).toBe(true)
 })

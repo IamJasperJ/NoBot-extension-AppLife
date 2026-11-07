@@ -27,6 +27,7 @@ export interface ExtensionContext {
   storage: KV
   settings: Record<string, unknown>
   chatId: string
+  channels?: ChannelAPI
   tasks?: {
     register(
       definition: {
@@ -83,4 +84,85 @@ export interface HostModules {
 /** 与宿主同名辅助函数一样只返回定义；安装时由宿主验证扩展。 */
 export function defineExtension(extension: Extension): Extension {
   return extension
+}
+
+// 结构声明与宿主渠道 v2 保持一致，不从宿主加载运行时代码。
+export interface ChannelAccount {
+  id: string
+  config: Record<string, unknown>
+  cursor: unknown
+}
+export interface ChannelIO {
+  emit(message: {
+    id: string
+    chat: { id: string; title: string; scope?: 'private' | 'group' }
+    from: { id: string; name: string }
+    text: string
+    images?: { bytes: Uint8Array; mime: string }[]
+    context?: string
+    replyTo?: string
+    sentAt: number
+  }): Promise<void>
+  status(state: 'connecting' | 'online' | 'offline' | 'paused', reason?: string): void
+  saveCursor(cursor: unknown): void
+  setOwner(externalId: string | null): void
+}
+export interface ChannelProvider {
+  id: string
+  name: string
+  riskNotice?: string
+  scopes: ('private' | 'group')[]
+  canInitiate: boolean
+  limits: { maxTextLength: number; minIntervalMs?: number; perMinute?: number }
+  media: { inboundImages: boolean; outboundImages: boolean; voice: boolean }
+  defaults?: {
+    newLocation?: { private?: 'auto' | 'approve' | 'existing-only'; group?: 'auto' | 'approve' | 'existing-only' }
+  }
+  accountFields: ExtensionSettingField[]
+  /** 账号由扩展自己管理（v2.1），渠道页不显示「添加」。 */
+  managedAccounts?: boolean
+  promptHint?: string
+  start(account: ChannelAccount, io: ChannelIO, signal: AbortSignal): void | Promise<void>
+  send(
+    account: ChannelAccount,
+    message: { chatId: string; text: string; replyTo?: string },
+    signal: AbortSignal,
+  ): Promise<{ id: string }>
+}
+export interface ChannelAPI {
+  registerProvider(provider: ChannelProvider): { unregister(): void }
+  /** 用户没在渠道页改过角色时，再次调用会让账号角色跟随（characterFollowed）。 */
+  ensureAccount(
+    providerId: string,
+    options: { name: string; characterId?: string; groupId?: string },
+  ): Promise<{ accountId: string; characterFollowed: boolean }>
+  lookupAll(chatId: string): ChannelLookup[]
+  lookup(chatId: string): ChannelLookup | null
+}
+export interface ChannelLookup {
+  provider: string
+  accountId: string
+  bindingId: string
+  scope: 'private' | 'group'
+  external: { chat: string; title: string }
+  actors: { externalId: string; name: string; role: 'owner' | 'player' | 'blocked'; paired: boolean }[]
+  ownerPresent: boolean
+}
+export class ChannelSendError extends Error {
+  constructor(
+    readonly kind: 'not-sent' | 'unknown',
+    readonly code: string,
+    opts?: { retryAfterMs?: number },
+  ) {
+    super(code)
+    this.name = 'ChannelSendError'
+    this.retryAfterMs = opts?.retryAfterMs
+  }
+  readonly retryAfterMs?: number
+}
+export class ChannelProviderStoppedError extends Error {
+  constructor() {
+    super('Channel provider stopped')
+    this.name = 'ChannelProviderStoppedError'
+  }
 }

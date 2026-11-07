@@ -136,6 +136,23 @@ SOCKS5 的域名由代理解析。「运行体检」会从服务端尝试连接�
 
 新版 NoBot 中，后台检查使用宿主统一任务列表：「应用生活」每 60 秒检查日程、回应与周报，「应用生活私信」每 15 秒检查私信、评论与直播（各平台仍遵守自身轮询间隔）。启用后约 1 秒进行首次检查；可在 NoBot 任务列表中暂停或手动执行，并查看执行状态。暂停会向正在执行的一轮发出取消信号。NoBot 服务需要保持运行；旧版宿主仍使用插件内置定时器，启动时立即检查一次。
 
+## 抖音私信分会话
+
+需要支持渠道平台 v2 的新版 NoBot，先启用 NoBot 的「渠道」扩展。
+
+1. 在应用生活中选好角色、打开抖音，再打开「抖音私信分会话（渠道）」；扩展权限提示中批准渠道权限。
+2. 登录给角色用的抖音账号。渠道页「扩展平台」会自动出现「抖音私信」账号，使用应用生活选择的固定角色，不需要填写额外字段。登录就绪后账号显示在线。
+3. 新面孔发来私信后，到渠道页批准新位置；对方下一条消息会建立会话。每人一个会话，批准前的消息不回放。首次读取只建立历史基线，旧私信不导入。
+
+限制与恢复：
+
+- 只做一对一私聊，只回消息，不主动发私信。每人每日默认最多回复 20 段，可在设置调整；达到上限的本条直接失败，活动日志会注明未发送且不补发，不会等到次日再发。
+- 仍需开启私信监听，遵守监听时段、登录状态与平台请求保护。验证码会暂停渠道账号；在应用生活处理验证并点「已处理」，下一轮检测恢复在线后，宿主继续发送确定未发出的消息。发送结果不确定时不自动重发。
+- 主人 `sec_uid` 的私信照旧进入绑定的家会话。访客只能使用 `douyin_search` / `douyin_watch`，获得近期作品标题和感受，不获得你的日记、信件或主人资料。
+- 关闭分会话开关后，渠道页显示平台不可用，账号和会话保留；重新开启会恢复。应用生活换角色会让账号跟随，渠道页手动改过角色或模式的账号保留手动设置。
+
+英文界面中，对应开关是 **Separate Douyin DM chats (channels)**。Enable Douyin and this switch in App Life, then find the automatically created account under extension platforms on the Channels page. Approve each new contact there; their next message creates a separate chat. Requires a recent NoBot with channel provider v2 support. One-to-one replies only; no unsolicited DMs. The daily per-person quota defaults to 20 segments; messages rejected at the quota are logged and never carried over to the next day. Captcha pauses delivery until verification is resolved and the account returns online. The owner's DMs continue to use the bound home chat. Disabling the switch keeps account and chat data for later recovery.
+
 ## 页面
 
 - **今天**：计划、今日分享、当前门槛和回应率、每个平台的风控用量和暂停提示、监听状态、待审回复、浏览器组件、各平台账号与登录、依赖体检

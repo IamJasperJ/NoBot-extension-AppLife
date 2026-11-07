@@ -22,6 +22,8 @@ export interface Settings extends PlanConfig, ShareSettings {
   douyinToolComment: boolean
   douyinCommentMode: 'draft' | 'direct'
   bilibiliEnabled: boolean
+  douyinChannel: boolean
+  douyinChannelDaily: number
   douyinEnabled: boolean
   douyinBrowserBackend: 'headless' | 'chrome'
   douyinChromeCloseOnIdle: boolean
@@ -80,6 +82,8 @@ export const defaults: Settings = {
   douyinCommentMode: 'draft',
 
   bilibiliEnabled: true,
+  douyinChannel: false,
+  douyinChannelDaily: 20,
   douyinEnabled: false,
   douyinBrowserBackend: 'headless',
   douyinChromeCloseOnIdle: false,
@@ -173,6 +177,7 @@ export function settingsOf(raw: Record<string, unknown>): Settings {
   s.livePollSeconds = Math.max(30, s.livePollSeconds)
   s.commentDailyDrafts = Math.min(30, Math.max(0, Math.floor(s.commentDailyDrafts)))
   s.liveDailyReplies = Math.min(30, Math.max(0, Math.floor(s.liveDailyReplies)))
+  s.douyinChannelDaily = Math.max(0, Math.floor(s.douyinChannelDaily))
   s.dmPollSeconds = Math.max(15, s.dmPollSeconds)
   s.exploreRatio = Math.min(0.5, Math.max(0, s.exploreRatio))
   s.quietAfterIgnored = Math.min(20, Math.max(0, Math.floor(s.quietAfterIgnored)))

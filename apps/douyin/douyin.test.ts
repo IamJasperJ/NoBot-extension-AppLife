@@ -271,3 +271,25 @@ test('私信适配器保留分享作品结构和图片数量，卡片封面不�
   expect(messages[0]?.imageCount).toBeUndefined()
   expect(messages.slice(1).map((m) => m.imageCount)).toEqual([1, 1])
 })
+
+test('会话列表适配器走只读伪接口并保留 sec_uid、群聊和未读字段', async () => {
+  const f = setup()
+  const signal = new AbortController().signal
+  f.handle(async (url, init) => {
+    expect(url.pathname).toBe('/__ui/im/conversations')
+    expect(init.method ?? 'GET').toBe('GET')
+    expect(init.signal).toBe(signal)
+    return Response.json({
+      status_code: 0,
+      conversations: [
+        { peerId: 'sec', name: 'Alice', lastAt: 1000, unread: 2, isGroup: false },
+        { peerId: '', name: 'skip' },
+        { peerId: 'group', name: 'Group', lastAt: 2000, unread: 0, isGroup: true },
+      ],
+    })
+  })
+  expect(await f.adapter.directMessages.conversations!({ signal })).toEqual([
+    { peerId: 'sec', name: 'Alice', lastAt: 1000, unread: 2, isGroup: false },
+    { peerId: 'group', name: 'Group', lastAt: 2000, unread: 0, isGroup: true },
+  ])
+})

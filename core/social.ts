@@ -22,7 +22,15 @@ export interface Draft {
 export interface Activity {
   id: string
   at: number
-  kind: 'comment-reply' | 'comment-draft' | 'comment-skip' | 'comment-share' | 'dm-share' | 'gate' | 'live-reply'
+  kind:
+    | 'dm-channel'
+    | 'comment-reply'
+    | 'comment-draft'
+    | 'comment-skip'
+    | 'comment-share'
+    | 'dm-share'
+    | 'gate'
+    | 'live-reply'
   ok: boolean
   title: string
   text: string
