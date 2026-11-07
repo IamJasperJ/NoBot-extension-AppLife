@@ -2,7 +2,7 @@ import { expect, mock, test } from 'bun:test'
 import type { ChannelAPI, ChannelIO } from '../host-api'
 import { ChannelProviderStoppedError, ChannelSendError } from '../host-api'
 import { memory } from '../test-utils'
-import { DouyinChannel, visitorMemory } from './channel'
+import { DouyinChannel, visitorMemory, visitorMessage, visitorTurn } from './channel'
 import type { DmPorts } from './dm'
 import { defaults, remember } from './state'
 import { type AppAdapter, type DirectMessage, type DmConversation, DmNotSentError, TrafficError } from './types'
@@ -424,4 +424,82 @@ test('渠道暂停前保持游标，监听时段外和退出登录不读取，�
   } finally {
     await g.close()
   }
+})
+
+const turnBinding = (provider: string, chat: string, ownerPresent = false): import('../host-api').ChannelLookup => ({
+  provider,
+  accountId: provider,
+  bindingId: chat,
+  scope: 'private',
+  external: { chat, title: chat },
+  actors: [],
+  ownerPresent,
+})
+
+test('消息来源纯判断：抖音访客、主人、其他渠道及无来源', () => {
+  const bindings = [turnBinding('onebot11', 'qq'), turnBinding('app-life.douyin', 'visitor')]
+  const user = (clientMessageId?: string) => ({ role: 'user', meta: { clientMessageId } })
+  expect(visitorMessage(user('app-life.douyin:visitor:1'), bindings, 'owner')).toBe(true)
+  expect(visitorMessage(user('app-life.douyin:owner:1'), bindings, 'owner')).toBe(false)
+  expect(visitorMessage(user('app-life.douyin:visitor:1'), [turnBinding('app-life.douyin', 'visitor', true)], '')).toBe(
+    false,
+  )
+  expect(visitorMessage(user('app-life.douyin:visitor:1'), [turnBinding('app-life.douyin', 'other', true)], '')).toBe(
+    true,
+  )
+  for (const source of ['onebot11:qq:1', 'telegram:peer:1', undefined, 'app-life.douyin:', 'app-life.douyin:peer:']) {
+    expect(visitorMessage(user(source), bindings, '')).toBe(false)
+  }
+  expect(
+    visitorMessage({ role: 'assistant', meta: { clientMessageId: 'app-life.douyin:visitor:1' } }, bindings, ''),
+  ).toBe(false)
+})
+
+test('本轮取最近用户消息，兼容旧 lookup、缺渠道和读取失败', () => {
+  let messages = [
+    { role: 'user', meta: { clientMessageId: 'app-life.douyin:visitor:1' } },
+    { role: 'assistant', meta: {} },
+  ]
+  const getChatInfo = mock(() => ({ messages }))
+  const binding = turnBinding('app-life.douyin', 'visitor')
+  const lookupAll = mock(() => [turnBinding('onebot11', 'qq'), binding])
+  const ctx = {
+    chatId: 'chat',
+    host: { getChatInfo },
+    storage: memory(),
+    settings: {},
+    channels: { lookupAll, lookup: () => binding },
+  } as unknown as import('../host-api').ExtensionContext
+  expect(visitorTurn(ctx)).toBe(true)
+  expect(getChatInfo).toHaveBeenCalledWith('chat', 50)
+  expect(lookupAll).toHaveBeenCalledWith('chat')
+  messages = [...messages, { role: 'user', meta: { clientMessageId: 'onebot11:qq:2' } }]
+  expect(visitorTurn(ctx)).toBe(false)
+  messages = messages.slice(0, 2)
+  expect(visitorTurn({ ...ctx, channels: { ...ctx.channels!, lookupAll: undefined } })).toBe(true)
+  expect(visitorTurn({ ...ctx, channels: undefined })).toBe(false)
+  getChatInfo.mockImplementation(() => {
+    throw new Error('读取失败')
+  })
+  expect(visitorTurn(ctx)).toBe(false)
+  expect(visitorTurn(ctx, { chatId: 'event-chat', ...messages[0]! })).toBe(true)
+  expect(lookupAll).toHaveBeenLastCalledWith('event-chat')
+})
+
+test('主人 sec_uid 复用设置解析及与当前输入匹配的缓存', () => {
+  const owner = 'MS4wLjABowner12345678'
+  const ctx = {
+    chatId: 'chat',
+    host: {},
+    storage: memory(),
+    settings: { douyinOwnerId: `https://www.douyin.com/user/${owner}` },
+    channels: { lookupAll: () => [], lookup: () => null },
+  } as unknown as import('../host-api').ExtensionContext
+  const message = { chatId: 'chat', role: 'user', meta: { clientMessageId: `app-life.douyin:${owner}:1` } }
+  expect(visitorTurn(ctx, message)).toBe(false)
+  ctx.settings.douyinOwnerId = '@owner'
+  ctx.storage.set('douyin-owner', { input: '@owner', secUid: owner })
+  expect(visitorTurn(ctx, message)).toBe(false)
+  ctx.settings.douyinOwnerId = '@other'
+  expect(visitorTurn(ctx, message)).toBe(true)
 })

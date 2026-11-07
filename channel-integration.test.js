@@ -263,6 +263,7 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       await host.waitIdle(binding.chatId, 5000)
       const info = host.getChatInfo(binding.chatId, 100)
       const inbound = info.messages.findLast((m) => m.role === 'user')
+      expect(inbound.meta.clientMessageId).toBe(`app-life.douyin:${visitor}:5`)
       expect(inbound.content).toBe('Alice 视频里讲了什么')
       expect(inbound.content).not.toContain(material)
       expect(inbound.meta.context).toContain(material)

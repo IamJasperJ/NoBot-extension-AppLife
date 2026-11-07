@@ -7,7 +7,7 @@ import { ensureOwner, type OwnerCache } from './apps/douyin/owner'
 import { BridgeOfflineError, BridgePausedError, ChromeBridge } from './browser/bridge'
 import { ExtensionSession } from './browser/extension-session'
 import { chromeExtensionVersion, chromeExtensionZip } from './browser/zip'
-import { DouyinChannel, visitorMemory } from './core/channel'
+import { DouyinChannel, visitorMemory, visitorTurn } from './core/channel'
 import { commentsOf, DraftError, pollComments, sendDraft } from './core/comments'
 import { type DayPorts, runDay } from './core/day'
 import { type DmPorts, pollOwnerDm, replyOwnerDm } from './core/dm'
@@ -64,10 +64,6 @@ import { setLanguageSource, t } from './i18n'
 import { settingsSchema } from './settings'
 
 setLanguageSource(getLanguage)
-function isVisitor(ctx: ExtensionContext) {
-  const binding = ctx.channels?.lookup?.(ctx.chatId)
-  return binding?.provider === 'app-life.douyin' && !binding.ownerPresent
-}
 type Context = Omit<ExtensionContext, 'chatId'>
 const runtime: Runtime = {
   fetch,
@@ -213,6 +209,27 @@ function service(ctx: Context): Service {
   }
   svc.ctx = ctx
   return svc
+}
+/** 沿父链找最近的用户消息 id；读不到会话或链断了返回 undefined（不知道来源），没有用户消息返回 null。 */
+export function nearestUserMessage(
+  ctx: Pick<ExtensionContext, 'host'>,
+  message: { chatId: string; parentId?: string | null },
+): string | null | undefined {
+  try {
+    const byId = new Map(ctx.host.getChatInfo(message.chatId, 200).messages.map((m) => [m.id, m]))
+    const seen = new Set<string>()
+    let id = message.parentId ?? null
+    while (id && !seen.has(id)) {
+      seen.add(id)
+      const current = byId.get(id)
+      if (!current) return undefined
+      if (current.role === 'user') return current.id
+      id = current.parentId ?? null
+    }
+    return null
+  } catch {
+    return undefined
+  }
 }
 class Service {
   channel?: DouyinChannel
@@ -891,7 +908,7 @@ const extension: Extension = {
   },
   hooks: {
     beforePrompt(input, ctx) {
-      if (isVisitor(ctx))
+      if (visitorTurn(ctx))
         return {
           ...input,
           injections: [
@@ -951,7 +968,7 @@ const extension: Extension = {
       }
     },
     async onEvent(event, ctx) {
-      if (isVisitor(ctx) || event.type !== 'message:saved' || !event.message) return
+      if (event.type !== 'message:saved' || !event.message || visitorTurn(ctx, event.message)) return
       const svc = service(ctx),
         home = ctx.storage.get<{ chatId: string; characterId: string }>('home')
       if (!home || event.message.chatId !== home.chatId || home.characterId !== svc.s.characterId) return
@@ -966,10 +983,12 @@ const extension: Extension = {
       if (event.message.role === 'assistant' && event.message.status !== 'error' && svc.pending() && !svc.replying) {
         svc.replying = true
         try {
+          // 回复只回到来源：只有在回那条等待中的私信时才发回私信。
+          const replyTo = nearestUserMessage(ctx, event.message)
           for (const app of enabledApps(svc.s)) {
             if (dmOf(scopedKv(svc.kv, app)).pendingReplies.length) {
               if (app === 'douyin') await svc.ensureDouyinOwner()
-              await replyOwnerDm(svc.dmPorts(app), event.message.content, svc.rt.now(), svc.signal)
+              await replyOwnerDm(svc.dmPorts(app), event.message.content, svc.rt.now(), svc.signal, replyTo)
             }
           }
         } finally {
@@ -979,7 +998,7 @@ const extension: Extension = {
     },
   },
   tools(ctx) {
-    if (isVisitor(ctx))
+    if (visitorTurn(ctx))
       return homeTools(service(ctx)).filter((tool) => ['douyin_watch', 'douyin_search'].includes(tool.name))
     const svc = service(ctx),
       home = ctx.storage.get<{ chatId: string; characterId: string }>('home')

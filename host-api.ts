@@ -136,7 +136,7 @@ export interface ChannelAPI {
     providerId: string,
     options: { name: string; characterId?: string; groupId?: string },
   ): Promise<{ accountId: string; characterFollowed: boolean }>
-  lookupAll(chatId: string): ChannelLookup[]
+  lookupAll?(chatId: string): ChannelLookup[]
   lookup(chatId: string): ChannelLookup | null
 }
 export interface ChannelLookup {

@@ -162,10 +162,21 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
     p.kv.set('dm', { ...latest, cursor: d.cursor, failures: d.failures, lastPollAt: d.lastPollAt, nextAt: d.nextAt })
   }
 }
-export async function replyOwnerDm(p: DmPorts, text: string, now: number, signal?: AbortSignal) {
+/**
+ * replyTo 是这条角色回复沿父链最近的用户消息 id：不是等回复的那条私信（比如在回 QQ 上的话）就不发、也不消费队列。
+ * undefined 表示查不到来源，沿用旧行为直接发。
+ */
+export async function replyOwnerDm(
+  p: DmPorts,
+  text: string,
+  now: number,
+  signal?: AbortSignal,
+  replyTo?: string | null,
+) {
   const d = dmOf(p.kv),
     pending = d.pendingReplies[0]
   if (!pending) return
+  if (replyTo !== undefined && replyTo !== pending.userMessageId) return
   const parts = splitDm(p.displayText ? p.displayText(text) : text)
   // 工具调用前的空段和纯舞台指令不消费队列，等待后续可见正文。
   if (!parts.length) return

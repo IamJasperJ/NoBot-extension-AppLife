@@ -1,12 +1,50 @@
-import type { ChannelAccount, ChannelAPI, ChannelIO, ChannelProvider } from '../host-api'
+import type { OwnerCache } from '../apps/douyin/owner'
+import type {
+  ChannelAccount,
+  ChannelAPI,
+  ChannelIO,
+  ChannelLookup,
+  ChannelProvider,
+  ExtensionContext,
+} from '../host-api'
 import { ChannelSendError } from '../host-api'
 import { t } from '../i18n'
 import { type DmPorts, OWNER_SHARE_REPLY_RULE, sharedDmMaterial, stripStage } from './dm'
 import { imageMime } from './image-mime'
 import { inWindow } from './plan'
 import { activity, countAttempt, todayCount } from './social'
-import { type HistoryItem, type Settings, watchedHistory } from './state'
+import { type HistoryItem, type Settings, scopedSettings, settingsOf, watchedHistory } from './state'
 import { BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
+
+interface TurnMessage {
+  role: string
+  meta?: { clientMessageId?: string }
+}
+
+/** 绑定顺序不代表本轮来源，必须用消息里的外部聊天 id 匹配绑定。 */
+export function visitorMessage(message: TurnMessage | undefined, bindings: readonly ChannelLookup[], ownerId: string) {
+  const source = message?.meta?.clientMessageId?.match(/^app-life\.douyin:([^:]+):.+$/)
+  if (message?.role !== 'user' || !source) return false
+  const secUid = source[1]!
+  if (secUid === ownerId) return false
+  const binding = bindings.find((item) => item.provider === 'app-life.douyin' && item.external.chat === secUid)
+  return !binding?.ownerPresent
+}
+
+/** 事件传入自身消息，避免误读另一会话或已切换的最新回合。 */
+export function visitorTurn(ctx: ExtensionContext, message?: TurnMessage & { chatId: string }) {
+  if (!ctx.channels) return false
+  try {
+    const chatId = message ? message.chatId : ctx.chatId
+    const latest = message ?? ctx.host.getChatInfo(chatId, 50).messages.findLast((item) => item.role === 'user')
+    const bindings = ctx.channels.lookupAll?.(chatId) ?? [ctx.channels.lookup(chatId)].filter((item) => item !== null)
+    const settings = scopedSettings(settingsOf(ctx.settings), 'douyin', ctx.storage.get<OwnerCache>('douyin-owner'))
+    return visitorMessage(latest, bindings, settings.ownerId)
+  } catch {
+    // 旧宿主或会话不可读时保持非访客行为。
+    return false
+  }
+}
 
 export const VISITOR_RULE =
   "The person you are chatting with is a Douyin user, not your owner. Do not mention your owner, your diary, letters or anything about your owner's life."

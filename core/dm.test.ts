@@ -87,6 +87,18 @@ test('首次只置游标、只认主人、新消息合并，反馈与去重', as
   await pollOwnerDm(x.p, now + 120000)
   expect(x.appends).toHaveLength(1)
 })
+test('回复只回到来源：在回别处的话时不发私信、不消费队列', async () => {
+  const x = setup()
+  x.f.kv.set('dm', { ...dmOf(x.f.kv), pendingReplies: [{ userMessageId: 'dm-user', peerId: 'owner', at: now }] })
+  await replyOwnerDm(x.p, '回 QQ 的话', now, undefined, 'qq-user')
+  expect(x.sends).toHaveLength(0)
+  expect(dmOf(x.f.kv).pendingReplies).toHaveLength(1)
+  await replyOwnerDm(x.p, '没有用户消息的主动发言', now, undefined, null)
+  expect(x.sends).toHaveLength(0)
+  await replyOwnerDm(x.p, '回私信', now, undefined, 'dm-user')
+  expect(x.sends).toEqual(['回私信'])
+  expect(dmOf(x.f.kv).pendingReplies).toHaveLength(0)
+})
 test('回复只发一次、舞台清理、最多三段、互关缓存六小时、单日收件人锁', async () => {
   const x = setup()
   const pending = () => {

@@ -361,25 +361,31 @@ test('渠道只在能力存在且设置开启时注册，账号带固定角色�
   }
 })
 
-test('访客 hook 与工具隔离，ownerPresent 不走访客分支，家里会话不变', async () => {
+test('多绑定按本轮来源隔离 hook 与工具，ownerPresent 和家里会话不变', async () => {
   const f = backgroundFixture()
   const personas = spyOn(host, 'listPersonas').mockReturnValue([])
   f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
   f.ctx.settings = { ...f.ctx.settings, douyinEnabled: true, injectDiary: false }
   let ownerPresent = false
+  let clientMessageId = 'onebot11:qq:1'
+  let douyinFirst = false
+  f.ctx.host.getChatInfo = () =>
+    ({ messages: [{ role: 'user', meta: { clientMessageId } }] }) as ReturnType<Host['getChatInfo']>
+  const qq = {
+    provider: 'onebot11',
+    accountId: 'qq',
+    bindingId: 'qq',
+    scope: 'private' as const,
+    external: { chat: 'qq', title: 'QQ' },
+    actors: [],
+    ownerPresent: false,
+  }
+  const douyin = () => ({ ...qq, provider: 'app-life.douyin', external: { chat: 'peer', title: 'Peer' }, ownerPresent })
   const channels: NonNullable<ExtensionContext['channels']> = {
     registerProvider: () => ({ unregister() {} }),
-    lookupAll: () => [],
+    lookupAll: () => (douyinFirst ? [douyin(), qq] : [qq, douyin()]),
     ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
-    lookup: () => ({
-      provider: 'app-life.douyin',
-      accountId: 'account',
-      bindingId: 'binding',
-      scope: 'private',
-      external: { chat: 'peer', title: 'Peer' },
-      actors: [],
-      ownerPresent,
-    }),
+    lookup: () => (douyinFirst ? douyin() : qq),
   }
   const ctx: ExtensionContext = { ...f.ctx, chatId: 'visitor', channels }
   const input = { preset: { samplers: { functionCalling: true } }, injections: [] } as unknown as Parameters<
@@ -387,6 +393,14 @@ test('访客 hook 与工具隔离，ownerPresent 不走访客分支，家里会�
   >[0]
   try {
     f.ctx.storage.set('diary', [{ text: 'SECRET DIARY' }])
+    expect(extension.hooks.beforePrompt(input, ctx)).toBe(input)
+    expect(extension.tools(ctx)).toEqual([])
+    douyinFirst = true
+    expect(extension.hooks.beforePrompt(input, ctx)).toBe(input)
+    expect(extension.tools(ctx)).toEqual([])
+    douyinFirst = false
+    clientMessageId = 'app-life.douyin:peer:2'
+
     const result = extension.hooks.beforePrompt(input, ctx)
     expect(result.injections).toHaveLength(1)
     expect(result.injections![0]).toMatchObject({ position: 'after_char', depth: 0, role: 'system' })
@@ -396,11 +410,29 @@ test('访客 hook 与工具隔离，ownerPresent 不走访客分支，家里会�
     await extension.hooks.onEvent(
       {
         type: 'message:saved',
-        message: { chatId: 'home', role: 'user', content: 'secret' } as import('../../packages/shared/src').MessageDTO,
+        message: {
+          chatId: 'home',
+          role: 'user',
+          content: 'secret',
+          meta: { clientMessageId },
+        } as import('../../packages/shared/src').MessageDTO,
+      },
+      { ...ctx, chatId: '', channels: { ...channels, lookupAll: (id) => (id === 'home' ? [douyin()] : []) } },
+    )
+    expect(f.ctx.storage.get('feedback')).toBeUndefined()
+    await extension.hooks.onEvent(
+      {
+        type: 'message:saved',
+        message: {
+          chatId: 'home',
+          role: 'user',
+          content: 'hello',
+          meta: { clientMessageId: 'onebot11:qq:3' },
+        } as import('../../packages/shared/src').MessageDTO,
       },
       ctx,
     )
-    expect(f.ctx.storage.get('feedback')).toBeUndefined()
+    expect(f.ctx.storage.get('feedback')).toBeDefined()
     ownerPresent = true
     expect(extension.hooks.beforePrompt(input, ctx)).toBe(input)
     expect(extension.tools(ctx)).toEqual([])
@@ -482,4 +514,25 @@ test('v2 宿主：关闭渠道时注销平台，重新开启再注册', async ()
   } finally {
     f.close()
   }
+})
+
+test('nearestUserMessage 沿父链找最近用户消息，读不到时返回 undefined', async () => {
+  const { nearestUserMessage } = await import('./server')
+  const messages = [
+    { id: 'u1', role: 'user', parentId: null },
+    { id: 'a1', role: 'assistant', parentId: 'u1' },
+    { id: 't1', role: 'tool', parentId: 'a1' },
+  ]
+  const ctx = { host: { getChatInfo: () => ({ messages }) } } as never
+  expect(nearestUserMessage(ctx, { chatId: 'c', parentId: 't1' })).toBe('u1')
+  expect(nearestUserMessage(ctx, { chatId: 'c', parentId: null })).toBeNull()
+  expect(nearestUserMessage(ctx, { chatId: 'c', parentId: 'missing' })).toBeUndefined()
+  const broken = {
+    host: {
+      getChatInfo: () => {
+        throw new Error('x')
+      },
+    },
+  } as never
+  expect(nearestUserMessage(broken, { chatId: 'c', parentId: 't1' })).toBeUndefined()
 })
