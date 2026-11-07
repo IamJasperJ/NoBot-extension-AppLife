@@ -179,7 +179,16 @@ export interface ContentDigest {
   missing: { part: 'subtitle' | 'danmaku' | 'comments' | 'frames'; reason: string }[]
 }
 
+export interface SharedWork {
+  kind: 'video' | 'slides' | 'comment'
+  itemId: string
+  title: string
+  author?: string
+  comment?: string
+}
+
 export interface DirectMessage {
+  shared?: SharedWork
   /** 已渲染图片的定位信息，不下载可能加密的资源地址。 */
   imageCount?: number
   id: string

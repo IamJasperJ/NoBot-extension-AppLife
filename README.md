@@ -71,6 +71,8 @@ shares the ones you'd like, writes you letters and keeps a private diary.*
 - 让她自己用应用：「去 B 站搜一下……」「看看这个视频 + 链接」「把这个分享到评论区」。需要在设置里打开对应平台的「交互使用应用」和细分开关。
 - 斜杠命令：`/app status` 查看状态，`/app wake` 立即醒一次，`/app skip-today` 今天休息。
 
+主人私信分享作品时，观看素材和相关提示只给模型看，聊天正文只保留原消息的文字及占位；此功能需要 NoBot 支持 `meta.context`。
+
 ![设置](docs/screenshots/al-settings.png)
 
 ## Chrome 插件：NoBot 浏览器桥

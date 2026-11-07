@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { runInNewContext } from 'node:vm'
 import type { BrowserPage } from '../../core/types'
 import { setLanguageSource } from '../../i18n'
 import { CdpPage, NavigationTimeoutError } from './cdp'
@@ -166,4 +167,116 @@ test('导航超时且实际地址不在 chat 时保留超时原因，不输入�
     evaluate: async () => 'https://www.douyin.com/',
   } as unknown as BrowserPage
   await expect(sendMessage(page, 'owner', 'hello')).rejects.toBe(error)
+})
+
+test('实测数字类型优先识别照片、空 id 表情、作品与评论，并保留结构化分享', () => {
+  const samples = [
+    {
+      type: 27,
+      pc: { aweType: 2702, inline_pic: 'fake', resource_url: { origin_url_list: ['https://fake.invalid/photo'] } },
+      text: '[图片]',
+      count: 1,
+    },
+    ...[510, 516].map((aweType) => ({
+      type: 5,
+      pc: {
+        aweType,
+        sticker_id: '',
+        image_type: 'gif',
+        emoji_type: 'recommended_emoji',
+        url: { url_list: ['https://fake.douyinpic.com/emoji.gif'] },
+      },
+      text: '[表情]',
+      count: 1,
+    })),
+    {
+      type: 8,
+      pc: { aweType: 800, itemId: '111', content_title: '猫', content_name: '作者', is_slides: false },
+      text: '[分享视频] 猫',
+      count: 0,
+      shared: { kind: 'video' as const, itemId: '111', title: '猫', author: '作者' },
+    },
+    {
+      type: 8,
+      pc: { aweType: 800, itemId: '222', content_title: '图集', is_slides: true },
+      text: '[分享图文] 图集',
+      count: 0,
+      shared: { kind: 'slides' as const, itemId: '222', title: '图集', author: '' },
+    },
+    {
+      type: 105,
+      pc: { aweType: 10500, itemId: '333', aweme_title: '视频', comment: '有趣', comment_user_name: '小明' },
+      text: '[分享评论] 小明：有趣（视频：视频）',
+      count: 0,
+      shared: { kind: 'comment' as const, itemId: '333', title: '视频', comment: '有趣' },
+    },
+    ...[0, 700].map((aweType) => ({ type: 7, pc: { aweType, text: '你好' }, text: '你好', count: 0 })),
+  ]
+  for (const sample of samples) {
+    expect(messageText(sample.pc, sample.type)).toBe(sample.text)
+    expect(messageImageCount(sample.pc, sample.type)).toBe(sample.count)
+    const [message] = attribute([
+      { own: 'them', text: '', parsedContent: sample.pc, messageType: sample.type, sid: '1', at: 1 },
+    ])
+    expect(message?.text).toBe(sample.text)
+    expect(message?.imageCount ?? 0).toBe(sample.count)
+    expect(message?.shared).toEqual('shared' in sample ? sample.shared : undefined)
+  }
+  expect(messageImageCount({ image_type: 'gif', sticker_id: '' }, 5)).toBe(1)
+  expect(messageText({ emoji_type: 'recommended_emoji', sticker_id: '' }, 5)).toBe('[表情]')
+  expect(messageText({ aweType: 0, text: '你好', image: {} })).toBe('你好 [图片]')
+  expect(messageImageCount({ aweType: 800, image: {} })).toBe(0)
+  try {
+    setLanguageSource(() => 'en')
+    expect(messageText({ aweType: 800, content_title: 'Cat' })).toBe('[Shared video] Cat')
+    expect(messageText({ aweType: 800, is_slides: true, content_title: 'Cat' })).toBe('[Shared photo post] Cat')
+    expect(messageText({ aweType: 10500, comment: 'Hi', aweme_title: 'Cat', comment_user_name: 'A' })).toBe(
+      '[Shared comment] A: Hi (Video: Cat)',
+    )
+  } finally {
+    setLanguageSource(() => 'zh')
+  }
+})
+
+test('表情正文缺少 img 时只读取同条消息的 douyinpic 地址，禁止跳转与外链', async () => {
+  for (const url of [
+    'https://fake.douyinpic.com/emoji.gif',
+    'https://douyinpic.com.evil.invalid/emoji.gif',
+    'http://fake.douyinpic.com/emoji.gif',
+  ]) {
+    let fetched = 0
+    const row = {
+      getAttribute: () => 'emoji',
+      querySelector: () => ({ querySelectorAll: () => [] }),
+      __reactFiber$fake: { memoizedProps: { message: { parsedContent: { aweType: 510, url: { url_list: [url] } } } } },
+    }
+    const page = {
+      backend: 'chrome',
+      evaluate: async (fn: (...args: unknown[]) => unknown, args: unknown) =>
+        runInNewContext(`(${fn.toString()})(args)`, {
+          args,
+          document: { querySelectorAll: () => [row] },
+          location: { href: 'https://www.douyin.com/chat' },
+          URL,
+          AbortSignal,
+          fetch: async (address: string, opts: RequestInit) => {
+            fetched++
+            expect(address).toBe(url)
+            expect(opts).toMatchObject({ credentials: 'omit', redirect: 'error' })
+            return new Response(new Uint8Array([1, 2]), { headers: { 'content-type': 'image/gif' } })
+          },
+          FileReader: class {
+            result = 'data:image/gif;base64,AQI='
+            onload?: () => void
+            readAsDataURL() {
+              this.onload?.()
+            }
+          },
+        }),
+      waitForTimeout: async () => {},
+    } as unknown as BrowserPage
+    const images = await captureMessageImages(page, 'emoji', 1)
+    expect(images).toEqual(url.startsWith('https://fake.douyinpic.com/') ? [new Uint8Array([1, 2])] : [])
+    expect(fetched).toBe(url.startsWith('https://fake.douyinpic.com/') ? 1 : 0)
+  }
 })

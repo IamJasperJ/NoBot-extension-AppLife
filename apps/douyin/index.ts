@@ -285,6 +285,17 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
           if (raw.from !== 'them' || !/^\d+$/.test(seq) || !str(raw.text)) continue
           if (afterSeq !== null && BigInt(seq) <= BigInt(afterSeq)) continue
           messages.push({
+            ...(['video', 'slides', 'comment'].includes(str(obj(raw.shared).kind))
+              ? {
+                  shared: {
+                    kind: str(obj(raw.shared).kind) as 'video' | 'slides' | 'comment',
+                    itemId: str(obj(raw.shared).itemId),
+                    title: str(obj(raw.shared).title),
+                    author: str(obj(raw.shared).author),
+                    comment: str(obj(raw.shared).comment),
+                  },
+                }
+              : {}),
             id: seq,
             seq,
             senderId: peerId,

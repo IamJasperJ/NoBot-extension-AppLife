@@ -49,6 +49,9 @@ const en: Record<string, string> = {
     'Douyin is showing a captcha. Open “Take a look at the page” in App Life to solve it, then click “Resolved”.',
 
   '[表情]': '[Sticker]',
+  '[分享视频] {title}': '[Shared video] {title}',
+  '[分享图文] {title}': '[Shared photo post] {title}',
+  '[分享评论] {commenter}：{comment}（视频：{title}）': '[Shared comment] {commenter}: {comment} (Video: {title})',
   '[图片]': '[Image]',
   '[分享]': '[Share]',
   '[分享] {title}': '[Share] {title}',

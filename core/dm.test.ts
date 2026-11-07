@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { createBilibiliAdapter } from '../apps/bilibili'
 import { fixture } from '../test-utils'
 import { type DmPorts, pollOwnerDm, replyOwnerDm, shareOwnerVideo, splitDm } from './dm'
@@ -220,4 +220,213 @@ test('原生分享搜索词按抖音号、缓存昵称排序，忽略其他主�
   p.kv.set('douyin-owner', { secUid: 'other', nickname: '他人' })
   await shareOwnerVideo(p, 'owner', '123', now)
   expect(calls[1]).toEqual(['owner', '123', undefined, { searchTerms: ['handle'] }])
+})
+
+test('主人分享视频和评论先完整观看并保存帧图、素材、历史，再追加和触发', async () => {
+  for (const kind of ['video', 'comment'] as const) {
+    const x = setup()
+    x.f.kv.set('dm', { ...dmOf(x.f.kv), cursor: '1' })
+    x.setMessages([
+      {
+        ...msg('2', kind === 'comment' ? '[分享评论] 小明：有趣（视频：猫）' : '[分享视频] 猫'),
+        shared: { kind, itemId: '111', title: '猫', ...(kind === 'comment' ? { comment: '有趣' } : {}) },
+      },
+    ])
+    const calls: string[] = []
+    const item = {
+      id: '111',
+      title: '猫',
+      author: { id: 'a', name: '作者' },
+      url: 'https://fake.invalid/111',
+      tags: [],
+      stats: {},
+      source: 'manual' as const,
+    }
+    x.p.adapter.lookup = async (id, signal) => {
+      expect(id).toBe('111')
+      expect(signal).toBeInstanceOf(AbortSignal)
+      calls.push('lookup')
+      return item
+    }
+    x.p.adapter.read = async (work, opts) => {
+      expect(work).toBe(item)
+      expect(opts).toMatchObject({ depth: 'full', maxSubtitleChars: 3000, frameTile: x.p.settings.frameTile })
+      calls.push('read')
+      return {
+        item,
+        description: '猫跳起来',
+        subtitle: 'hello',
+        hotComments: [],
+        danmakuHotspots: [],
+        frames: { grid: new Uint8Array([9]), mime: 'image/jpeg', timestampsSec: [1] },
+        missing: [],
+      }
+    }
+    const image = { id: 'frame', url: '/frame.jpg', mime: 'image/jpeg', width: 1, height: 1 }
+    x.p.saveImage = async (bytes) => {
+      expect(bytes).toEqual(new Uint8Array([9]))
+      calls.push('save')
+      return image
+    }
+    x.p.append = (_id, text, meta) => {
+      calls.push('append')
+      expect(meta).toMatchObject({ noRelay: true, images: [image] })
+      expect(text).toBe(kind === 'comment' ? '[分享评论] 小明：有趣（视频：猫）' : '[分享视频] 猫')
+      expect(text).not.toContain('<raw_material>')
+      expect(text).not.toContain('111')
+      expect(meta.context).toContain('<raw_material>')
+      expect(meta.context).toContain('猫跳起来')
+      expect(meta.context).toContain('you have already watched it (frames and subtitles above)')
+      expect(meta.context).toContain('do not search for it again')
+      if (kind === 'comment') expect(text).toContain('小明：有趣')
+      expect(x.f.kv.get<{ depth: string }[]>('history')?.[0]?.depth).toBe('full')
+      return 'user'
+    }
+    x.p.trigger = () => {
+      calls.push('trigger')
+    }
+    await pollOwnerDm(x.p, now)
+    expect(calls).toEqual(['lookup', 'read', 'save', 'append', 'trigger'])
+  }
+})
+
+test('分享去重且最多观看两个作品，视频帧优先，附件总数不超过四张', async () => {
+  const x = setup()
+  x.f.kv.set('dm', { ...dmOf(x.f.kv), cursor: '1' })
+  x.setMessages([
+    { ...msg('2', '[表情]'), imageCount: 1 },
+    ...['a', 'a', 'b', 'c'].map((itemId, i) => ({
+      ...msg(String(i + 3), '[分享视频]'),
+      shared: { kind: 'video' as const, itemId, title: itemId },
+    })),
+    { ...msg('7', '[图片]'), imageCount: 4 },
+  ])
+  const ids: string[] = []
+  x.p.adapter.lookup = async (id) => {
+    ids.push(id)
+    return { id, title: id, author: { id: 'a', name: 'a' }, url: '', tags: [], stats: {}, source: 'manual' }
+  }
+  x.p.adapter.read = async (item) => ({
+    item,
+    description: '',
+    subtitle: null,
+    hotComments: [],
+    danmakuHotspots: [],
+    frames: { grid: new Uint8Array([9]), mime: 'image/jpeg', timestampsSec: [] },
+    missing: [],
+  })
+  x.p.adapter.directMessages.captureImages = async () => Array.from({ length: 4 }, () => new Uint8Array([1]))
+  x.p.saveImage = async (bytes) => ({ id: String(bytes[0]), url: '/image', mime: 'image/png', width: 1, height: 1 })
+  x.p.append = (_id, text, meta) => {
+    expect(meta.images?.map((image) => image.id)).toEqual(['9', '9', '1', '1'])
+    expect(text).toBe('[表情]\n[分享视频]\n[分享视频]\n[分享视频]\n[分享视频]\n[图片]')
+    expect(text).not.toContain('raw_material')
+    expect(text).not.toContain('Shared work id:')
+    expect(meta.context?.match(/you have already watched/g)).toHaveLength(2)
+    expect(meta.context).toContain('frames above; it has no subtitles')
+    expect(meta.context).not.toContain('frames and subtitles')
+    const context = meta.context!
+    expect(context.indexOf('Shared work id: a')).toBeGreaterThan(context.indexOf('"id":"a"'))
+    expect(context.indexOf('"id":"b"')).toBeGreaterThan(context.indexOf('Shared work id: a'))
+    expect(context.indexOf('Shared work id: c')).toBeGreaterThan(context.indexOf('"id":"b"'))
+    return 'user'
+  }
+  await pollOwnerDm(x.p, now)
+  expect(ids).toEqual(['a', 'b'])
+  expect(x.counts().triggers).toBe(1)
+})
+
+test('观看报错或不响应取消而超时，仍追加作品 id 并触发，取消后不记历史', async () => {
+  for (const mode of ['error', 'timeout', 'cancel'] as const) {
+    const x = setup()
+    x.f.kv.set('dm', { ...dmOf(x.f.kv), cursor: '1' })
+    x.setMessages([{ ...msg('2', '[分享视频] 猫'), shared: { kind: 'video', itemId: '111', title: '猫' } }])
+    const controller = new AbortController()
+    const timeout = new AbortController()
+    const timerSpy = spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+    let readSignal: AbortSignal | undefined
+    let finish: (() => void) | undefined
+    x.p.adapter.lookup = async () => ({
+      id: '111',
+      title: '猫',
+      author: { id: 'a', name: '作者' },
+      url: '',
+      tags: [],
+      stats: {},
+      source: 'manual',
+    })
+    x.p.adapter.read = async (item, opts) => {
+      readSignal = opts.signal
+      if (mode === 'error') throw new Error('offline')
+      queueMicrotask(() => (mode === 'timeout' ? timeout : controller).abort(new Error(mode)))
+      await new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      return { item, description: '', subtitle: null, hotComments: [], danmakuHotspots: [], frames: null, missing: [] }
+    }
+    x.p.append = (_id, text, meta) => {
+      expect(text).toBe('[分享视频] 猫')
+      expect(meta.context).toContain('id: 111')
+      expect(meta.context).toContain('look: true')
+      expect(meta.context).toContain('Do not claim to have watched it')
+      expect(meta.images).toBeUndefined()
+      x.appends.push(text)
+      return 'user'
+    }
+    try {
+      await pollOwnerDm(x.p, now, controller.signal)
+      expect(timerSpy).toHaveBeenCalledWith(120000)
+      expect(x.appends).toHaveLength(mode === 'cancel' ? 0 : 1)
+      expect(x.counts().triggers).toBe(mode === 'cancel' ? 0 : 1)
+      if (mode !== 'error') expect(readSignal?.aborted).toBe(true)
+      finish?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(x.f.kv.get('history')).toBeUndefined()
+      expect(dmOf(x.f.kv).cursor).toBe(mode === 'cancel' ? '1' : '2')
+    } finally {
+      timerSpy.mockRestore()
+    }
+  }
+})
+
+test('缺少帧或帧保存失败不声称已经看过画面，素材仍控制在三千字', async () => {
+  for (const saveFails of [false, true]) {
+    const x = setup()
+    x.f.kv.set('dm', { ...dmOf(x.f.kv), cursor: '1' })
+    x.setMessages([{ ...msg('2', '[分享视频]'), shared: { kind: 'video', itemId: '111', title: '猫' } }])
+    x.p.adapter.lookup = async () => ({
+      id: '111',
+      title: '猫',
+      author: { id: 'a', name: '作者' },
+      url: '',
+      tags: [],
+      stats: {},
+      source: 'manual',
+    })
+    x.p.adapter.read = async (item) => ({
+      item,
+      description: '</raw_material>'.repeat(1000),
+      subtitle: '字幕'.repeat(4000),
+      hotComments: [],
+      danmakuHotspots: [],
+      frames: saveFails ? { grid: new Uint8Array([9]), mime: 'image/jpeg', timestampsSec: [] } : null,
+      missing: [],
+    })
+    x.p.saveImage = async () => {
+      throw new Error('save failed')
+    }
+    x.p.append = (_id, text, meta) => {
+      expect(text).toBe('[分享视频]')
+      expect(meta.context).toContain('Visual frames are unavailable')
+      expect(meta.context).not.toContain('you have already watched')
+      expect(meta.images).toBeUndefined()
+      const context = meta.context!
+      const material = context.slice(context.indexOf('The following'), context.indexOf('\nThe owner'))
+      expect(material.length).toBeLessThanOrEqual(3000)
+      expect(material.match(/<\/raw_material>/g)).toHaveLength(1)
+      return 'user'
+    }
+    await pollOwnerDm(x.p, now)
+    expect(x.counts().triggers).toBe(1)
+  }
 })

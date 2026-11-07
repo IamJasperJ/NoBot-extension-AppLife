@@ -5,16 +5,11 @@ import type { Preference, Preferences } from './prefs'
 import { digestMaterial, rawMaterial } from './prompts'
 import { attachSaid, loadShares, recordShare, shareState, unrecordShare } from './share'
 import { activity, countAttempt, draftsOf, errorText, type SocialPorts, todayCount } from './social'
-import {
-  type DiaryEntry,
-  enabledApps,
-  type HistoryItem,
-  remember,
-  type Settings,
-  toolsFor,
-  watchedHistory,
-} from './state'
+import { type DiaryEntry, enabledApps, remember, type Settings, toolsFor, watchedHistory } from './state'
 import type { CommentTarget, ContentItem, KV } from './types'
+import { manualItem, watchWork } from './watch'
+
+export { manualItem } from './watch'
 
 const clip = (text: string, limit: number) => Array.from(text).slice(0, limit).join('')
 function textArg(value: unknown, limit: number): string {
@@ -44,26 +39,6 @@ export function prefer(prefs: Preferences, verdict: unknown, kind: unknown, inpu
   }
 }
 
-export function manualItem(item: ContentItem, app: string, now: number): HistoryItem {
-  return {
-    ...item,
-    app,
-    source: 'manual',
-    topics: [],
-    heart: 0,
-    enjoy: 0,
-    forOwner: 0,
-    urge: 0,
-    explore: false,
-    reason: '',
-    notes: '',
-    depth: 'text',
-    watchedAt: now,
-    shared: false,
-    verdict: null,
-    delivered: [],
-  }
-}
 function writable(p: SocialPorts) {
   if (!p.loggedIn()) throw new Error(t('请先登录'))
   if (p.paused()) throw new Error(t('平台请求保护已暂停，请先解除暂停'))
@@ -243,20 +218,17 @@ export function homeTools(svc: ToolService): Tool[] {
       )
       add(
         `${prefix}_watch`,
-        `Read a ${app} work by URL, share text or id. Set look to inspect frames. Read-only.`,
+        `Read a ${app} work by URL, share text or id. Set look to inspect frames. When someone asks whether you watched something or you are about to comment on a work's content, set look to true. Read-only.`,
         { id_or_url: str, look: { type: 'boolean' } },
         ['id_or_url'],
         async (args, signal) => {
-          const ports = p(),
-            item = await ports.adapter.lookup(String(args.id_or_url ?? ''), signal)
-          const depth = args.look === true ? 'full' : 'text'
-          const digest = await ports.adapter.read(item, {
-            depth,
-            maxSubtitleChars: 3000,
-            frameTile: svc.s.frameTile,
+          const digest = await watchWork(
+            p(),
+            String(args.id_or_url ?? ''),
+            args.look === true ? 'full' : 'text',
+            svc.rt.now(),
             signal,
-          })
-          remember(svc.kv, { ...manualItem(item, app, svc.rt.now()), depth })
+          )
           return {
             content: digestMaterial(app, digest, 3000),
             ...(digest.frames ? { images: [{ bytes: digest.frames.grid, mime: digest.frames.mime }] } : {}),

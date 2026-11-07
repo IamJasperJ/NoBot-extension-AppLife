@@ -4,9 +4,11 @@ import { type OwnerCache, parseOwnerInput } from '../apps/douyin/owner'
 import { t } from '../i18n'
 import { dayOf, inWindow } from './plan'
 import { pollDelay } from './poll'
+import { digestMaterial } from './prompts'
 import { ownerSpoke } from './share'
 import { dmOf, feedbackOf, type Settings } from './state'
 import { type AppAdapter, BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
+import { watchWork } from './watch'
 export interface DmPorts {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   kv: KV
@@ -74,11 +76,47 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
           await p.waitIdle(home, 120000)
           signal?.throwIfAborted()
           const images: AttachmentDTO[] = []
+          const watched = new Map<string, string>()
+          // 整批分享共用两分钟预算；竞速保证不响应取消的适配器也不会阻塞回复。
+          const timeout = AbortSignal.timeout(120000)
+          const watchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+          const ids = [...new Set(fresh.map((m) => m.shared?.itemId).filter((id): id is string => !!id))].slice(0, 2)
+          for (const id of ids) {
+            try {
+              const digest = await abortable(() => watchWork(p, id, 'full', now, watchSignal), watchSignal)
+              let hasFrames = false
+              if (digest.frames && p.saveImage) {
+                try {
+                  const image = await abortable(() => p.saveImage!(digest.frames!.grid), watchSignal)
+                  images.push(image)
+                  hasFrames = true
+                } catch {
+                  // 保存失败时不能告诉模型它已经看到了画面。
+                }
+              }
+              watched.set(
+                id,
+                `${digestMaterial(p.adapter.id, digest, 3000, 3000)}\n${
+                  hasFrames
+                    ? `The owner shared this work; you have already watched it (${digest.subtitle?.trim() ? 'frames and subtitles above' : 'frames above; it has no subtitles'}); react to its actual content; do not search for it again.`
+                    : `The owner shared this work. Visual frames are unavailable; do not claim to have seen them. To inspect it, call ${p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id}_watch with id: ${id} and look: true.`
+                }`,
+              )
+            } catch (error) {
+              p.log(error)
+              watched.set(
+                id,
+                `The owner shared this work, but watching failed or timed out. Do not claim to have watched it. Call ${p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id}_watch with id: ${id} and look: true before commenting on its content.`,
+              )
+            }
+            signal?.throwIfAborted()
+          }
           for (const message of fresh) {
-            if (!message.imageCount || !p.saveImage || !p.adapter.directMessages.captureImages) continue
+            if (images.length >= 4 || !message.imageCount || !p.saveImage || !p.adapter.directMessages.captureImages)
+              continue
             try {
               const shots = await p.adapter.directMessages.captureImages(s.ownerId, message, signal)
-              for (const bytes of shots.slice(0, 4)) {
+              for (const bytes of shots.slice(0, 4 - images.length)) {
                 if (!bytes.length || bytes.length > 5 * 1024 * 1024) continue
                 try {
                   images.push(await p.saveImage(bytes))
@@ -91,8 +129,21 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
             }
           }
           signal?.throwIfAborted()
+          // 素材和观看提示只附给模型，聊天正文保留每条私信自己的文字及占位。
+          const context = fresh
+            .flatMap((m) => {
+              if (!m.shared?.itemId) return []
+              const material = watched.get(m.shared.itemId)
+              if (material) {
+                watched.delete(m.shared.itemId)
+                return [material]
+              }
+              return [`Shared work id: ${m.shared.itemId}. If you need to inspect it, use look: true.`]
+            })
+            .join('\n')
           const userMessageId = p.append(home, fresh.map((m) => m.text).join('\n'), {
             noRelay: true,
+            ...(context ? { context } : {}),
             ...(images.length ? { images } : {}),
           })
           d.cursor = latest
@@ -222,4 +273,19 @@ async function prepareOwnerDm(
   d.lockedDate = dayOf(now)
   d.lockedPeer = peerId
   p.kv.set('dm', d)
+}
+
+/** 取消监听在成功、失败和超时后都释放，防止轮询积累监听器。 */
+async function abortable<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  let onAbort: () => void = () => {}
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([run(), aborted])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
 }

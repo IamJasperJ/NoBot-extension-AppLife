@@ -7,7 +7,7 @@
  *   - CDP 的鼠标 / 键盘事件在这个页面上点不动、回车不发送，统一在页面内 dispatchEvent
  *   - 发送前核对输入框里正好是这段正文，发送后回读「我发的」条数增加才算成功
  */
-import { type BrowserPage, BrowserSkippedError } from '../../core/types'
+import { type BrowserPage, BrowserSkippedError, type SharedWork } from '../../core/types'
 import { t } from '../../i18n'
 import { NavigationTimeoutError } from './cdp'
 import { CaptchaError } from './risk'
@@ -18,6 +18,7 @@ export interface ChatMessage {
   sid: string
   at: number
   imageCount?: number
+  shared?: SharedWork
 }
 export type SendResult =
   | { status: 'sent'; sid: string }
@@ -106,25 +107,57 @@ const clickScript = (pos: { x: number; y: number }) => {
     el.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, opt) : new MouseEvent(type, opt))
   return true
 }
-/** 正文优先；只按明确的内容字段或类型识别媒体，未知类型保留通用占位。 */
+const record = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+const clean = (value: unknown) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '')
+const isEmoji = (pc: Record<string, unknown>, messageType?: unknown) =>
+  pc.aweType === 510 ||
+  pc.aweType === 516 ||
+  (messageType === 5 && (['gif', 'emoji', 'sticker'].includes(clean(pc.image_type)) || !!clean(pc.emoji_type)))
+
+function messageShared(content: unknown): SharedWork | undefined {
+  const pc = record(content)
+  if (pc.aweType !== 800 && pc.aweType !== 10500) return
+  return {
+    kind: pc.aweType === 10500 ? 'comment' : pc.is_slides === true ? 'slides' : 'video',
+    itemId: clean(pc.itemId) || clean(pc.item_id) || clean(pc.aweme_id),
+    title: clean(pc.content_title) || clean(pc.aweme_title),
+    ...(pc.aweType === 10500 ? { comment: clean(pc.comment) } : { author: clean(pc.content_name) }),
+  }
+}
+
+/** 数字 aweType 优先于旧字段，避免空 sticker_id 和卡片标题吞掉媒体语义。 */
 export function messageText(content: unknown, messageType?: unknown): string {
-  const pc = content && typeof content === 'object' ? (content as Record<string, unknown>) : {}
-  const clean = (value: unknown) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '')
+  const pc = record(content)
+  if (pc.aweType === 2702) return t('[图片]')
+  if (isEmoji(pc, messageType)) return t('[表情]')
+  const shared = messageShared(pc)
+  if (shared?.kind === 'comment')
+    return t('[分享评论] {commenter}：{comment}（视频：{title}）', {
+      commenter: clean(pc.comment_user_name),
+      comment: shared.comment ?? '',
+      title: shared.title,
+    })
+  if (shared)
+    return shared.kind === 'slides'
+      ? t('[分享图文] {title}', { title: shared.title })
+      : t('[分享视频] {title}', { title: shared.title })
   const text = clean(pc.text)
   if (text) return messageImageCount(content, messageType) ? `${text} ${t('[图片]')}` : text
   const type = clean(pc.type || messageType).toLowerCase()
   if (pc.sticker || pc.sticker_id || /^(sticker|emoji|emoticon)$/.test(type)) return t('[表情]')
   if (pc.image || pc.image_url || pc.images || pc.image_list || /^(image|photo|picture)$/.test(type)) return t('[图片]')
-  const aweme = pc.aweme && typeof pc.aweme === 'object' ? (pc.aweme as Record<string, unknown>) : {}
+  const aweme = record(pc.aweme)
   const title = clean(pc.content_title) || clean(aweme.desc) || clean(pc.title)
   if (pc.aweme || pc.aweme_id || pc.card || /^(share|video|aweme|card)$/.test(type))
     return title ? t('[分享] {title}', { title }) : t('[分享]')
   return title || t('[消息]')
 }
-/** 只识别明确的图片内容，表情和分享封面不当作私信图片。 */
+/** 分享封面不算图片；明确的照片与新版表情进入附件路径。 */
 export function messageImageCount(content: unknown, messageType?: unknown): number {
-  if (!content || typeof content !== 'object') return 0
-  const pc = content as Record<string, unknown>
+  const pc = record(content)
+  if (pc.aweType === 800 || pc.aweType === 10500) return 0
+  if (pc.aweType === 2702 || isEmoji(pc, messageType)) return 1
   const type = String(pc.type || messageType || '').toLowerCase()
   if (pc.sticker || pc.sticker_id || /^(sticker|emoji|emoticon|share|video|aweme|card)$/.test(type)) return 0
   if (pc.aweme || pc.aweme_id || pc.card) return 0
@@ -168,10 +201,45 @@ const imageBytesScript = async (args: { sid: string; index: number }) => {
     return !!content || !(r.width >= 28 && r.width <= 48 && Math.abs(r.width - r.height) <= 6)
   })
   const image = images[args.index]
-  if (!image) return ''
-  const url = new URL(image.currentSrc || image.src, location.href)
-  if (!['https:', 'http:', 'blob:'].includes(url.protocol)) return ''
-  const response = await fetch(url.href, { credentials: 'omit', signal: AbortSignal.timeout(8000) })
+  let fallback = ''
+  if (!image && args.index === 0) {
+    // 表情未渲染成正文 img 时，从同一消息 fiber 取推荐表情地址；绝不下载任意外链。
+    const key = Object.keys(row).find((key) => key.startsWith('__reactFiber$'))
+    type Fiber = {
+      memoizedProps?: {
+        message?: {
+          type?: number
+          parsedContent?: { aweType?: number; image_type?: string; emoji_type?: string; url?: { url_list?: unknown[] } }
+        }
+      }
+      return?: Fiber
+    }
+    let fiber = key ? (row as unknown as Record<string, Fiber>)[key] : undefined
+    for (let depth = 0; fiber && depth < 24; depth++, fiber = fiber.return) {
+      const message = fiber.memoizedProps?.message
+      const pc = message?.parsedContent
+      if (
+        !pc ||
+        (pc.aweType !== 510 &&
+          pc.aweType !== 516 &&
+          !(message?.type === 5 && (['gif', 'emoji', 'sticker'].includes(pc.image_type ?? '') || !!pc.emoji_type)))
+      )
+        continue
+      const first = pc.url?.url_list?.[0]
+      if (typeof first === 'string') fallback = first
+      break
+    }
+  }
+  if (!image && !fallback) return ''
+  const url = new URL(image ? image.currentSrc || image.src : fallback, location.href)
+  const allowed = (url: URL) =>
+    url.protocol === 'https:' && (url.hostname === 'douyinpic.com' || url.hostname.endsWith('.douyinpic.com'))
+  if (fallback ? !allowed(url) : !['https:', 'http:', 'blob:'].includes(url.protocol)) return ''
+  const response = await fetch(url.href, {
+    credentials: 'omit',
+    signal: AbortSignal.timeout(8000),
+    ...(fallback ? { redirect: 'error' as const } : {}),
+  })
   if (!response.ok) return ''
   const blob = await response.blob()
   if (!blob.type.startsWith('image/') || !blob.size || blob.size > 5 * 1024 * 1024) return ''
@@ -201,7 +269,14 @@ export async function captureMessageImages(page: BrowserPage, sid: string, count
       await page.evaluate(imageRectScript, { sid, index, scroll: true })
       await page.waitForTimeout(200)
       const clip = await page.evaluate(imageRectScript, { sid, index, scroll: false }, { readonly: true })
-      if (!clip) continue
+      if (!clip) {
+        const base64 = await page.evaluate(imageBytesScript, { sid, index }, { readonly: true }).catch(() => '')
+        if (base64) {
+          const bytes = new Uint8Array(Buffer.from(base64, 'base64'))
+          if (bytes.length && bytes.length <= 5 * 1024 * 1024) images.push(bytes)
+        }
+        continue
+      }
       // 内置 CdpPage 的截图方法目前只支持整页，因此在这里复用连接，严格限制截图范围。
       const cdp = (page as unknown as { c?: { send(method: string, params: unknown): Promise<{ data?: unknown }> } }).c
       const bytes = cdp
@@ -348,6 +423,7 @@ export function attribute(
     out.push({
       from: (row.own || carry || 'unknown') as ChatMessage['from'],
       text: row.parsedContent ? messageText(row.parsedContent, row.messageType) : row.text,
+      ...(messageShared(row.parsedContent) ? { shared: messageShared(row.parsedContent) } : {}),
       sid: row.sid,
       at: row.at,
       ...(messageImageCount(row.parsedContent, row.messageType)

@@ -252,3 +252,22 @@ test('主人抖音号换算复用 api.get 的凭据与用户搜索参数', async
   expect(f.calls[0]!.url.searchParams.get('search_channel')).toBe('aweme_user_web')
   expect(new Headers(f.calls[0]!.init.headers).get('cookie')).toBe('sessionid=session')
 })
+
+test('私信适配器保留分享作品结构和图片数量，卡片封面不变成图片', async () => {
+  const f = setup()
+  const shared = { kind: 'comment' as const, itemId: '111', title: '猫', author: '', comment: '有趣' }
+  f.handle(async () =>
+    Response.json({
+      status_code: 0,
+      messages: [
+        { from: 'them', sid: '2', text: '[分享评论] 有趣', at: 12, shared },
+        { from: 'them', sid: '3', text: '[图片]', at: 12, imageCount: 1 },
+        { from: 'them', sid: '4', text: '[表情]', at: 12, imageCount: 1 },
+      ],
+    }),
+  )
+  const messages = await f.adapter.directMessages.list('owner', { afterSeq: '1', limit: 10 })
+  expect(messages[0]?.shared).toEqual(shared)
+  expect(messages[0]?.imageCount).toBeUndefined()
+  expect(messages.slice(1).map((m) => m.imageCount)).toEqual([1, 1])
+})
