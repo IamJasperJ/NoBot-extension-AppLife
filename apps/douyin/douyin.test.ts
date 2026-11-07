@@ -293,3 +293,45 @@ test('会话列表适配器走只读伪接口并保留 sec_uid、群聊和未读
     { peerId: 'group', name: 'Group', lastAt: 2000, unread: 0, isGroup: true },
   ])
 })
+
+test('群适配器保留发送人和提及引用，过滤本人、群 AI 与系统通知', async () => {
+  const f = setup()
+  f.handle(async (url) =>
+    Response.json(
+      url.pathname.includes('/profile/self/')
+        ? { status_code: 0, user: { uid: '123', sec_uid: 'my-sec' } }
+        : {
+            status_code: 0,
+            messages: [
+              { sid: '1', from: 'me', senderSec: 'my-sec', text: 'mine' },
+              { sid: '2', from: 'them', senderSec: 'my-sec', text: 'fallback' },
+              { sid: '3', from: 'them', senderSec: 'robot', robot: true, text: 'ai' },
+              { sid: '4', from: 'them', system: true, text: 'notice' },
+              {
+                sid: '5',
+                from: 'them',
+                senderSec: 'owner',
+                senderName: '主人',
+                text: 'hello',
+                mentionUids: ['123'],
+                replyToSid: '1',
+                at: 12,
+              },
+            ],
+          },
+    ),
+  )
+  expect(await f.adapter.directMessages.list('group:7705', { afterSeq: null, limit: 50 })).toEqual([
+    {
+      id: '5',
+      seq: '5',
+      senderId: 'owner',
+      senderName: '主人',
+      text: 'hello',
+      mentioned: true,
+      replyToSid: '1',
+      repliesToMe: true,
+      at: 12,
+    },
+  ])
+})

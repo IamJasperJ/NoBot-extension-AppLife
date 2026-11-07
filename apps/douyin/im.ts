@@ -20,6 +20,15 @@ export interface ChatMessage {
   at: number
   imageCount?: number
   shared?: SharedWork
+  senderSec?: string
+  senderUid?: string
+  senderName?: string
+  mentioned?: boolean
+  mentionUids?: string[]
+  replyToSid?: string
+  repliesToMe?: boolean
+  robot?: boolean
+  system?: boolean
 }
 export type SendResult =
   | { status: 'sent'; sid: string }
@@ -63,8 +72,12 @@ const listScript = () => {
       let f: any = (n as any)[key]
       for (let d = 0; f && d < 14; d++, f = f.return) {
         const p = f.memoizedProps
-        if (p?.conversation?.toParticipantSecUserId) {
-          sec = String(p.conversation.toParticipantSecUserId)
+        if (p?.conversation) {
+          const c = p.conversation
+          const group = Number(c.type ?? c.conversationType) === 2 || c.isGroup === true
+          const id = c.conversationShortId ?? c.id ?? c.lastMessage?.conversationShortId
+          sec = group ? (id ? `group:${id}` : '') : String(c.toParticipantSecUserId || '')
+          if (!sec) continue
           break
         }
       }
@@ -100,6 +113,120 @@ const currentScript = () => {
   }
   return ''
 }
+/** 群会话必须由当前消息面板核验，不能信列表的选中样式。 */
+export const currentConversationScript = () => {
+  for (const node of Array.from(
+    document.querySelectorAll('[class*="messageMessageBox"], [data-e2e="msg-item-content"]'),
+  )) {
+    const key = Object.keys(node).find((key) => key.startsWith('__reactFiber$'))
+    type Fiber = { memoizedProps?: { message?: { conversationShortId?: unknown } }; return?: Fiber }
+    let fiber = key ? (node as unknown as Record<string, Fiber>)[key] : undefined
+    for (let depth = 0; fiber && depth < 30; depth++, fiber = fiber.return) {
+      const id = fiber.memoizedProps?.message?.conversationShortId
+      if (id) return String(id)
+    }
+  }
+  return ''
+}
+
+/** 按字段读取原型 getter；群消息身份与头像布局无关。 */
+export const readGroupScript = (self: { uid?: string; sec?: string } | null) => {
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  const rows = []
+  const seen = new Set<string>()
+  for (const node of Array.from(document.querySelectorAll('[class*="messageMessageBox"]'))) {
+    const key = Object.keys(node).find((key) => key.startsWith('__reactFiber$'))
+    let fiber = key ? object((node as unknown as Record<string, unknown>)[key]) : {}
+    for (let depth = 0; depth < 24 && fiber; depth++, fiber = object(fiber.return)) {
+      const m = object(object(fiber.memoizedProps).message)
+      const sid = String(m.serverId ?? '')
+      if (!sid) continue
+      if (seen.has(sid)) break
+      seen.add(sid)
+      const pc = object(m.parsedContent)
+      const mentionUids = [m.mentionedUsers, pc.mention_users].flatMap((value) =>
+        Array.isArray(value)
+          ? value.flatMap((user) => {
+              if (typeof user === 'string' || typeof user === 'number') return [String(user)]
+              const u = object(user)
+              return [u.uid, u.id, u.user_id, u.sec_uid, u.secUid].filter((id) => id != null).map(String)
+            })
+          : [],
+      )
+      const refs = [
+        m.referenceInfo,
+        m.refMsg,
+        pc.referenceInfo,
+        pc.reference_info,
+        pc.reference,
+        pc.referenceMessage,
+        pc.reference_message,
+        pc.refMsg,
+      ]
+      const replyToSid = refs
+        .map((ref) => {
+          const r = object(ref)
+          return r.serverId ?? r.server_id ?? r.referencedMessageId ?? r.messageId ?? object(r.message).serverId
+        })
+        .find((id) => id != null && String(id))
+      const senderSec = String(m.secSender ?? '')
+      const rawAt = Number(m.createdAt ?? 0)
+      const robot =
+        ['1', 'true'].includes(String(object(m.ext)['a:is_from_robot']).toLowerCase()) ||
+        String(m.clientId ?? '').startsWith('AI-REPLY')
+      const system =
+        Number(m.type) === 1001 ||
+        Number(pc.aweType) === 100140 ||
+        !(
+          pc.text ||
+          [2702, 510, 516, 800, 10500].includes(Number(pc.aweType)) ||
+          pc.image ||
+          pc.images ||
+          pc.image_url ||
+          pc.image_list ||
+          pc.aweme ||
+          pc.card ||
+          pc.sticker
+        )
+      // 只读昵称标签，整行包含正文和引用，不能当作发言人名称。
+      const name = node
+        .querySelector(
+          '[data-e2e="message-sender-name"], [class*="senderName"], [class*="SenderName"], [class*="nickName"], [class*="nickname"]',
+        )
+        ?.textContent?.trim()
+      node.setAttribute('data-app-life-dm-id', sid)
+      rows.push({
+        sid,
+        at: rawAt > 1e14 ? Math.floor(rawAt / 1000) : rawAt > 1e12 ? rawAt : rawAt * 1000,
+        fromMe: m.isFromMe === true || !!(self?.sec && senderSec === self.sec),
+        senderSec,
+        senderUid: String(m.sender ?? ''),
+        senderName: name || senderSec.slice(0, 8),
+        mentioned: m.isMentioned === true || mentionUids.some((id) => id === self?.uid || id === self?.sec),
+        mentionUids,
+        ...(replyToSid ? { replyToSid: String(replyToSid) } : {}),
+        robot,
+        system,
+        parsedContent: m.parsedContent,
+        messageType: m.type,
+      })
+      break
+    }
+  }
+  return rows.reverse()
+}
+
+const groupMessages = (rows: ReturnType<typeof readGroupScript>): ChatMessage[] =>
+  rows.map((row) => ({
+    ...row,
+    from: row.fromMe ? 'me' : 'them',
+    text: messageText(row.parsedContent, row.messageType),
+    imageCount: messageImageCount(row.parsedContent, row.messageType),
+    shared: messageShared(row.parsedContent),
+    repliesToMe: !!row.replyToSid && rows.some((ref) => ref.sid === row.replyToSid && ref.fromMe),
+  }))
+
 const clickScript = (pos: { x: number; y: number }) => {
   const el = document.elementFromPoint(pos.x, pos.y)
   if (!el) return false
@@ -462,6 +589,9 @@ export function attribute(
 type OpenResult = { status: 'open' } | { status: 'login' | 'verify' } | { status: 'failed'; reason: string }
 /** 打开和某人的会话；只认 sec_uid，找不到或对不上一律放弃（发错人比发不出去严重得多）。 */
 export async function openConversation(page: BrowserPage, secUid: string): Promise<OpenResult> {
+  const group = secUid.startsWith('group:')
+  const target = group ? secUid.slice(6) : secUid
+  const currentPanel = group ? currentConversationScript : currentScript
   if (!page.url().startsWith('https://www.douyin.com/chat')) {
     try {
       await page.goto('https://www.douyin.com/chat', { timeout: 30000 })
@@ -478,7 +608,7 @@ export async function openConversation(page: BrowserPage, secUid: string): Promi
   }
   if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify' }
   if (await page.evaluate(hasEditorScript, null, { readonly: true })) {
-    if ((await page.evaluate(currentScript, null, { readonly: true })) === secUid) return { status: 'open' }
+    if ((await page.evaluate(currentPanel, null, { readonly: true })) === target) return { status: 'open' }
   }
   let list: ReturnType<typeof listScript> = []
   for (let i = 0; i < 20 && !list.length; i++) {
@@ -497,14 +627,19 @@ export async function openConversation(page: BrowserPage, secUid: string): Promi
     if (await page.evaluate(hasEditorScript, null, { readonly: true })) break
   }
   await sleep(page, 600)
-  const current = await page.evaluate(currentScript, null, { readonly: true })
-  if (current !== secUid) return { status: 'failed', reason: '打开的会话对端不是主人，已中止' }
+  const current = await page.evaluate(currentPanel, null, { readonly: true })
+  if (current !== target) return { status: 'failed', reason: '打开的会话对端不是主人，已中止' }
   return { status: 'open' }
 }
 export async function readConversation(page: BrowserPage, secUid: string) {
   const opened = await openConversation(page, secUid)
   if (opened.status !== 'open') return opened
-  return { status: 'open' as const, messages: attribute(await page.evaluate(readScript, null, { readonly: true })) }
+  return {
+    status: 'open' as const,
+    messages: secUid.startsWith('group:')
+      ? groupMessages(await page.evaluate(readGroupScript, null, { readonly: true }))
+      : attribute(await page.evaluate(readScript, null, { readonly: true })),
+  }
 }
 export async function sendMessage(
   page: BrowserPage,
@@ -518,7 +653,11 @@ export async function sendMessage(
   const want = norm(text)
   const mine = (rows: ChatMessage[]) =>
     rows.filter((m) => m.from === 'me' && (norm(m.text) === want || norm(m.text).startsWith(want.slice(0, 20))))
-  const before = mine(attribute(await page.evaluate(readScript, null, { readonly: true })))
+  const read = async () =>
+    secUid.startsWith('group:')
+      ? groupMessages(await page.evaluate(readGroupScript, null, { readonly: true }))
+      : attribute(await page.evaluate(readScript, null, { readonly: true }))
+  const before = mine(await read())
   if (!(await page.evaluate(focusScript, null))) return { status: 'not-sent', reason: '输入框拿不到焦点' }
   await sleep(page, 200)
   await page.keyboard.insertText(text)
@@ -536,7 +675,7 @@ export async function sendMessage(
       await sleep(page, 1600)
     }
     await sleep(page, 1100)
-    const after = mine(attribute(await page.evaluate(readScript, null)))
+    const after = mine(await read())
     const left = norm(await page.evaluate(typedScript, null))
     if (after.length > before.length && !left) return { status: 'sent', sid: after.at(-1)?.sid ?? '' }
     return { status: 'uncertain', reason: '回读没在「我发的」消息里找到这条' }
@@ -873,7 +1012,11 @@ export const conversationsScript = () => {
     for (let depth = 0; depth < 14 && Object.keys(fiber).length; depth++, fiber = object(fiber.return)) {
       const conversation = object(object(fiber.memoizedProps).conversation)
       const peerId = String(conversation.toParticipantSecUserId || '')
-      if (!peerId) continue
+      const isGroup =
+        conversation.isGroup === true || Number(conversation.conversationType) === 2 || Number(conversation.type) === 2
+      const conversationId =
+        conversation.conversationShortId ?? conversation.id ?? object(conversation.lastMessage).conversationShortId
+      if (isGroup ? !conversationId : !peerId) continue
       const last = object(conversation.lastMessage)
       const participant = object(conversation.toParticipant)
       const rawAt = Number(
@@ -884,12 +1027,21 @@ export const conversationsScript = () => {
       // biome-ignore lint/performance/useDomNodeTextContent: 昵称回退需要按页面可见换行取首行，不能拼入隐藏节点
       const visibleName = (node as HTMLElement).innerText?.split('\n')[0]
       out.push({
-        peerId,
+        peerId: isGroup ? `group:${conversationId}` : peerId,
+        ...(isGroup ? { conversationId: String(conversationId) } : {}),
         name: String(
-          conversation.name || conversation.toParticipantName || participant.nickname || visibleName || peerId,
+          conversation.name ||
+            object(conversation.coreInfo).name ||
+            conversation.toParticipantName ||
+            participant.nickname ||
+            visibleName ||
+            peerId,
         ),
         lastAt: Number.isFinite(lastAt) ? lastAt : 0,
-        unread: Math.max(0, Number(conversation.unreadCount ?? conversation.unread ?? 0) || 0),
+        unread: Math.max(
+          0,
+          Number(conversation.badgeCount ?? conversation.unreadCount ?? conversation.unread ?? 0) || 0,
+        ),
         isGroup:
           conversation.isGroup === true ||
           Number(conversation.conversationType) === 2 ||
@@ -919,7 +1071,9 @@ export async function readConversations(page: BrowserPage) {
     if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify' as const }
     if (await page.evaluate(loginScript, null, { readonly: true })) return { status: 'login' as const }
     const conversations = await page.evaluate(conversationsScript, null, { readonly: true })
-    if (conversations.length) return { status: 'open' as const, conversations }
+    if (conversations.length) {
+      return { status: 'open' as const, conversations }
+    }
     await sleep(page, 750)
   }
   return { status: 'open' as const, conversations: [] }

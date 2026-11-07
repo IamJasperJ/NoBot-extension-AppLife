@@ -18,7 +18,7 @@ test('二期功能默认关闭、家分享默认值，以及枚举和额度规�
     settingsOf({
       shareVia: 'invalid',
       liveScope: 'invalid',
-      commentPollSeconds: 1,
+      bilibiliCommentPollSeconds: 1,
       livePollSeconds: 1,
       commentDailyDrafts: 99,
       liveDailyReplies: -1,
@@ -31,7 +31,7 @@ test('二期功能默认关闭、家分享默认值，以及枚举和额度规�
     commentDailyDrafts: 30,
     liveDailyReplies: 0,
   })
-  expect(settingsOf({ liveRoom: 1, aiCommentGuard: 'yes', commentPollSeconds: NaN })).toMatchObject({
+  expect(settingsOf({ liveRoom: 1, aiCommentGuard: 'yes', bilibiliCommentPollSeconds: NaN })).toMatchObject({
     liveRoom: '',
     aiCommentGuard: false,
     commentPollSeconds: 300,
@@ -120,23 +120,25 @@ test('平台 KV 隔离所有专属键，共享历史与日记；删除不影响�
   }
 })
 
-test('平台设置切换主人、抖音不带 B 站昵称、关闭直播并限制轮询下限，不污染全局设置', async () => {
+test('平台设置切换主人、抖音不带 B 站昵称、关闭直播并切换各平台轮询间隔，不污染全局设置', async () => {
   const { scopedSettings } = await import('./state')
   const s = settingsOf({
     ownerId: 'mid',
     ownerName: '小明',
     douyinOwnerId: ' MS4wLjABabcdefghijklmnop ',
     liveRoom: 'room',
-    dmPollSeconds: 15,
-    commentPollSeconds: 60,
+    bilibiliDmPollSeconds: 15,
+    bilibiliCommentPollSeconds: 60,
+    douyinDmPollSeconds: 15,
+    douyinCommentPollSeconds: 120,
   })
   expect(scopedSettings(s, 'douyin')).toMatchObject({
     app: 'douyin',
     ownerId: 'MS4wLjABabcdefghijklmnop',
     ownerName: '',
     liveRoom: '',
-    dmPollSeconds: 120,
-    commentPollSeconds: 300,
+    dmPollSeconds: 15,
+    commentPollSeconds: 120,
   })
   expect(scopedSettings(s, 'bilibili')).toMatchObject({
     ownerId: 'mid',
@@ -146,7 +148,7 @@ test('平台设置切换主人、抖音不带 B 站昵称、关闭直播并限�
     commentPollSeconds: 60,
   })
   expect(s.ownerId).toBe('mid')
-  expect(scopedSettings({ ...s, dmPollSeconds: 600, commentPollSeconds: 900 }, 'douyin')).toMatchObject({
+  expect(scopedSettings({ ...s, douyinDmPollSeconds: 600, douyinCommentPollSeconds: 900 }, 'douyin')).toMatchObject({
     dmPollSeconds: 600,
     commentPollSeconds: 900,
   })
@@ -209,4 +211,40 @@ test('浏览器代理默认留空，只接受无认证、无路径且有合法�
     'http://proxy:80\nheader',
   ])
     expect(settingsOf({ douyinBrowserProxy: proxy }).douyinBrowserProxy).toBe('')
+})
+
+test('平台轮询默认值、下限、非法值和内部字段忽略原始设置', () => {
+  const expected = {
+    bilibiliDmPollSeconds: 60,
+    bilibiliCommentPollSeconds: 300,
+    douyinDmPollSeconds: 120,
+    douyinCommentPollSeconds: 300,
+  }
+  expect(settingsOf({})).toMatchObject(expected)
+  const invalid = Object.fromEntries(Object.keys(expected).map((key) => [key, NaN]))
+  expect(settingsOf(invalid)).toMatchObject(expected)
+  expect(settingsOf(Object.fromEntries(Object.keys(expected).map((key) => [key, -1])))).toMatchObject({
+    bilibiliDmPollSeconds: 15,
+    bilibiliCommentPollSeconds: 60,
+    douyinDmPollSeconds: 15,
+    douyinCommentPollSeconds: 120,
+  })
+  expect(settingsOf({ dmPollSeconds: 999, commentPollSeconds: 999, frameTile: 1, maxSubtitleChars: 1 })).toMatchObject({
+    ...expected,
+    dmPollSeconds: 60,
+    commentPollSeconds: 300,
+    frameTile: 720,
+    maxSubtitleChars: 6000,
+  })
+  expect(settingsOf({ bilibiliEnabled: false, douyinEnabled: true })).toMatchObject({
+    dmPollSeconds: 120,
+    commentPollSeconds: 300,
+  })
+})
+
+test('群回复方式默认 mention，只接受 mention 或 batch', () => {
+  expect(settingsOf({}).douyinGroupReply).toBe('mention')
+  expect(settingsOf({ douyinGroupReply: 'batch' }).douyinGroupReply).toBe('batch')
+  expect(settingsOf({ douyinGroupReply: 'mention' }).douyinGroupReply).toBe('mention')
+  expect(settingsOf({ douyinGroupReply: 'invalid' }).douyinGroupReply).toBe('mention')
 })

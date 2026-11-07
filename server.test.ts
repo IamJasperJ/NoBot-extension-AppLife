@@ -9,8 +9,8 @@ import * as planCore from './core/plan'
 import * as host from './host'
 import type { ExtensionContext, Host } from './host-api'
 import { setLanguageSource } from './i18n'
-import extension, { browserProxyReachable } from './server'
-import { memory } from './test-utils'
+import extension, { browserProxyReachable, Service } from './server'
+import { fixture, memory } from './test-utils'
 
 // 服务入口会绑定宿主语言源，纯逻辑测试仍使用独立的中文环境。
 setLanguageSource(() => 'zh')
@@ -511,6 +511,34 @@ test('v2 宿主：关闭渠道时注销平台，重新开启再注册', async ()
     f.ctx.settings.douyinChannel = true
     await run()
     expect(providers).toHaveLength(2)
+    expect(providers[1]!.scopes).toEqual(['private', 'group'])
+    const controller = new AbortController()
+    const started = providers[1]!.start(
+      { id: 'account', config: {}, cursor: null },
+      {
+        emit: async () => {},
+        status: () => {},
+        saveCursor: () => {},
+        setOwner: () => {},
+      },
+      controller.signal,
+    )
+    f.ctx.settings.douyinChannelGroups = true
+    await run()
+    expect(unregister).toHaveBeenCalledTimes(1)
+    expect(providers).toHaveLength(2)
+    expect(controller.signal.aborted).toBe(false)
+    f.ctx.settings.douyinChannelGroups = false
+    await run()
+    expect(unregister).toHaveBeenCalledTimes(1)
+    expect(providers).toHaveLength(2)
+    f.ctx.settings.douyinChannelGroups = true
+    await run()
+    expect(unregister).toHaveBeenCalledTimes(1)
+    expect(providers).toHaveLength(2)
+    expect(controller.signal.aborted).toBe(false)
+    controller.abort()
+    await started
   } finally {
     f.close()
   }
@@ -535,4 +563,116 @@ test('nearestUserMessage 沿父链找最近用户消息，读不到时返回 und
     },
   } as never
   expect(nearestUserMessage(broken, { chatId: 'c', parentId: 't1' })).toBeUndefined()
+})
+
+test('主人渠道能力切换：新宿主停用抖音专线，旧宿主保留；B 站轮询与回复不变', async () => {
+  for (const supported of [false, true]) {
+    const f = backgroundFixture()
+    const poll = spyOn(dmCore, 'pollOwnerDm').mockResolvedValue()
+    const reply = spyOn(dmCore, 'replyOwnerDm').mockResolvedValue()
+    f.ctx.settings = {
+      ...f.ctx.settings,
+      douyinEnabled: true,
+      douyinChannel: true,
+      douyinOwnerId: 'MS4wLjABowner12345678',
+      dmListen: false,
+      commentListen: false,
+      liveListen: false,
+    }
+    f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
+    f.ctx.channels = {
+      registerProvider: () => ({ unregister() {} }),
+      ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
+      lookup: () => null,
+      ...(supported ? { bind: async () => ({ bindingId: 'owner-binding' }) } : {}),
+    }
+    try {
+      extension.startBackground(f.ctx, f.lifetime.signal)
+      await f.registrations[1]!.run(new AbortController().signal)
+      expect(poll.mock.calls.map(([p]) => p.adapter.id).sort()).toEqual(
+        supported ? ['bilibili'] : ['bilibili', 'douyin'],
+      )
+      for (const app of ['bilibili', 'douyin']) {
+        f.ctx.storage.set(`${app}:dm`, {
+          cursor: '1',
+          nextAt: 0,
+          lastPollAt: 0,
+          failures: 0,
+          pendingReplies: [{ userMessageId: 'source', peerId: 'owner', at: Date.now() }],
+        })
+      }
+      await extension.hooks.onEvent(
+        {
+          type: 'message:saved',
+          message: {
+            chatId: 'home',
+            role: 'assistant',
+            content: '回复',
+            status: 'done',
+            meta: {},
+          } as import('../../packages/shared/src').MessageDTO,
+        },
+        { ...f.ctx, chatId: 'home' },
+      )
+      expect(reply.mock.calls.map(([p]) => p.adapter.id).sort()).toEqual(
+        supported ? ['bilibili'] : ['bilibili', 'douyin'],
+      )
+    } finally {
+      poll.mockRestore()
+      reply.mockRestore()
+      f.close()
+    }
+  }
+})
+
+test('渠道出站等待私信锁释放，五分钟超时才 busy，取消等待确认未发出', async () => {
+  for (const mode of ['release', 'timeout', 'abort', 'already-aborted'] as const) {
+    const f = backgroundFixture()
+    const clock = fixture()
+    const svc = new Service(f.ctx)
+    svc.rt = clock.runtime
+    svc.dmBusy = true
+    svc.ctx.settings = { douyinEnabled: true, douyinChannel: true }
+    svc.signal = f.lifetime.signal
+    const sent = mock(async () => ({ id: 'sent' }))
+    const dm = svc.dmPorts('douyin')
+    dm.loggedIn = () => true
+    dm.paused = () => false
+    dm.adapter.directMessages.send = sent
+    svc.dmPorts = () => dm
+    svc.ctx.channels = {
+      registerProvider: () => ({ unregister() {} }),
+      ensureAccount: async () => ({ accountId: 'a', characterFollowed: true }),
+      lookup: () => null,
+    }
+    svc.registerChannel()
+    const controller = new AbortController()
+    if (mode === 'already-aborted') controller.abort()
+    let sleeps = 0
+    svc.rt.sleep = async (ms) => {
+      expect(ms).toBe(1000)
+      sleeps++
+      clock.advance(ms)
+      if (mode === 'release') svc.dmBusy = false
+      if (mode === 'abort') controller.abort()
+    }
+    try {
+      const result = svc.channel!.send(
+        { id: 'a', config: {}, cursor: null },
+        { chatId: 'visitor', text: 'hi' },
+        controller.signal,
+      )
+      if (mode === 'release') {
+        expect(await result).toEqual({ id: 'sent' })
+        expect(sent).toHaveBeenCalledTimes(1)
+        expect(svc.dmBusy).toBe(false)
+      } else {
+        await expect(result).rejects.toMatchObject({ kind: 'not-sent', code: mode === 'timeout' ? 'busy' : 'aborted' })
+        expect(sent).not.toHaveBeenCalled()
+      }
+      expect(sleeps).toBe(mode === 'timeout' ? 300 : mode === 'already-aborted' ? 0 : 1)
+    } finally {
+      f.close()
+    }
+  }
 })

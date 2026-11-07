@@ -92,17 +92,20 @@ export interface ChannelAccount {
   config: Record<string, unknown>
   cursor: unknown
 }
+export interface ChannelInboundMessage {
+  id: string
+  chat: { id: string; title: string; scope?: 'private' | 'group' }
+  from: { id: string; name: string }
+  text: string
+  images?: { bytes: Uint8Array; mime: string }[]
+  context?: string
+  mentionsMe?: boolean
+  repliesToMe?: boolean
+  replyTo?: string
+  sentAt: number
+}
 export interface ChannelIO {
-  emit(message: {
-    id: string
-    chat: { id: string; title: string; scope?: 'private' | 'group' }
-    from: { id: string; name: string }
-    text: string
-    images?: { bytes: Uint8Array; mime: string }[]
-    context?: string
-    replyTo?: string
-    sentAt: number
-  }): Promise<void>
+  emit(message: ChannelInboundMessage): Promise<void>
   status(state: 'connecting' | 'online' | 'offline' | 'paused', reason?: string): void
   saveCursor(cursor: unknown): void
   setOwner(externalId: string | null): void
@@ -117,6 +120,8 @@ export interface ChannelProvider {
   media: { inboundImages: boolean; outboundImages: boolean; voice: boolean }
   defaults?: {
     newLocation?: { private?: 'auto' | 'approve' | 'existing-only'; group?: 'auto' | 'approve' | 'existing-only' }
+    /** 新建群绑定的默认触发方式；旧宿主忽略，默认 follow-room */
+    trigger?: { group?: 'all' | 'follow-room' | 'mention' | 'reply' | 'command' }
   }
   accountFields: ExtensionSettingField[]
   /** 账号由扩展自己管理（v2.1），渠道页不显示「添加」。 */
@@ -136,6 +141,10 @@ export interface ChannelAPI {
     providerId: string,
     options: { name: string; characterId?: string; groupId?: string },
   ): Promise<{ accountId: string; characterFollowed: boolean }>
+  bind?(
+    providerId: string,
+    options: { chat: { id: string; title: string; scope?: 'private' | 'group' }; chatId: string },
+  ): Promise<{ bindingId: string }> | { bindingId: string }
   lookupAll?(chatId: string): ChannelLookup[]
   lookup(chatId: string): ChannelLookup | null
 }

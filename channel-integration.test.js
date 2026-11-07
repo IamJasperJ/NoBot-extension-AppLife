@@ -150,7 +150,7 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
         douyinEnabled: true,
         douyinChannel: true,
         douyinOwnerId: owner,
-        dmListen: true,
+        dmListen: false,
         listenAllDay: true,
         frames: false,
         commentListen: false,
@@ -206,6 +206,8 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       messages.set(visitor, [message(visitor, '1', '旧私信', { at: clock - 60000 })])
       messages.set(owner, [message(owner, '1', '主人旧私信')])
       peers = [peer(visitor), peer(owner)]
+      const ownerBindingCount =
+        typeof extensionChannels('app-life', host, false, new AbortController().signal).bind === 'function' ? 1 : 0
       const poll = async () => {
         clock += 180000
         const task = await runScheduledTask('app-life:messages')
@@ -214,7 +216,7 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       await poll()
       await settle(async () => (await json('channels', '/accounts'))[0].status === 'online')
       expect(await json('channels', '/requests')).toEqual([])
-      expect(listBindings(accountId)).toHaveLength(0)
+      expect(listBindings(accountId)).toHaveLength(ownerBindingCount)
       expect(getSetting('extdata:app-life:channel-cursors')).toMatchObject({ [visitor]: { seq: '1' } })
       messages.get(visitor).push(
         message(visitor, '2', 'Alice 你好'),
@@ -236,7 +238,7 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       expect(getSetting('extdata:app-life:channel-cursors')).toMatchObject({ [visitor]: { seq: '3' } })
       const pending = (await json('channels', '/requests')).find((r) => r.chat === visitor)
       expect(pending.state).toBe('pending')
-      expect(listBindings(accountId)).toHaveLength(0)
+      expect(listBindings(accountId)).toHaveLength(ownerBindingCount)
       releaseSend()
       sendGate = undefined
       await json('channels', `/requests/${pending.id}/approve`, {})
@@ -247,8 +249,8 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
         }),
       )
       await poll()
-      await settle(() => listBindings(accountId).length === 1)
-      const binding = listBindings(accountId)[0]
+      await settle(() => listBindings(accountId).length === ownerBindingCount + 1)
+      const binding = listBindings(accountId).find((b) => b.chat === visitor)
       const { updateRoom } = await import('../../apps/server/src/services/rooms')
       updateRoom(binding.roomId, { turnMode: 'every' })
       await host.waitIdle(binding.chatId, 5000)
@@ -275,7 +277,9 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
         external: { chat: visitor },
         actors: [{ externalId: visitor, role: 'player', paired: false }],
       })
-      expect(api.lookup(home.chatId)).toBeNull()
+      if (ownerBindingCount) {
+        expect(api.lookup(home.chatId)).toMatchObject({ external: { chat: owner } })
+      } else expect(api.lookup(home.chatId)).toBeNull()
       expect(
         availableTools(binding.chatId)
           .filter((t) => t.tool.name.startsWith('douyin_'))
@@ -289,23 +293,28 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       expect(promptText).toContain(material)
       expect(promptText).not.toContain('SECRET_DIARY')
       expect(promptText).not.toContain("The owner's latest message")
+      // 新宿主关闭专线监听也接收主人渠道私信；旧宿主重新开启专线并建立基线。
+      settings = { ...settings, dmListen: !ownerBindingCount }
+      await registry.configureExtension('app-life', { settings })
+      await poll()
       // 新出现的人也跳过渠道开启前的消息，同时投递开启后的消息。
       messages.set(fresh, [message(fresh, '1', '更早历史', { at: 0 }), message(fresh, '6', '新面孔')])
-      messages.get(owner).push(message(owner, '2', '家里见'))
+      messages.get(owner).push(message(owner, '20', '家里见'))
       peers = [peer(owner), peer(fresh)]
       await poll()
       await settle(() => host.getChatInfo(home.chatId, 100).messages.some((m) => m.content === '家里见'))
       expect((await json('channels', '/requests')).some((r) => r.chat === owner)).toBe(false)
       const freshRequest = (await json('channels', '/requests')).find((r) => r.chat === fresh)
       expect(freshRequest.state).toBe('pending')
-      expect(listBindings(accountId).some((b) => b.chat === owner)).toBe(false)
+      expect(listBindings(accountId).some((b) => b.chat === owner)).toBe(!!ownerBindingCount)
+      if (ownerBindingCount) expect(api.lookup(home.chatId)).toMatchObject({ ownerPresent: true })
       await host.waitIdle(home.chatId, 5000)
       await settle(() => sends.some((s) => s.id === owner))
       await json('channels', `/requests/${freshRequest.id}/approve`, {})
       messages.get(fresh).push(message(fresh, '7', 'Alice 新会话'))
       peers = [peer(fresh)]
       await poll()
-      await settle(() => listBindings(accountId).length === 2)
+      await settle(() => listBindings(accountId).length === ownerBindingCount + 2)
       const freshBinding = listBindings(accountId).find((b) => b.chat === fresh)
       expect(freshBinding.chatId).not.toBe(binding.chatId)
       expect(api.lookup(freshBinding.chatId)).toMatchObject({ external: { chat: fresh }, ownerPresent: false })

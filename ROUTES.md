@@ -358,7 +358,7 @@ type Activity = {
 
 设置以 bilibiliEnabled（默认 true）与 douyinEnabled（默认 false）决定启用平台；不再提供 app 下拉框。
 主人账号分别使用 ownerId 与 douyinOwnerId。平台的凭据、风控、缓存、监听游标、草稿、活动独立；
-分享账本、偏好、日记、历史和记忆共用。抖音没有直播，私信轮询至少 120 秒，评论至少 300 秒。
+分享账本、偏好、日记、历史和记忆共用。抖音没有直播。轮询间隔按平台设置：`bilibiliDmPollSeconds` 默认 60 秒、下限 15 秒，`bilibiliCommentPollSeconds` 默认 300 秒、下限 60 秒；`douyinDmPollSeconds` 默认 120 秒、下限 15 秒，`douyinCommentPollSeconds` 默认 300 秒、下限 120 秒。抖音私信分会话共用抖音私信轮询间隔，不受 `dmListen` 影响。旧的共用轮询设置值直接忽略。
 每个平台依次轮询主人私信、评论、直播；待回复私信只阻止所属平台的公开互动。
 至少一个启用平台已登录即可唤醒。浏览名额按可用平台平分，余数给前面的平台；
 单个平台暂停或中断不影响其他平台和写信，所有已登录平台均暂停或中断时才不写信。

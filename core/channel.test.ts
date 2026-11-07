@@ -4,11 +4,11 @@ import { ChannelProviderStoppedError, ChannelSendError } from '../host-api'
 import { memory } from '../test-utils'
 import { DouyinChannel, visitorMemory, visitorMessage, visitorTurn } from './channel'
 import type { DmPorts } from './dm'
-import { defaults, remember } from './state'
+import { dmOf, remember, scopedSettings, settingsOf } from './state'
 import { type AppAdapter, type DirectMessage, type DmConversation, DmNotSentError, TrafficError } from './types'
 import { manualItem } from './watch'
 
-function fixture() {
+function fixture(raw: Record<string, unknown> = {}, ownerChannel = false) {
   const kv = memory()
   let now = Date.parse('2026-11-07T12:00:00+08:00')
   let paused = false
@@ -18,9 +18,13 @@ function fixture() {
   const list = mock(
     async (_peerId: string, _opts: { afterSeq: string | null; limit: number; signal?: AbortSignal }) => messages,
   )
-  const send = mock(async (): Promise<undefined | { id: string }> => ({ id: 'sent-id' }))
+  const send = mock(
+    async (_peer?: string, _text?: string, _signal?: AbortSignal): Promise<undefined | { id: string }> => ({
+      id: 'sent-id',
+    }),
+  )
   const settings = {
-    ...defaults,
+    ...scopedSettings(settingsOf(raw), 'douyin'),
     douyinEnabled: true,
     douyinChannel: true,
     listenAllDay: true,
@@ -69,13 +73,17 @@ function fixture() {
     lookup: () => null,
     lookupAll: () => [],
   }
+  const bind = mock(async (_provider: string, _options: unknown) => ({ bindingId: 'binding' }))
+  if (ownerChannel) api.bind = bind
+  const home = { chatId: 'home', title: '主人昵称' }
   const exclusive = mock(() => {})
   const channel = new DouyinChannel(api, {
     dm: () => dm,
+    ownerHome: () => home,
     settings: () => settings,
     self: () => 'self',
     now: () => now,
-    exclusive: (work) => {
+    exclusiveWait: (work) => {
       exclusive()
       return work()
     },
@@ -93,6 +101,9 @@ function fixture() {
   const started = provider.start({ id: 'account', config: {}, cursor: null }, io, lifetime.signal)
   return {
     kv,
+    api,
+    bind,
+    home,
     settings,
     io,
     lifetime,
@@ -104,8 +115,8 @@ function fixture() {
     send,
     dm,
     exclusive,
-    advance: () => {
-      now += 180000
+    advance: (ms = 180000) => {
+      now += ms
     },
     peers: (value: DmConversation[]) => {
       peers = value
@@ -146,14 +157,14 @@ test('渠道参数、幂等账号与角色同步、io 生命周期和状态', as
   try {
     expect(f.provider).toMatchObject({
       id: 'douyin',
-      scopes: ['private'],
+      scopes: ['private', 'group'],
       canInitiate: false,
-      limits: { maxTextLength: 500, minIntervalMs: 60000, perMinute: 1 },
+      limits: { maxTextLength: 500 },
       accountFields: [],
       defaults: { newLocation: { private: 'approve' } },
     })
     expect(f.provider.promptHint).toBe(
-      'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation.',
+      'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
     )
     expect(f.io.status).toHaveBeenCalledWith('online', undefined)
     await f.channel.ensure()
@@ -247,14 +258,15 @@ test('逐条按 seq 投递图片和分享 context，失败不推进，停止错�
   }
 })
 
-test('读取遵守监听开关、时段、暂停与登录；关闭设置不发送', async () => {
+test('主人监听关闭仍轮询渠道，暂停后停止；关闭渠道不发送', async () => {
   const f = fixture()
   try {
     f.peers([peer('visitor')])
     f.settings.dmListen = false
     await f.channel.poll()
-    expect(f.list).not.toHaveBeenCalled()
-    f.settings.dmListen = true
+    expect(f.list).toHaveBeenCalledTimes(1)
+    f.list.mockClear()
+    f.advance()
     f.pause()
     await f.channel.poll()
     expect(f.list).not.toHaveBeenCalled()
@@ -502,4 +514,223 @@ test('主人 sec_uid 复用设置解析及与当前输入匹配的缓存', () =>
   expect(visitorTurn(ctx, message)).toBe(false)
   ctx.settings.douyinOwnerId = '@other'
   expect(visitorTurn(ctx, message)).toBe(true)
+})
+
+test('渠道沿用抖音私信间隔，允许低于旧的两分钟下限', async () => {
+  const f = fixture({ bilibiliDmPollSeconds: 15, douyinDmPollSeconds: 60 })
+  try {
+    f.settings.dmListen = false
+    f.peers([peer('visitor')])
+    await f.channel.poll()
+    expect(f.list).toHaveBeenCalledTimes(1)
+    f.advance(59000)
+    await f.channel.poll()
+    expect(f.list).toHaveBeenCalledTimes(1)
+    f.advance(1000)
+    await f.channel.poll()
+    expect(f.list).toHaveBeenCalledTimes(2)
+  } finally {
+    await f.close()
+  }
+})
+
+test('群渠道基线、发言人、主人发言、提及引用与按群发送', async () => {
+  const f = fixture({ douyinChannelGroups: true })
+  const group = { ...peer('group:7705', 1, true), conversationId: '7705', name: '群名' }
+  try {
+    expect(f.provider.scopes).toEqual(['private', 'group'])
+    expect(f.provider.defaults?.newLocation?.group).toBe('approve')
+    expect(f.provider.defaults?.trigger?.group).toBe('mention')
+    f.peers([group])
+    f.messages([message('1')])
+    await f.channel.poll()
+    expect(f.io.emit).not.toHaveBeenCalled()
+    f.advance()
+    f.messages([
+      message('2', { senderId: 'self', fromMe: true }),
+      message('3', { robot: true }),
+      message('4', { system: true }),
+      message('5', { senderId: 'owner', senderName: '主人', mentioned: true, replyToSid: '2', repliesToMe: true }),
+    ])
+    await f.channel.poll()
+    expect(f.io.emit).toHaveBeenCalledTimes(1)
+    expect(f.io.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '5',
+        chat: { id: '7705', title: '群名', scope: 'group' },
+        from: { id: 'owner', name: '主人' },
+        mentionsMe: true,
+        repliesToMe: true,
+        replyTo: '2',
+      }),
+    )
+    await f.provider.send(
+      { id: 'account', config: {}, cursor: null },
+      { chatId: '7705', text: 'hello' },
+      f.lifetime.signal,
+    )
+    expect(f.send).toHaveBeenCalledWith('group:7705', 'hello', f.lifetime.signal)
+  } finally {
+    await f.close()
+  }
+})
+
+test('数字群 id 和群绑定即使主人在场也强制访客回合', () => {
+  const user = (id: string) => ({ role: 'user', meta: { clientMessageId: `app-life.douyin:${id}:1` } })
+  expect(visitorMessage(user('7705'), [turnBinding('app-life.douyin', '7705', true)], '7705')).toBe(true)
+  expect(
+    visitorMessage(
+      user('group-id'),
+      [{ ...turnBinding('app-life.douyin', 'group-id', true), scope: 'group' }],
+      'group-id',
+    ),
+  ).toBe(true)
+})
+
+test('主人渠道接管：start 绑定家里、切换基线去重、素材保留主人身份，发送不占访客配额', async () => {
+  const f = fixture({ douyinChannelDaily: 0 }, true)
+  try {
+    await f.channel.bindOwner()
+    expect(f.channel.ownerViaChannel).toBe(true)
+    expect(f.io.setOwner).toHaveBeenCalledWith('owner')
+    expect(f.bind).toHaveBeenCalledWith('douyin', {
+      chat: { id: 'owner', title: '主人昵称' },
+      chatId: 'home',
+    })
+    const since = f.kv.get<{ since: number }>('channel-owner')!.since
+    f.kv.set('dm', {
+      ...dmOf(f.kv),
+      cursor: '10',
+      pendingReplies: [{ userMessageId: 'old', peerId: 'owner', at: since }],
+    })
+    // 模拟专线与接管交界：已处理序号即使时间较新也不能重复投递。
+    f.home.chatId = 'new-home'
+    await f.channel.bindOwner()
+    expect(dmOf(f.kv).pendingReplies).toEqual([])
+    f.peers([peer('owner', since + 5)])
+    f.messages([
+      message('9', { senderId: 'owner', at: since + 1 }),
+      message('11', { senderId: 'owner', at: since - 1 }),
+      message('12', { senderId: 'owner', at: since + 2, shared: { itemId: 'video', kind: 'video', title: '视频' } }),
+    ])
+    await f.channel.poll()
+    expect(f.io.emit).toHaveBeenCalledTimes(1)
+    expect(f.io.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '12',
+        chat: { id: 'owner', title: 'name-owner' },
+        context: expect.stringContaining('The owner'),
+      }),
+    )
+    await f.provider.send(
+      { id: 'account', config: {}, cursor: null },
+      { chatId: 'owner', text: 'a'.repeat(700) },
+      f.lifetime.signal,
+    )
+    expect(f.send).toHaveBeenCalledTimes(1)
+    expect(f.send.mock.calls[0]?.[1]).toBe('a'.repeat(700))
+    expect(f.kv.get('count:channel:owner')).toBeUndefined()
+    f.advance()
+    await f.channel.poll()
+    expect(f.io.emit).toHaveBeenCalledTimes(1)
+  } finally {
+    await f.close()
+  }
+})
+
+test('主人绑定失败不抛出，下轮重试；换主人和家里会话重新绑定，旧宿主仍排除主人', async () => {
+  const f = fixture({}, true)
+  try {
+    await f.channel.bindOwner()
+    f.settings.ownerId = 'new-owner'
+    f.bind.mockRejectedValueOnce(new Error('暂时失败'))
+    await f.channel.bindOwner()
+    expect(f.dm.log).toHaveBeenCalled()
+    await f.channel.bindOwner()
+    expect(f.io.setOwner).toHaveBeenLastCalledWith('new-owner')
+    expect(f.bind).toHaveBeenLastCalledWith('douyin', {
+      chat: { id: 'new-owner', title: '主人昵称' },
+      chatId: 'home',
+    })
+    const count = f.bind.mock.calls.length
+    await f.channel.bindOwner()
+    expect(f.bind).toHaveBeenCalledTimes(count)
+    f.home.chatId = 'another-home'
+    await f.channel.bindOwner()
+    expect(f.bind).toHaveBeenCalledTimes(count + 1)
+    delete f.api.bind
+    expect(f.channel.ownerViaChannel).toBe(false)
+    f.peers([peer('new-owner')])
+    await f.channel.poll()
+    expect(f.list).not.toHaveBeenCalled()
+  } finally {
+    await f.close()
+  }
+})
+
+test('群回复方式实时切换，batch 仅给本轮最后一条消息额外标记提及', async () => {
+  const f = fixture({ douyinChannelGroups: true })
+  try {
+    f.peers([peer('group:7705', 1, true)])
+    f.messages([message('1')])
+    await f.channel.poll()
+    for (const mode of ['batch', 'mention'] as const) {
+      f.settings.douyinGroupReply = mode
+      f.advance()
+      const base = mode === 'batch' ? 2 : 4
+      f.messages([message(String(base)), message(String(base + 1), { repliesToMe: true })])
+      f.io.emit = mock(async () => {})
+      await f.channel.poll()
+      expect(
+        (f.io.emit as ReturnType<typeof mock>).mock.calls.map(([m]) => [m.id, m.mentionsMe, m.repliesToMe]),
+      ).toEqual([
+        [String(base), false, false],
+        [String(base + 1), mode === 'batch', true],
+      ])
+    }
+    f.advance()
+    f.messages([message('6', { mentioned: true }), message('7')])
+    f.io.emit = mock(async () => {})
+    await f.channel.poll()
+    expect((f.io.emit as ReturnType<typeof mock>).mock.calls.map(([m]) => m.mentionsMe)).toEqual([true, false])
+  } finally {
+    await f.close()
+  }
+})
+
+test('群开关就地重建基线，关掉期间不读取不补投，私聊游标保留', async () => {
+  const f = fixture()
+  try {
+    f.kv.set('channel-since', 0)
+    f.kv.set('channel-cursors', { visitor: { seq: '10', lastAt: 1 }, 'group:7705': { seq: '1', lastAt: 1 } })
+    f.peers([peer('group:7705', 2, true)])
+    f.settings.douyinChannelGroups = true
+    f.channel.sync()
+    const since = f.kv.get<number>('channel-groups-since')!
+    expect(f.kv.get('channel-cursors')).toEqual({ visitor: { seq: '10', lastAt: 1 } })
+    f.messages([message('2', { at: since - 1 }), message('3', { at: since + 1 })])
+    await f.channel.poll()
+    expect(f.io.emit).toHaveBeenCalledTimes(1)
+    f.settings.douyinChannelGroups = false
+    f.channel.sync()
+    expect(f.channel.groups).toBe(false)
+    expect(f.kv.get('channel-groups-since')).toBeUndefined()
+    await expect(
+      f.provider.send({ id: 'account', config: {}, cursor: null }, { chatId: '7705', text: 'hi' }, f.lifetime.signal),
+    ).rejects.toMatchObject({ kind: 'not-sent', code: 'groups-disabled' })
+    f.advance()
+    await f.channel.poll()
+    expect(f.list).toHaveBeenCalledTimes(1)
+    f.settings.douyinChannelGroups = true
+    f.channel.sync()
+    const reopened = f.kv.get<number>('channel-groups-since')!
+    expect(reopened).toBeGreaterThan(since)
+    f.messages([message('4', { at: reopened - 1 }), message('5', { at: reopened + 1 })])
+    f.advance()
+    await f.channel.poll()
+    expect((f.io.emit as ReturnType<typeof mock>).mock.calls.map(([m]) => m.id)).toEqual(['3', '5'])
+    expect(f.kv.get('channel-cursors')).toMatchObject({ visitor: { seq: '10' } })
+  } finally {
+    await f.close()
+  }
 })

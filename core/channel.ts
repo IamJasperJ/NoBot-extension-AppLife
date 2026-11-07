@@ -13,7 +13,7 @@ import { type DmPorts, OWNER_SHARE_REPLY_RULE, sharedDmMaterial, stripStage } fr
 import { imageMime } from './image-mime'
 import { inWindow } from './plan'
 import { activity, countAttempt, todayCount } from './social'
-import { type HistoryItem, type Settings, scopedSettings, settingsOf, watchedHistory } from './state'
+import { dmOf, type HistoryItem, type Settings, scopedSettings, settingsOf, watchedHistory } from './state'
 import { BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
 
 interface TurnMessage {
@@ -26,8 +26,10 @@ export function visitorMessage(message: TurnMessage | undefined, bindings: reado
   const source = message?.meta?.clientMessageId?.match(/^app-life\.douyin:([^:]+):.+$/)
   if (message?.role !== 'user' || !source) return false
   const secUid = source[1]!
-  if (secUid === ownerId) return false
+  if (/^\d+$/.test(secUid)) return true
   const binding = bindings.find((item) => item.provider === 'app-life.douyin' && item.external.chat === secUid)
+  if (binding?.scope === 'group') return true
+  if (secUid === ownerId) return false
   return !binding?.ownerPresent
 }
 
@@ -67,12 +69,13 @@ export function visitorMemory(kv: KV): string {
 }
 interface Ports {
   settings(): Settings
+  ownerHome?(): { chatId: string; title: string } | undefined
   dm(): DmPorts
   self(): string
   now(): number
   reason(): string | null
   captcha?(): boolean
-  exclusive<T>(work: () => Promise<T>): Promise<T>
+  exclusiveWait<T>(work: () => Promise<T>, signal: AbortSignal, maxMs?: number): Promise<T>
   log(error: unknown): void
 }
 interface Cursor {
@@ -84,9 +87,57 @@ export class DouyinChannel {
   readonly sessions = new Map<string, { io: ChannelIO; signal: AbortSignal }>()
   /** 每个账号最近一次上报的状态，重新 start 时清掉。 */
   private reported = new Map<string, string>()
+  get groups() {
+    return this.p.settings().douyinChannelGroups
+  }
   accountId?: string
   state: 'online' | 'offline' | 'paused' = 'offline'
   reason?: string
+  private ownerBindings = new Map<ChannelIO, string>()
+  private binding?: Promise<void>
+  get ownerViaChannel() {
+    return !!(this.enabled && this.api.bind && this.p.dm().settings.ownerId && this.p.ownerHome?.())
+  }
+  async bindOwner() {
+    if (this.binding) return this.binding
+    this.binding = this.bindOwnerNow()
+    try {
+      await this.binding
+    } finally {
+      this.binding = undefined
+    }
+  }
+  private async bindOwnerNow() {
+    if (!this.ownerViaChannel) return
+    const home = this.p.ownerHome!()!
+    const p = this.p.dm()
+    const owner = p.settings.ownerId
+    const key = `${owner}:${home.chatId}`
+    const stored = p.kv.get<{ key: string; since: number }>('channel-owner')
+    // 接管先定时间和序号基线；绑定重试期间的新消息保留，已处理消息不再投递。
+    if (stored?.key !== key) {
+      const cursors = p.kv.get<Record<string, Cursor>>('channel-cursors') ?? {}
+      // 旧专线游标不一定是纯数字序号；不是就只用渠道已有游标，避免 BigInt 抛错卡住接管。
+      const numeric = (value: unknown) => (typeof value === 'string' && /^\d+$/.test(value) ? value : '0')
+      const processed = numeric(dmOf(p.kv).cursor)
+      const previous = numeric(cursors[owner]?.seq)
+      cursors[owner] = { seq: BigInt(processed) > BigInt(previous) ? processed : previous, lastAt: 0 }
+      p.kv.set('channel-cursors', cursors)
+      p.kv.set('channel-owner', { key, since: this.p.now() })
+      const dm = dmOf(p.kv)
+      p.kv.set('dm', { ...dm, pendingReplies: [] })
+    }
+    for (const { io, signal } of this.sessions.values()) {
+      if (signal.aborted || this.ownerBindings.get(io) === key) continue
+      try {
+        io.setOwner(owner)
+        await this.api.bind!('douyin', { chat: { id: owner, title: home.title }, chatId: home.chatId })
+        this.ownerBindings.set(io, key)
+      } catch (error) {
+        this.p.log(error)
+      }
+    }
+  }
   private nextAt = 0
   private character?: string
   private ensuring?: Promise<void>
@@ -112,7 +163,20 @@ export class DouyinChannel {
       this.ensuring = undefined
     }
   }
+  syncGroups() {
+    const kv = this.p.dm().kv
+    if (!this.groups) {
+      kv.delete('channel-groups-since')
+      return
+    }
+    if (kv.get<number>('channel-groups-since') !== undefined) return
+    kv.set('channel-groups-since', this.p.now())
+    // 重新开启只清理群游标，关掉期间的群消息不补投，私聊继续原来的进度。
+    const cursors = kv.get<Record<string, Cursor>>('channel-cursors') ?? {}
+    kv.set('channel-cursors', Object.fromEntries(Object.entries(cursors).filter(([id]) => !id.startsWith('group:'))))
+  }
   sync() {
+    this.syncGroups()
     const dm = this.p.dm()
     this.reason = this.p.reason() ?? undefined
     this.state = !dm.loggedIn() ? 'offline' : !this.enabled || dm.paused() ? 'paused' : 'online'
@@ -152,16 +216,18 @@ export class DouyinChannel {
       id: 'douyin',
       name: t('抖音私信'),
       riskNotice: t('抖音网页自动化存在风控和封号风险，请谨慎开启'),
-      scopes: ['private'],
+      scopes: ['private', 'group'],
       canInitiate: false,
-      limits: { maxTextLength: 500, minIntervalMs: 60000, perMinute: 1 },
+      // 发送间隔不在宿主侧写死：由风控里的「私信发送冷却」控制（可设 0），拟人分条才能连续发出。
+      limits: { maxTextLength: 500 },
       media: { inboundImages: true, outboundImages: false, voice: false },
-      defaults: { newLocation: { private: 'approve' } },
+      // 群回复方式由入站提及标记控制，已有绑定无需调整触发方式。
+      defaults: { newLocation: { private: 'approve', group: 'approve' }, trigger: { group: 'mention' } },
       accountFields: [],
       // 账号由应用生活自动建（ensureAccount），渠道页不提供「添加」。
       managedAccounts: true,
       promptHint:
-        'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation.',
+        'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
       start: async (account, io, signal) => {
         if (signal.aborted) return
         const session = { io, signal }
@@ -169,12 +235,14 @@ export class DouyinChannel {
         this.reported.delete(account.id)
         try {
           this.sync()
+          await this.bindOwner()
           await new Promise<void>((resolve) => {
             signal.addEventListener('abort', () => resolve(), { once: true })
             if (signal.aborted) resolve()
           })
         } finally {
           if (this.sessions.get(account.id) === session) this.sessions.delete(account.id)
+          this.ownerBindings.delete(io)
         }
       },
       send: (account, message, signal) => this.send(account, message, signal),
@@ -183,12 +251,12 @@ export class DouyinChannel {
   async poll(signal?: AbortSignal) {
     await this.ensure()
     this.sync()
+    await this.bindOwner()
     const p = this.p.dm(),
       now = this.p.now(),
       s = p.settings
     if (
       !this.enabled ||
-      !s.dmListen ||
       !p.loggedIn() ||
       p.paused() ||
       (!s.listenAllDay && !inWindow(s, now)) ||
@@ -206,8 +274,13 @@ export class DouyinChannel {
     const peers = (await p.adapter.directMessages.conversations({ signal }))
       .filter(
         (peer) =>
-          !peer.isGroup &&
-          peer.peerId !== s.ownerId &&
+          (!peer.isGroup || this.groups) &&
+          (peer.isGroup ||
+            peer.peerId !== s.ownerId ||
+            (this.ownerViaChannel &&
+              [...this.sessions.values()].every(
+                ({ io }) => this.ownerBindings.get(io) === `${s.ownerId}:${this.p.ownerHome?.()?.chatId}`,
+              ))) &&
           peer.peerId !== this.p.self() &&
           (!cursors[peer.peerId] || peer.lastAt > cursors[peer.peerId]!.lastAt || peer.unread > 0),
       )
@@ -221,18 +294,36 @@ export class DouyinChannel {
       )
         .filter(
           (message) =>
-            message.senderId === peer.peerId &&
+            (peer.isGroup || message.senderId === peer.peerId) &&
+            !message.fromMe &&
+            !message.robot &&
+            !message.system &&
+            message.senderId !== this.p.self() &&
             /^\d+$/.test(message.seq) &&
             (!cursor || BigInt(message.seq) > BigInt(cursor.seq)),
         )
         .sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0))
+      // 主人基线独立于访客渠道启用时间，并保留原专线已处理的序号。
+      if (!peer.isGroup && peer.peerId === s.ownerId && this.ownerViaChannel) {
+        const sinceOwner = p.kv.get<{ since: number }>('channel-owner')!.since
+        const old = messages.filter((message) => message.at <= sinceOwner)
+        if (old.length) {
+          cursors[peer.peerId] = { seq: old.at(-1)!.seq, lastAt: 0 }
+          p.kv.set('channel-cursors', cursors)
+        }
+        messages = messages.filter((message) => message.at > sinceOwner)
+      }
       signal?.throwIfAborted()
       if (!known && cursor) {
         // 新面孔：渠道开启前的旧消息只用来定基线，先落游标，避免下轮把它们当新消息。
-        const old = messages.filter((message) => message.at < since)
+        const old = messages.filter(
+          (message) => message.at < (peer.isGroup ? (p.kv.get<number>('channel-groups-since') ?? since) : since),
+        )
         cursors[peer.peerId] = { seq: old.at(-1)?.seq ?? '0', lastAt: 0 }
         p.kv.set('channel-cursors', cursors)
-        messages = messages.filter((message) => message.at >= since)
+        messages = messages.filter(
+          (message) => message.at >= (peer.isGroup ? (p.kv.get<number>('channel-groups-since') ?? since) : since),
+        )
       }
       if (!cursor) {
         cursors[peer.peerId] = { seq: messages.at(-1)?.seq ?? '0', lastAt: peer.lastAt }
@@ -252,7 +343,7 @@ export class DouyinChannel {
         if (message.shared?.itemId) {
           const timeout = AbortSignal.timeout(120000)
           const watchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
-          context = `${await sharedDmMaterial(p, message.shared.itemId, now, watchSignal, 'The sender', save)}\n${OWNER_SHARE_REPLY_RULE}`
+          context = `${await sharedDmMaterial(p, message.shared.itemId, now, watchSignal, peer.peerId === s.ownerId && !peer.isGroup ? 'The owner' : 'The sender', save)}\n${OWNER_SHARE_REPLY_RULE}`
         }
         if (message.imageCount && p.adapter.directMessages.captureImages) {
           try {
@@ -271,8 +362,24 @@ export class DouyinChannel {
             accountSignal.throwIfAborted()
             await io.emit({
               id: message.seq,
-              chat: { id: peer.peerId, title: peer.name },
-              from: { id: peer.peerId, name: peer.name },
+              chat: {
+                id: peer.isGroup ? (peer.conversationId ?? peer.peerId.slice(6)) : peer.peerId,
+                title: peer.name,
+                ...(peer.isGroup ? { scope: 'group' as const } : {}),
+              },
+              from: {
+                id: peer.isGroup ? message.senderId : peer.peerId,
+                name: peer.isGroup ? (message.senderName ?? message.senderId.slice(0, 8)) : peer.name,
+              },
+              ...(peer.isGroup
+                ? {
+                    mentionsMe:
+                      message.mentioned === true ||
+                      (this.p.settings().douyinGroupReply === 'batch' && message === messages.at(-1)),
+                    repliesToMe: message.repliesToMe === true,
+                    replyTo: message.replyToSid,
+                  }
+                : {}),
               text: message.text,
               images,
               context,
@@ -300,7 +407,7 @@ export class DouyinChannel {
     const text = stripStage(message.text)
     if (!text) return { id: String(this.p.now()) }
     try {
-      return await this.p.exclusive(async () => {
+      return await this.p.exclusiveWait(async () => {
         signal.throwIfAborted()
         const p = this.p.dm(),
           now = this.p.now()
@@ -309,8 +416,11 @@ export class DouyinChannel {
           this.sync()
           throw new ChannelSendError('not-sent', this.p.captcha?.() ? 'captcha' : 'paused')
         }
+        const group = /^\d+$/.test(message.chatId)
+        if (group && !this.groups) throw new ChannelSendError('not-sent', 'groups-disabled')
         const key = `channel:${message.chatId}`
-        if (todayCount(p, key, now) >= this.p.settings().douyinChannelDaily) {
+        const owner = this.ownerViaChannel && message.chatId === p.settings.ownerId
+        if (!owner && todayCount(p, key, now) >= this.p.settings().douyinChannelDaily) {
           activity(p, {
             at: now,
             kind: 'dm-channel',
@@ -322,10 +432,14 @@ export class DouyinChannel {
           // 每日配额不占住宿主的账号发送队列；即使临近午夜也不自动补发。
           throw new ChannelSendError('not-sent', 'daily-limit')
         }
-        const result = await p.adapter.directMessages.send(message.chatId, text, signal)
-        countAttempt(p, key, now)
+        const result = await p.adapter.directMessages.send(
+          group ? `group:${message.chatId}` : message.chatId,
+          text,
+          signal,
+        )
+        if (!owner) countAttempt(p, key, now)
         return { id: result?.id || String(now) }
-      })
+      }, signal)
     } catch (error) {
       // 宿主日志只记 code，原始错误在插件日志里留一份方便排查。
       this.p.log(error)

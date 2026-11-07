@@ -59,7 +59,7 @@ import {
   userRoot,
   websocketUpgrade,
 } from './host'
-import { defineExtension, type Extension, type ExtensionContext } from './host-api'
+import { ChannelSendError, defineExtension, type Extension, type ExtensionContext } from './host-api'
 import { setLanguageSource, t } from './i18n'
 import { settingsSchema } from './settings'
 
@@ -231,7 +231,24 @@ export function nearestUserMessage(
     return undefined
   }
 }
-class Service {
+export class Service {
+  get ownerViaChannel() {
+    return this.channel?.ownerViaChannel === true
+  }
+  ownerHome() {
+    const home = this.kv.get<{ chatId: string; characterId: string }>('home')
+    if (!home || home.characterId !== this.s.characterId) return
+    try {
+      if (!this.ctx.host.getChatInfo(home.chatId, 1).characters.some((c) => c.id === this.s.characterId)) return
+      const owner = this.kv.get<OwnerCache>('douyin-owner')
+      return {
+        chatId: home.chatId,
+        title: (owner?.input === this.s.douyinOwnerId.trim() ? owner.nickname : '') || t('主人'),
+      }
+    } catch {
+      return
+    }
+  }
   channel?: DouyinChannel
   channelHandle?: { unregister(): void }
   registerChannel() {
@@ -245,8 +262,12 @@ class Service {
       this.channelHandle = undefined
       this.channel = undefined
       // 关掉期间的私信不补投：下次打开重新以那时为界。
-      if (!this.s.douyinEnabled || !this.s.douyinChannel) this.kv.delete('channel-since')
-      return
+      if (!this.s.douyinEnabled || !this.s.douyinChannel) {
+        scopedKv(this.kv, 'douyin').delete('channel-owner')
+        this.kv.delete('channel-since')
+        this.kv.delete('channel-groups-since')
+      }
+      if (!this.s.douyinEnabled || !this.s.douyinChannel || !this.signal || this.signal.aborted) return
     }
     if (
       !this.channel &&
@@ -258,6 +279,7 @@ class Service {
     ) {
       this.channel = new DouyinChannel(this.ctx.channels, {
         settings: () => this.s,
+        ownerHome: () => this.ownerHome(),
         dm: () => this.dmPorts('douyin'),
         self: () => this.account('douyin')?.id ?? '',
         now: () => this.rt.now(),
@@ -266,16 +288,22 @@ class Service {
           const traffic = this.platform('douyin').guard.status()
           if (traffic.manual.length) return t('抖音需要验证')
           if (traffic.pausedUntil && traffic.pausedUntil > this.rt.now()) return traffic.pauseReason ?? t('私信已暂停')
-          return this.paused('douyin') ? t('私信已暂停') : null
+          if (this.s.douyinBrowserBackend === 'chrome') {
+            const browser = chromeSession(this.ctx).browser.available()
+            if (!browser.ok) return browser.detail
+          }
+          return null
         },
-        exclusive: (work) => this.exclusive(work),
+        exclusiveWait: (work, signal, maxMs) => this.exclusiveWait(work, signal, maxMs),
         log: this.log,
       })
+      this.channel.syncGroups()
       this.channelHandle = this.ctx.channels.registerProvider(this.channel.provider())
       // 以打开开关的时间为界：之后发来的私信都要投递，不等第一次读取成功（浏览器可能还没连上）。
       if (this.kv.get<number>('channel-since') === undefined) this.kv.set('channel-since', this.rt.now())
       void this.channel.ensure().catch(this.log)
     }
+    this.channel?.syncGroups()
   }
   running = false
   dmBusy = false
@@ -386,7 +414,9 @@ class Service {
     return !!(x.manual.length || (x.pausedUntil && x.pausedUntil > this.rt.now()))
   }
   pending() {
-    return Object.keys(apps).some((app) => dmOf(scopedKv(this.kv, app)).pendingReplies.length)
+    return Object.keys(apps).some(
+      (app) => !(app === 'douyin' && this.ownerViaChannel) && dmOf(scopedKv(this.kv, app)).pendingReplies.length,
+    )
   }
   log = (error: unknown) => {
     if (error instanceof BrowserSkippedError) return
@@ -465,6 +495,24 @@ class Service {
     } finally {
       this.dmBusy = false
     }
+  }
+  async exclusiveWait<T>(work: () => Promise<T>, signal: AbortSignal, maxMs = 300000): Promise<T> {
+    const deadline = this.rt.now() + maxMs
+    // 主人渠道由宿主投递，onEvent 跳过它；此入口不能从持有私信锁的专线回复中调用。
+    while (this.running || this.dmBusy || this.replying) {
+      if (signal.aborted) throw new ChannelSendError('not-sent', 'aborted')
+      const remaining = deadline - this.rt.now()
+      if (remaining <= 0) throw new RouteError('BUSY', t('正在运行，请稍后重试'))
+      try {
+        await this.rt.sleep(Math.min(1000, remaining), signal)
+      } catch (error) {
+        if (signal.aborted) throw new ChannelSendError('not-sent', 'aborted')
+        throw error
+      }
+    }
+    if (signal.aborted) throw new ChannelSendError('not-sent', 'aborted')
+    // 检查和抢锁之间不让出执行权，多个等待者不会同时进入浏览器。
+    return this.exclusive(work)
   }
   dmPorts(app: string): DmPorts {
     const { adapter } = this.platform(app)
@@ -600,6 +648,8 @@ class Service {
     this.registerChannel()
     await this.channel?.ensure()
     this.channel?.sync()
+    // 绑定只操作宿主数据，登录离线也应重试，不必等待读取私信。
+    if (this.channel) await this.channel.bindOwner()
     const signal = this.roundSignal(taskSignal)
     if (signal?.aborted || this.running || this.dmBusy || this.replying) return
     this.dmBusy = true
@@ -611,11 +661,15 @@ class Service {
         if (!this.loggedIn(app)) continue
         try {
           if (app === 'douyin') await this.ensureDouyinOwner()
-          await pollOwnerDm(this.dmPorts(app), this.rt.now(), signal)
+          if (!(app === 'douyin' && this.ownerViaChannel)) await pollOwnerDm(this.dmPorts(app), this.rt.now(), signal)
           if (app === 'douyin') await this.channel?.poll(signal)
           signal?.throwIfAborted()
           // 待回复私信只阻止所属平台的公开互动。
-          if (dmOf(scopedKv(this.kv, app)).pendingReplies.length || this.replying) continue
+          if (
+            (!(app === 'douyin' && this.ownerViaChannel) && dmOf(scopedKv(this.kv, app)).pendingReplies.length) ||
+            this.replying
+          )
+            continue
           await pollComments(this.socialPorts(app, signal), this.rt.now(), signal)
           signal?.throwIfAborted()
           await pollLive(this.socialPorts(app, signal), this.rt.now(), signal)
@@ -687,7 +741,12 @@ class Service {
         limits: normalizeLimits({ ...this.ctx.settings, ...s.risk }),
       },
       dm: {
-        listening: enabledApps(this.s).includes(app) && s.dmListen && this.loggedIn(app) && !!s.ownerId,
+        listening:
+          enabledApps(this.s).includes(app) &&
+          (s.dmListen || (app === 'douyin' && this.ownerViaChannel)) &&
+          this.loggedIn(app) &&
+          !!s.ownerId,
+        label: app === 'douyin' && this.ownerViaChannel ? t('私信经渠道') : undefined,
         lastPollAt: dm.lastPollAt,
         nextAt: dm.nextAt,
         failures: dm.failures,
@@ -756,8 +815,9 @@ class Service {
                 : !this.ctx.channels?.registerProvider
                   ? { label: t('宿主不支持') }
                   : {
-                      label:
-                        this.channel?.state === 'online' && this.channel.sessions.size
+                      label: this.ownerViaChannel
+                        ? t('私信经渠道')
+                        : this.channel?.state === 'online' && this.channel.sessions.size
                           ? t('已连接（{id}）', {
                               id: this.channel.accountId ?? [...this.channel.sessions.keys()][0] ?? '',
                             })
@@ -986,6 +1046,7 @@ const extension: Extension = {
           // 回复只回到来源：只有在回那条等待中的私信时才发回私信。
           const replyTo = nearestUserMessage(ctx, event.message)
           for (const app of enabledApps(svc.s)) {
+            if (app === 'douyin' && svc.ownerViaChannel) continue
             if (dmOf(scopedKv(svc.kv, app)).pendingReplies.length) {
               if (app === 'douyin') await svc.ensureDouyinOwner()
               await replyOwnerDm(svc.dmPorts(app), event.message.content, svc.rt.now(), svc.signal, replyTo)
@@ -1437,7 +1498,7 @@ const extension: Extension = {
             enabledApps(s.s).map(async (app) => {
               const adapter = s.platform(app).adapter
               const checks = await adapter.diagnose()
-              if (app === 'douyin' && s.s.douyinBrowserProxy) {
+              if (app === 'douyin' && s.s.douyinBrowserBackend === 'headless' && s.s.douyinBrowserProxy) {
                 const ok = await browserProxyReachable(s.s.douyinBrowserProxy)
                 checks.push({ name: t('浏览器代理'), ok, detail: ok ? t('浏览器代理可连接') : t('浏览器代理连不上') })
               }

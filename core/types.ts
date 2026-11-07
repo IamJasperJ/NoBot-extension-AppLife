@@ -195,6 +195,13 @@ export interface DirectMessage {
   /** 单调递增的游标（B 站：msg_seqno），框架据此只取新消息 */
   seq: string
   senderId: string
+  senderName?: string
+  fromMe?: boolean
+  robot?: boolean
+  system?: boolean
+  mentioned?: boolean
+  replyToSid?: string
+  repliesToMe?: boolean
   text: string
   at: number
 }
@@ -426,6 +433,7 @@ export interface AppAdapter {
 }
 
 export interface DmConversation {
+  conversationId?: string
   peerId: string
   name: string
   lastAt: number

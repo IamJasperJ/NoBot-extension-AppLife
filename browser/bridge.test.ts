@@ -612,3 +612,33 @@ for (const reattachDuringNavigate of [true, false]) {
     }
   })
 }
+
+test('空闲 detach、target_closed 和关闭标签保持可用并自动重开；真正离线或手动暂停才不可用', async () => {
+  const f = await sessionFixture(5)
+  try {
+    await f.session.run(async () => {})
+    await Bun.sleep(15)
+    expect(f.commands.some((c) => c.op === 'cdp.detach')).toBe(true)
+    expect(f.session.available().ok).toBe(true)
+    f.connection.receive(JSON.stringify(targetClosed))
+    expect(f.session.available().ok).toBe(true)
+    await f.session.run(async (page) => {
+      expect(await page.evaluate(() => 42, null, { readonly: true })).toBe(42)
+    })
+    f.connection.receive(JSON.stringify({ event: 'tab.closed', key: 'douyin' }))
+    expect(f.session.available().ok).toBe(true)
+    const opens = f.commands.filter((c) => c.op === 'tab.open').length
+    await f.session.run(async (page) => {
+      expect(await page.evaluate(() => 42, null, { readonly: true })).toBe(42)
+    })
+    expect(f.commands.filter((c) => c.op === 'tab.open')).toHaveLength(opens + 1)
+    f.connection.receive(JSON.stringify({ event: 'state', paused: true }))
+    expect(f.session.available()).toMatchObject({ ok: false, detail: '插件已暂停' })
+    f.connection.receive(JSON.stringify({ event: 'state', paused: false }))
+    expect(f.session.available().ok).toBe(true)
+    f.connection.close()
+    expect(f.session.available()).toMatchObject({ ok: false, detail: 'Chrome 插件不在线' })
+  } finally {
+    await f.close()
+  }
+})

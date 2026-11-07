@@ -560,6 +560,17 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
           { host: '192.168.1.20', port: 1080 },
           { host: '192.168.1.20', port: 1080 },
         ])
+        await registry.configureExtension('app-life', {
+          settings: {
+            ...savedSettings,
+            douyinEnabled: true,
+            douyinBrowserBackend: 'chrome',
+            douyinBrowserProxy: 'socks5://192.168.1.20:1080',
+          },
+        })
+        const chromeChecks = (await (await request('/diagnose', {})).json()).checks
+        expect(chromeChecks.some((c) => c.name === '抖音 浏览器代理')).toBe(false)
+        expect(proxyConnections).toHaveLength(2)
       } finally {
         connectProxy.mockRestore()
         await registry.configureExtension('app-life', { settings: savedSettings })
@@ -596,7 +607,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
           maxVideos: 1,
           deepReads: 0,
           commentListen: true,
-          commentPollSeconds: 60,
+          bilibiliCommentPollSeconds: 60,
           listenAllDay: true,
           ownerId: '7',
           liveRoom: '1',

@@ -22,6 +22,8 @@ export interface Settings extends PlanConfig, ShareSettings {
   douyinToolComment: boolean
   douyinCommentMode: 'draft' | 'direct'
   bilibiliEnabled: boolean
+  douyinGroupReply: 'mention' | 'batch'
+  douyinChannelGroups: boolean
   douyinChannel: boolean
   douyinChannelDaily: number
   douyinEnabled: boolean
@@ -57,6 +59,10 @@ export interface Settings extends PlanConfig, ShareSettings {
   liveScope: 'owner' | 'mention'
   livePollSeconds: number
   liveDailyReplies: number
+  bilibiliDmPollSeconds: number
+  bilibiliCommentPollSeconds: number
+  douyinDmPollSeconds: number
+  douyinCommentPollSeconds: number
   dmListen: boolean
   dmPollSeconds: number
   listenAllDay: boolean
@@ -66,6 +72,9 @@ export interface Settings extends PlanConfig, ShareSettings {
   memoryChars: number
   risk: Partial<RiskLimits>
 }
+const FRAME_TILE = 720
+const MAX_SUBTITLE_CHARS = 6000
+
 export const defaults: Settings = {
   app: 'bilibili',
   bilibiliInteractive: true,
@@ -82,6 +91,8 @@ export const defaults: Settings = {
   douyinCommentMode: 'draft',
 
   bilibiliEnabled: true,
+  douyinGroupReply: 'mention',
+  douyinChannelGroups: false,
   douyinChannel: false,
   douyinChannelDaily: 20,
   douyinEnabled: false,
@@ -100,8 +111,8 @@ export const defaults: Settings = {
   deepReads: 2,
   interests: '',
   frames: true,
-  frameTile: 720,
-  maxSubtitleChars: 6000,
+  frameTile: FRAME_TILE,
+  maxSubtitleChars: MAX_SUBTITLE_CHARS,
   connectionId: '',
   model: '',
   visionConnectionId: '',
@@ -122,6 +133,10 @@ export const defaults: Settings = {
   liveScope: 'owner',
   livePollSeconds: 60,
   liveDailyReplies: 10,
+  bilibiliDmPollSeconds: 60,
+  bilibiliCommentPollSeconds: 300,
+  douyinDmPollSeconds: 120,
+  douyinCommentPollSeconds: 300,
   dmListen: true,
   dmPollSeconds: 60,
   listenAllDay: false,
@@ -143,11 +158,15 @@ function browserProxyOf(value: string): string {
     return ''
   }
 }
+// 内部字段不接受原始设置覆盖；平台轮询间隔在规范化后派生。
+const INTERNAL_SETTINGS = new Set(['dmPollSeconds', 'commentPollSeconds', 'frameTile', 'maxSubtitleChars'])
+
 export function settingsOf(raw: Record<string, unknown>): Settings {
   const s = Object.fromEntries(
-    Object.entries(defaults).map(([key, value]) => [key, raw[key] ?? value]),
+    Object.entries(defaults).map(([key, value]) => [key, INTERNAL_SETTINGS.has(key) ? value : (raw[key] ?? value)]),
   ) as unknown as Settings
   for (const key of Object.keys(defaults) as (keyof Settings)[]) {
+    if (INTERNAL_SETTINGS.has(key)) continue
     const base = defaults[key],
       value = raw[key]
     if (typeof base === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
@@ -167,18 +186,21 @@ export function settingsOf(raw: Record<string, unknown>): Settings {
   s.deepReads = Math.min(10, Math.max(0, Math.floor(s.deepReads)))
   s.shareDaily = Math.min(20, Math.max(0, Math.floor(s.shareDaily)))
   s.skipChance = Math.min(1, Math.max(0, s.skipChance))
-  s.frameTile = Math.min(1080, Math.max(240, s.frameTile))
-  s.maxSubtitleChars = Math.min(30000, Math.max(0, s.maxSubtitleChars))
   if (!['home', 'comment', 'dm'].includes(s.shareVia)) s.shareVia = 'home'
   if (!['home', 'comment', 'dm'].includes(s.douyinShareVia)) s.douyinShareVia = 'home'
   if (!['owner', 'mention'].includes(s.liveScope)) s.liveScope = 'owner'
   s.liveRoom = s.liveRoom.trim()
-  s.commentPollSeconds = Math.max(60, s.commentPollSeconds)
+  s.bilibiliCommentPollSeconds = Math.max(60, s.bilibiliCommentPollSeconds)
+  s.douyinCommentPollSeconds = Math.max(120, s.douyinCommentPollSeconds)
   s.livePollSeconds = Math.max(30, s.livePollSeconds)
   s.commentDailyDrafts = Math.min(30, Math.max(0, Math.floor(s.commentDailyDrafts)))
   s.liveDailyReplies = Math.min(30, Math.max(0, Math.floor(s.liveDailyReplies)))
+  if (!['mention', 'batch'].includes(s.douyinGroupReply)) s.douyinGroupReply = 'mention'
   s.douyinChannelDaily = Math.max(0, Math.floor(s.douyinChannelDaily))
-  s.dmPollSeconds = Math.max(15, s.dmPollSeconds)
+  s.bilibiliDmPollSeconds = Math.max(15, s.bilibiliDmPollSeconds)
+  s.douyinDmPollSeconds = Math.max(15, s.douyinDmPollSeconds)
+  s.dmPollSeconds = s.app === 'douyin' ? s.douyinDmPollSeconds : s.bilibiliDmPollSeconds
+  s.commentPollSeconds = s.app === 'douyin' ? s.douyinCommentPollSeconds : s.bilibiliCommentPollSeconds
   s.exploreRatio = Math.min(0.5, Math.max(0, s.exploreRatio))
   s.quietAfterIgnored = Math.min(20, Math.max(0, Math.floor(s.quietAfterIgnored)))
   s.windows = Array.isArray(raw.windows) ? (raw.windows as Settings['windows']) : defaults.windows
@@ -317,10 +339,11 @@ export function scopedKv(kv: KV, app: string): KV {
 }
 /**
  * 某个平台看到的设置：主人 id 和分享渠道换成该平台的，主人昵称只给 B 站；直播只有 B 站有。
- * 抖音的私信和通知要开浏览器页面，轮询放慢（私信至少 2 分钟、评论至少 5 分钟），浏览器才有机会空闲关掉。
+ * 各平台的轮询间隔换进内部字段，主人私信与访客渠道共用抖音私信间隔。
  */
 export function scopedSettings(s: Settings, app: string, owner?: OwnerCache): Settings {
-  if (app !== 'douyin') return { ...s, app }
+  if (app !== 'douyin')
+    return { ...s, app, dmPollSeconds: s.bilibiliDmPollSeconds, commentPollSeconds: s.bilibiliCommentPollSeconds }
   const parsed = parseOwnerInput(s.douyinOwnerId)
   const ownerId = parsed.kind === 'secUid' ? parsed.secUid : owner?.input === s.douyinOwnerId.trim() ? owner.secUid : ''
   return {
@@ -331,8 +354,8 @@ export function scopedSettings(s: Settings, app: string, owner?: OwnerCache): Se
     // 主人昵称是 B 站的；抖音评论里拼一段 @ 文字不会提醒到人，还可能 @ 错人，所以不加
     ownerName: '',
     liveRoom: '',
-    dmPollSeconds: Math.max(120, s.dmPollSeconds),
-    commentPollSeconds: Math.max(300, s.commentPollSeconds),
+    dmPollSeconds: s.douyinDmPollSeconds,
+    commentPollSeconds: s.douyinCommentPollSeconds,
   }
 }
 

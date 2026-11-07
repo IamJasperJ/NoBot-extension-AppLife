@@ -296,7 +296,28 @@ test('会话列表只从 fiber 取 sec_uid，识别群聊、未读与时间，�
           unreadCount: 3,
           lastMessage: { createdAt: 1794000000 },
         }),
-        node({ toParticipantSecUserId: 'group-id', name: 'Group', conversationType: 2, updatedAt: 1794000000000 }),
+        node(
+          Object.create({
+            get toParticipantSecUserId() {
+              return ''
+            },
+            get conversationShortId() {
+              return '7705449790703796773'
+            },
+            get name() {
+              return 'Group'
+            },
+            get type() {
+              return 2
+            },
+            get badgeCount() {
+              return 4
+            },
+            get updatedAt() {
+              return 1794000000000
+            },
+          }),
+        ),
         node({ name: 'sec-guess', unreadCount: 10 }),
         node({ toParticipantSecUserId: 'sec-2', isGroup: true }),
       ],
@@ -304,8 +325,14 @@ test('会话列表只从 fiber 取 sec_uid，识别群聊、未读与时间，�
   })
   expect(JSON.parse(JSON.stringify(rows))).toEqual([
     { peerId: 'sec-1', name: 'Alice', unread: 3, lastAt: 1794000000000, isGroup: false },
-    { peerId: 'group-id', name: 'Group', unread: 0, lastAt: 1794000000000, isGroup: true },
-    { peerId: 'sec-2', name: 'DOM nickname', unread: 0, lastAt: 0, isGroup: true },
+    {
+      peerId: 'group:7705449790703796773',
+      conversationId: '7705449790703796773',
+      name: 'Group',
+      unread: 4,
+      lastAt: 1794000000000,
+      isGroup: true,
+    },
   ])
   const calls: unknown[] = []
   const page = {
@@ -317,4 +344,137 @@ test('会话列表只从 fiber 取 sec_uid，识别群聊、未读与时间，�
   } as unknown as BrowserPage
   expect((await readConversations(page)).status).toBe('open')
   expect(calls.every((opts) => (opts as { readonly: boolean }).readonly)).toBe(true)
+})
+
+// getter 放在原型上，避免测试误把页面 SDK 当成可枚举 JSON。
+const getters = (value: Record<string, unknown>) =>
+  Object.create(
+    Object.defineProperties(
+      {},
+      Object.fromEntries(Object.entries(value).map(([key, val]) => [key, { get: () => val }])),
+    ),
+  )
+
+test('群消息读取原型字段，忽略 isMyMessage，读取昵称、提及、引用和过滤标记', async () => {
+  const { readGroupScript } = await import('./im')
+  const make = (sid: string, extra: Record<string, unknown> = {}) => ({
+    __reactFiber$test: {
+      memoizedProps: {
+        message: getters({
+          serverId: sid,
+          sender: '123',
+          secSender: 'member-sec',
+          isMyMessage: true,
+          createdAt: 1794000000,
+          type: 7,
+          parsedContent: { text: 'hello', mention_users: [{ uid: 'self-uid' }] },
+          ...extra,
+        }),
+      },
+    },
+    querySelector: () => ({ textContent: '成员昵称' }),
+    setAttribute: () => {},
+  })
+  const rows = runInNewContext(`(${readGroupScript.toString()})(self)`, {
+    self: { uid: 'self-uid', sec: 'self-sec' },
+    document: {
+      querySelectorAll: () => [
+        make('6', { type: 1001 }),
+        make('5', { clientId: 'AI-REPLY-1' }),
+        make('4', { ext: { 'a:is_from_robot': 'true' } }),
+        make('3', { referenceInfo: getters({ serverId: '1' }) }),
+        make('2', { secSender: 'self-sec' }),
+        make('1', { isFromMe: true }),
+      ],
+    },
+  })
+  expect(rows[0]).toMatchObject({ sid: '1', fromMe: true })
+  expect(rows[1]).toMatchObject({ sid: '2', fromMe: true })
+  expect(rows[2]).toMatchObject({
+    sid: '3',
+    fromMe: false,
+    senderSec: 'member-sec',
+    senderUid: '123',
+    senderName: '成员昵称',
+    mentioned: true,
+    replyToSid: '1',
+    at: 1794000000000,
+  })
+  expect(rows[3].robot).toBe(true)
+  expect(rows[4].robot).toBe(true)
+  expect(rows[5].system).toBe(true)
+})
+
+test('打开群按会话 id 点击，面板 id 不符则放弃，发送回读只认 isFromMe', async () => {
+  const { currentConversationScript, readGroupScript } = await import('./im')
+  for (const mismatch of [false, true]) {
+    let selected = false
+    let sent = false
+    let typed = ''
+    const row = {
+      __reactFiber$test: {
+        memoizedProps: {
+          conversation: getters({
+            type: 2,
+            toParticipantSecUserId: '',
+            lastMessage: getters({ conversationShortId: '7705' }),
+          }),
+        },
+      },
+      innerText: '群名\n旧消息',
+      getBoundingClientRect: () => ({ x: 10, y: 20, width: 30, height: 40 }),
+    }
+    const page = {
+      url: () => 'https://www.douyin.com/chat',
+      waitForTimeout: async () => {},
+      keyboard: {
+        insertText: async (text: string) => {
+          typed = text
+        },
+      },
+      evaluate: async (fn: (...args: unknown[]) => unknown, arg: unknown) => {
+        if (fn === currentConversationScript) return selected && !mismatch ? '7705' : 'other'
+        if (fn === readGroupScript) return sent ? [{ sid: '9', fromMe: true, parsedContent: { text: 'hello' } }] : []
+        if (fn.name === 'listScript')
+          return runInNewContext(`(${fn.toString()})()`, { document: { querySelectorAll: () => [row] } })
+        if (fn.name === 'clickScript') {
+          expect(arg).toEqual({ x: 25, y: 40 })
+          selected = true
+          return true
+        }
+        if (fn.name === 'blockedScript') return false
+        if (fn.name === 'typedScript') return typed
+        if (fn.name === 'enterScript') {
+          sent = true
+          typed = ''
+          return true
+        }
+        return true
+      },
+    } as unknown as BrowserPage
+    const result = await sendMessage(page, 'group:7705', 'hello')
+    expect(result.status).toBe(mismatch ? 'not-sent' : 'sent')
+    expect(sent).toBe(!mismatch)
+  }
+})
+
+test('当前群校验读取消息 getter，会话缺消息或缺 id 时不猜测', async () => {
+  const { currentConversationScript } = await import('./im')
+  for (const id of ['7705449790703796773', undefined]) {
+    const result = runInNewContext(`(${currentConversationScript.toString()})()`, {
+      document: {
+        querySelectorAll: () => [
+          {
+            __reactFiber$test: {
+              memoizedProps: {},
+              return: {
+                memoizedProps: { message: getters({ conversationShortId: id }) },
+              },
+            },
+          },
+        ],
+      },
+    })
+    expect(result).toBe(id ?? '')
+  }
 })

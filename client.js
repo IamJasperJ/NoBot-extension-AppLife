@@ -90,6 +90,7 @@ const en = {
   无: 'None',
   私信监听: 'DM listener',
   监听中: 'Listening',
+  私信经渠道: 'DMs via channel',
   未开启: 'Off',
   上次检查: 'Last check',
   下次检查: 'Next check',
@@ -634,7 +635,11 @@ export default function activate(api) {
               ? s?.live
                 ? h('span', { className: 'al-pill active' }, t('直播中'))
                 : h('span', { className: 'al-pill lurking' }, t('未开播'))
-              : h('span', { className: `al-pill ${on ? 'active' : 'lurking'}` }, on ? t('监听中') : t('未开启'))
+              : h(
+                  'span',
+                  { className: `al-pill ${on ? 'active' : 'lurking'}` },
+                  s?.label || (on ? t('监听中') : t('未开启')),
+                )
           const detail = on
             ? [
                 `${t('上次检查')} ${dateTime(s?.lastPollAt)}`,

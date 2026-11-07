@@ -285,6 +285,7 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
               lastAt: num(row.lastAt),
               unread: num(row.unread),
               isGroup: row.isGroup === true,
+              ...(str(row.conversationId) ? { conversationId: str(row.conversationId) } : {}),
             }
           })
           .filter((row) => row.peerId)
@@ -300,9 +301,26 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
           .catch(() => undefined)
         api.ensure(response, payload)
         const messages: DirectMessage[] = []
+        const group = peerId.startsWith('group:')
+        // 本账号数字 uid 用于补全 mention_users；页面 isMentioned 仍可独立使用。
+        const self = group ? obj((await api.get('/aweme/v1/web/user/profile/self/', {}, signal)).user) : {}
+        const ownSids = new Set(
+          arr(obj(payload).messages)
+            .map(obj)
+            .filter((raw) => raw.from === 'me' || (str(raw.senderSec) === str(self.sec_uid) && !!str(self.sec_uid)))
+            .map((raw) => str(raw.sid)),
+        )
         for (const raw of arr(obj(payload).messages).map(obj)) {
           const seq = str(raw.sid)
-          if (raw.from !== 'them' || !/^\d+$/.test(seq) || !str(raw.text)) continue
+          if (
+            raw.from !== 'them' ||
+            ownSids.has(seq) ||
+            raw.robot === true ||
+            raw.system === true ||
+            !/^\d+$/.test(seq) ||
+            !str(raw.text)
+          )
+            continue
           if (afterSeq !== null && BigInt(seq) <= BigInt(afterSeq)) continue
           messages.push({
             ...(['video', 'slides', 'comment'].includes(str(obj(raw.shared).kind))
@@ -318,7 +336,17 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
               : {}),
             id: seq,
             seq,
-            senderId: peerId,
+            senderId: group ? str(raw.senderSec) : peerId,
+            ...(group
+              ? {
+                  senderName: str(raw.senderName),
+                  mentioned:
+                    raw.mentioned === true ||
+                    arr(raw.mentionUids).some((id) => !!id && [str(self.uid), str(self.sec_uid)].includes(str(id))),
+                  replyToSid: str(raw.replyToSid) || undefined,
+                  repliesToMe: raw.repliesToMe === true || ownSids.has(str(raw.replyToSid)),
+                }
+              : {}),
             text: str(raw.text),
             at: num(raw.at) || deps.runtime.now(),
             ...(num(raw.imageCount) > 0 ? { imageCount: Math.min(4, num(raw.imageCount)) } : {}),

@@ -1,8 +1,16 @@
 const en: Record<string, string> = {
+  主人: 'Owner',
+  私信经渠道: 'DMs via channel',
+  抖音渠道群聊: 'Douyin channel group chats',
+  '群聊回复方式在下面选择；群消息同样受每日回复上限':
+    'Choose the group reply mode below; group messages are also subject to the daily reply limit',
+  群聊回复方式: 'Group reply mode',
+  '被 @ 或回复她时才回': 'Reply only when mentioned or replied to',
+  每次轮询有新消息就回: 'Reply whenever a poll finds new messages',
   抖音私信: 'Douyin DMs',
   '抖音私信分会话（渠道）': 'Separate Douyin DM chats (channels)',
-  '每位联系人单独建会话；新联系人需要在渠道页批准，网页自动化有风控和封号风险':
-    'Create a separate chat per contact. Approve new contacts on the Channels page. Web automation risks restrictions and account bans.',
+  '每位联系人单独建会话；新联系人需要在渠道页批准，网页自动化有风控和封号风险。开启后你的私信也接入渠道，挂在她的家里会话，可在渠道页把抖音设为主渠道':
+    'Each contact gets a separate conversation; approve new contacts on the Channels page. Browser automation risks restrictions and account bans. Enabling this also connects your DMs to her home conversation; you can set Douyin as its primary channel.',
   每人每日渠道回复上限: 'Daily channel reply limit per person',
   '每位联系人每天最多发送的回复段数，0 表示不发送':
     'Maximum reply segments sent to each contact per day. Set 0 to disable sending.',
@@ -73,8 +81,8 @@ const en: Record<string, string> = {
   '[分享] {title}': '[Share] {title}',
   '[消息]': '[Message]',
   浏览器代理: 'Browser proxy',
-  '只给抖音的浏览器用，例如 socks5://192.168.1.20:1080；留空不额外设置':
-    'Only for the Douyin browser, e.g. socks5://192.168.1.20:1080; leave blank for no additional configuration',
+  '只给抖音的服务器无头浏览器用，例如 socks5://192.168.1.20:1080；留空不额外设置':
+    'Only for the Douyin server headless browser, e.g. socks5://192.168.1.20:1080; leave blank for no additional configuration',
   浏览器代理可连接: 'Browser proxy is reachable',
   浏览器代理连不上: 'Cannot connect to the browser proxy',
   '还没有配置主人账号，无法 @ 主人': 'The owner account is not configured yet; cannot @mention the owner',
@@ -147,8 +155,8 @@ const en: Record<string, string> = {
   此平台不支持读取浏览器登录态: 'This platform does not support reading browser login sessions',
   '刷 B 站': 'Browse Bilibili',
   刷抖音: 'Browse Douyin',
-  '抖音需要无头浏览器：启用后在「今天」页安装浏览器组件（约 190 MB）':
-    'Douyin requires a headless browser: after enabling it, install the browser component on Today (about 190 MB)',
+  '选择服务器无头浏览器时，需在「今天」页安装浏览器组件（约 190 MB）':
+    'When using the server headless browser, install the browser component on Today (about 190 MB)',
   '主人抖音主页链接 douyin.com/user/ 后面那一串': "The part after douyin.com/user/ in the owner's Douyin profile URL",
   已登录: 'Logged in',
   '当前系统不是 Debian / Ubuntu，无法自动安装；请自行安装 Chrome 或 Chromium':
@@ -196,8 +204,6 @@ const en: Record<string, string> = {
   '评论区分享会按 sec_uid 自动查你的昵称并 @ 你': 'Comment shares look up your nickname from sec_uid and mention you',
   '两个平台共用；分享渠道在各平台分组里设':
     'Shared by both platforms; the delivery channel is set in each platform group',
-  '两个平台共用；抖音轮询最少 2 分钟': 'Shared by both platforms; Douyin polls no more often than every 2 minutes',
-  '两个平台共用；抖音轮询最少 5 分钟': 'Shared by both platforms; Douyin polls no more often than every 5 minutes',
   '请输入抖音作品链接、分享口令或作品 id': 'Enter a Douyin work URL, share text or work id',
   抖音没有弹幕: 'Douyin has no danmaku',
   作品信息读取失败: 'Failed to read work information',
@@ -303,8 +309,8 @@ Object.assign(en, {
   会话不属于所选角色: 'This chat does not belong to the selected character',
   作息: 'Schedule',
   偏好格式无效: 'Invalid preferences',
-  全天监听: 'Listen all day',
-  '写入冷却（秒）': 'Write cooldown (seconds)',
+  活动窗口外也监听: 'Listen outside activity windows',
+  '公开写入冷却（秒）': 'Public write cooldown (seconds)',
   写私人日记: 'Write private diary',
   分享: 'Sharing',
   分享已关闭: 'Sharing is disabled',
@@ -315,7 +321,6 @@ Object.assign(en, {
   唤醒流程已启动: 'Wake routine started',
   图像能力将在实际请求时由宿主检查: 'The host will check image support when making a request',
   她的兴趣: 'Her interests',
-  字幕字符上限: 'Maximum subtitle characters',
   绑定会话: 'Bound chat',
   '尚未登录，今日浏览已跳过': 'Not logged in; browsing skipped for today',
   已配置: 'Configured',
@@ -323,7 +328,6 @@ Object.assign(en, {
   应用生活操作失败: 'App Life operation failed',
   '应用生活：{app}，今日分享 {shares}/{cap}': 'App Life: {app}; shares today {shares}/{cap}',
   开始时间: 'Start time',
-  抽帧单格尺寸: 'Frame tile size',
   无效作息时间: 'Invalid schedule time',
   日记: 'Diary',
   '最小醒来间隔（分钟）': 'Minimum wake gap (minutes)',
@@ -355,7 +359,9 @@ Object.assign(en, {
   看视频: 'Watching videos',
   看视频画面: 'Inspect video frames',
   私信: 'Direct messages',
-  '私信冷却（秒）': 'DM cooldown (seconds)',
+  '私信（含拟人分条的每一条）之间的最短间隔，0 表示不等待；每条都计入写入上限':
+    'Minimum gap between direct messages (including each split part); 0 means no wait. Every part counts toward the write limits.',
+  '私信发送冷却（秒）': 'DM send cooldown (seconds)',
   私信已暂停: 'Direct messages are paused',
   私信轮询秒数: 'DM polling interval (seconds)',
   私信需要双方互相关注: 'Direct messages require mutual following',
@@ -447,5 +453,18 @@ Object.assign(en, {
     'Share only through the selected channel; DM and comment shares do not post in the bound chat',
   '每次只通过所选渠道分享；私信和评论不在绑定会话里发言，评论区会按 sec_uid 自动查昵称并 @ 你':
     'Share only through the selected channel; DM and comment shares do not post in the bound chat. Comments look up your nickname by sec_uid and mention you',
+})
+Object.assign(en, {
+  模型: 'Models',
+  私信与评论: 'Direct messages and comments',
+  日记与记忆: 'Diary and memory',
+  抖音私信分会话: 'Douyin DM conversations',
+  '对私信、评论、直播和抖音私信分会话都生效': 'Applies to DMs, comments, live streams, and Douyin DM conversations',
+  'B 站的私信和评论轮询间隔分别设置；间隔太短更容易触发风控':
+    'Set Bilibili DM and comment polling intervals separately; short intervals increase the risk of account restrictions',
+  '抖音私信和评论轮询需要打开浏览器页面；间隔太短更容易触发风控':
+    'Douyin DM and comment polling opens browser pages; short intervals increase the risk of account restrictions',
+  '两个平台共用监听开关；轮询间隔在各平台分组里设':
+    'Both platforms share listening switches; set polling intervals in each platform group',
 })
 export default en
