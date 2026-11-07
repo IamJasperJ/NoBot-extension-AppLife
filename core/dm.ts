@@ -9,6 +9,9 @@ import { ownerSpoke } from './share'
 import { dmOf, feedbackOf, type Settings } from './state'
 import { type AppAdapter, BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
 import { watchWork } from './watch'
+/** 附在主人分享素材之后，防止模型把分析和草稿当成私信正文发出去。 */
+export const OWNER_SHARE_REPLY_RULE =
+  'Reply in character with only the chat message you would send; do not output analysis, plans, notes or drafts.'
 export interface DmPorts {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   kv: KV
@@ -130,7 +133,7 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
           }
           signal?.throwIfAborted()
           // 素材和观看提示只附给模型，聊天正文保留每条私信自己的文字及占位。
-          const context = fresh
+          const materials = fresh
             .flatMap((m) => {
               if (!m.shared?.itemId) return []
               const material = watched.get(m.shared.itemId)
@@ -141,6 +144,8 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
               return [`Shared work id: ${m.shared.itemId}. If you need to inspect it, use look: true.`]
             })
             .join('\n')
+          // 长段素材容易让模型先写分析再作答，明确只要角色口吻的一条私信正文。
+          const context = materials ? `${materials}\n${OWNER_SHARE_REPLY_RULE}` : ''
           const userMessageId = p.append(home, fresh.map((m) => m.text).join('\n'), {
             noRelay: true,
             ...(context ? { context } : {}),

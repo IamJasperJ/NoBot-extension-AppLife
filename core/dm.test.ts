@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from 'bun:test'
 import { createBilibiliAdapter } from '../apps/bilibili'
 import { fixture } from '../test-utils'
-import { type DmPorts, pollOwnerDm, replyOwnerDm, shareOwnerVideo, splitDm } from './dm'
+import { type DmPorts, OWNER_SHARE_REPLY_RULE, pollOwnerDm, replyOwnerDm, shareOwnerVideo, splitDm } from './dm'
 import { loadShares, recordShare } from './share'
 import { defaults, dmOf } from './state'
 import type { DirectMessage } from './types'
@@ -278,6 +278,7 @@ test('主人分享视频和评论先完整观看并保存帧图、素材、历�
       expect(meta.context).toContain('猫跳起来')
       expect(meta.context).toContain('you have already watched it (frames and subtitles above)')
       expect(meta.context).toContain('do not search for it again')
+      expect(meta.context?.endsWith(OWNER_SHARE_REPLY_RULE)).toBe(true)
       if (kind === 'comment') expect(text).toContain('小明：有趣')
       expect(x.f.kv.get<{ depth: string }[]>('history')?.[0]?.depth).toBe('full')
       return 'user'
