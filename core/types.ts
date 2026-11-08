@@ -64,6 +64,11 @@ export interface RiskPolicy {
   isDirectMessage(url: URL): boolean
   /** 不受写冷却限制的写操作（例如删除自己的评论） */
   bypassCooldown?(url: URL): boolean
+  /**
+   * 不计入读取预算的读操作：只读已经打开的页面（例如私信列表），不向平台发接口请求。
+   * 仍然排队、仍受暂停 / 验证码拦截；否则短间隔轮询几个小时就会把每日读取上限耗光。
+   */
+  unmetered?(url: URL): boolean
   /** 写操作指纹忽略的字段（签名、时间戳、csrf 等每次都变的字段） */
   volatileFields: RegExp
   /** 从请求头里取账号标识原文（例如 SESSDATA）；框架会再做哈希，不落明文 */

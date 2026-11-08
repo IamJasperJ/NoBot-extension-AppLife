@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { bilibiliRiskPolicy } from '../apps/bilibili/risk'
+import { douyinRiskPolicy } from '../apps/douyin/risk'
 import { fixture, json } from '../test-utils'
 import { normalizeLimits, RISK_DEFAULTS } from './limits'
 import { pollDelay } from './poll'
@@ -31,6 +32,29 @@ describe('请求保护', () => {
     f.setTime(new Date(2026, 9, 30, 0, 0, 0).getTime())
     await next.fetch(read)
     expect(Object.values(next.status().accounts)[0]).toMatchObject({ date: '2026-10-30', readDay: 1, readHour: 1 })
+  })
+  test('只读已打开页面的抖音私信伪接口不占读取预算，真实接口照常计数', async () => {
+    const f = fixture({ readHourly: 1, readDaily: 1 })
+    const guard = createTrafficGuard({
+      kv: f.kv,
+      key: 'traffic-douyin',
+      policy: douyinRiskPolicy,
+      limits: () => ({ ...RISK_DEFAULTS, readHourly: 1, readDaily: 1 }),
+      runtime: f.runtime,
+    })
+    const page = 'https://www.douyin.com/__ui/im/conversations'
+    const list = 'https://www.douyin.com/__ui/im/list?peer=group%3A1'
+    await guard.fetch('https://www.douyin.com/aweme/v1/web/user/profile/self/')
+    await expect(guard.fetch('https://www.douyin.com/aweme/v1/web/user/profile/self/')).rejects.toMatchObject({
+      code: 'BUDGET',
+    })
+    // 预算已满，读页面仍然可以；且不累加计数
+    for (let i = 0; i < 3; i++) {
+      f.advance(5000)
+      await guard.fetch(page)
+      await guard.fetch(list)
+    }
+    expect(Object.values(guard.status().accounts)[0]).toMatchObject({ readDay: 1, readHour: 1 })
   })
   test('写预算和午夜保留冷却', async () => {
     const f = fixture({ writeHourly: 1, writeDaily: 2 })

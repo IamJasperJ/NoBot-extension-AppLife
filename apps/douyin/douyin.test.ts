@@ -275,9 +275,12 @@ test('私信适配器保留分享作品结构和图片数量，卡片封面不�
 test('群消息没有昵称时按 sec_uid 查主页补上，同一人只查一次，查不到留空', async () => {
   const f = setup()
   const lookups: string[] = []
+  let selfLookups = 0
   f.handle(async (url) => {
-    if (url.pathname.includes('/profile/self/'))
+    if (url.pathname.includes('/profile/self/')) {
+      selfLookups++
       return Response.json({ status_code: 0, user: { uid: '1', sec_uid: 'me' } })
+    }
     if (url.pathname.includes('/profile/other/')) {
       const sec = url.searchParams.get('sec_user_id') ?? ''
       lookups.push(sec)
@@ -298,6 +301,8 @@ test('群消息没有昵称时按 sec_uid 查主页补上，同一人只查一�
   await f.adapter.directMessages.list('group:7705', { afterSeq: null, limit: 50 })
   // 查到的缓存一天、查不到的十分钟内都不重查；页面已有昵称的不查
   expect(lookups).toEqual(['alice', 'bob'])
+  // 自己的账号信息缓存一小时，不每轮都查
+  expect(selfLookups).toBe(1)
 })
 
 test('会话列表适配器走只读伪接口并保留 sec_uid、群聊和未读字段', async () => {

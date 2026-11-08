@@ -226,7 +226,7 @@ export function createTrafficGuard({
               throw new TrafficError(t('写操作冷却中，请稍后再发送'), 'COOLDOWN', a.lastWrite + gap - now)
             if (a.writeHour >= cfg.writeHourly || a.writeDay >= cfg.writeDaily)
               throw new TrafficError(t('已达到本地写操作预算，本次不发送'), 'BUDGET')
-          } else if (a.readHour >= cfg.readHourly || a.readDay >= cfg.readDaily)
+          } else if (!policy.unmetered?.(url) && (a.readHour >= cfg.readHourly || a.readDay >= cfg.readDaily))
             throw new TrafficError(t('已达到本地读取预算，请等待预算窗口恢复'), 'BUDGET')
           const reserved = Math.max(now, s.nextAt)
           if (reserved - now > 30000) throw new TrafficError(t('请求队列已满，本次停止'), 'QUEUE_FULL')
@@ -236,7 +236,7 @@ export function createTrafficGuard({
             a.writeDay++
             a.lastWrite = now
             s.operations[id] = { id, at: now, status: 'pending', endpoint: url.pathname }
-          } else {
+          } else if (!policy.unmetered?.(url)) {
             a.readHour++
             a.readDay++
           }

@@ -76,6 +76,20 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
   // 群消息里只有发言人的 sec_uid：按主页查一次昵称并缓存。查到的一天后再刷新（对方可能改名），
   // 查不到的十分钟内不重查，避免每轮轮询都打主页接口。
   const memberNames = new Map<string, { name: string; at: number }>()
+  // 自己的 uid / sec_uid 不会变：缓存一小时，免得每轮读群都多一次接口请求（读取预算用完时也不至于读不了群）。
+  let selfCache: { user: Record<string, unknown>; at: number } | null = null
+  const selfProfile = async (signal?: AbortSignal) => {
+    const now = deps.runtime.now()
+    if (selfCache && now - selfCache.at < 3_600_000) return selfCache.user
+    try {
+      const user = obj((await api.get('/aweme/v1/web/user/profile/self/', {}, signal)).user)
+      if (str(user.sec_uid)) selfCache = { user, at: now }
+      return user
+    } catch (error) {
+      if (signal?.aborted) throw error
+      return selfCache?.user ?? {}
+    }
+  }
   const memberName = async (secUid: string, signal?: AbortSignal) => {
     const now = deps.runtime.now()
     const hit = memberNames.get(secUid)
@@ -322,8 +336,8 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
         api.ensure(response, payload)
         const messages: DirectMessage[] = []
         const group = peerId.startsWith('group:')
-        // 本账号数字 uid 用于补全 mention_users；页面 isMentioned 仍可独立使用。
-        const self = group ? obj((await api.get('/aweme/v1/web/user/profile/self/', {}, signal)).user) : {}
+        // 本账号数字 uid 用于补全 mention_users；页面 isMentioned 仍可独立使用，所以查不到也照常读群。
+        const self = group ? await selfProfile(signal) : {}
         const ownSids = new Set(
           arr(obj(payload).messages)
             .map(obj)
