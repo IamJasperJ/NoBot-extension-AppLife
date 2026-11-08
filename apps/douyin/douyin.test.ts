@@ -272,6 +272,34 @@ test('私信适配器保留分享作品结构和图片数量，卡片封面不�
   expect(messages.slice(1).map((m) => m.imageCount)).toEqual([1, 1])
 })
 
+test('群消息没有昵称时按 sec_uid 查主页补上，同一人只查一次，查不到留空', async () => {
+  const f = setup()
+  const lookups: string[] = []
+  f.handle(async (url) => {
+    if (url.pathname.includes('/profile/self/'))
+      return Response.json({ status_code: 0, user: { uid: '1', sec_uid: 'me' } })
+    if (url.pathname.includes('/profile/other/')) {
+      const sec = url.searchParams.get('sec_user_id') ?? ''
+      lookups.push(sec)
+      return Response.json({ status_code: 0, user: sec === 'alice' ? { nickname: '小爱' } : {} })
+    }
+    return Response.json({
+      status_code: 0,
+      messages: [
+        { sid: '1', from: 'them', senderSec: 'alice', senderName: '', text: 'a' },
+        { sid: '2', from: 'them', senderSec: 'alice', senderName: '', text: 'b' },
+        { sid: '3', from: 'them', senderSec: 'bob', senderName: '', text: 'c' },
+        { sid: '4', from: 'them', senderSec: 'carol', senderName: '页面昵称', text: 'd' },
+      ],
+    })
+  })
+  const first = await f.adapter.directMessages.list('group:7705', { afterSeq: null, limit: 50 })
+  expect(first.map((m) => m.senderName)).toEqual(['小爱', '小爱', undefined, '页面昵称'])
+  await f.adapter.directMessages.list('group:7705', { afterSeq: null, limit: 50 })
+  // 查到的缓存一天、查不到的十分钟内都不重查；页面已有昵称的不查
+  expect(lookups).toEqual(['alice', 'bob'])
+})
+
 test('会话列表适配器走只读伪接口并保留 sec_uid、群聊和未读字段', async () => {
   const f = setup()
   const signal = new AbortController().signal

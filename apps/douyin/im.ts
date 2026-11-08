@@ -175,21 +175,10 @@ export const readGroupScript = (self: { uid?: string; sec?: string } | null) => 
       const robot =
         ['1', 'true'].includes(String(object(m.ext)['a:is_from_robot']).toLowerCase()) ||
         String(m.clientId ?? '').startsWith('AI-REPLY')
-      const system =
-        Number(m.type) === 1001 ||
-        Number(pc.aweType) === 100140 ||
-        !(
-          pc.text ||
-          [2702, 510, 516, 800, 10500].includes(Number(pc.aweType)) ||
-          pc.image ||
-          pc.images ||
-          pc.image_url ||
-          pc.image_list ||
-          pc.aweme ||
-          pc.card ||
-          pc.sticker
-        )
-      // 只读昵称标签，整行包含正文和引用，不能当作发言人名称。
+      // 只跳过明确的系统通知（建群、进退群等 aweType ≥ 100000 或 type 1001）；其他类型交给与私信相同的解析，
+      // 白名单式判断会把群里的照片、收藏表情、图文卡片当成通知丢掉。
+      const system = Number(m.type) === 1001 || Number(pc.aweType) >= 100000
+      // 只读昵称标签，整行包含正文和引用，不能当作发言人名称；页面多数时候不渲染群昵称，取不到就留空交给适配器查主页。
       const name = node
         .querySelector(
           '[data-e2e="message-sender-name"], [class*="senderName"], [class*="SenderName"], [class*="nickName"], [class*="nickname"]',
@@ -202,7 +191,7 @@ export const readGroupScript = (self: { uid?: string; sec?: string } | null) => 
         fromMe: m.isFromMe === true || !!(self?.sec && senderSec === self.sec),
         senderSec,
         senderUid: String(m.sender ?? ''),
-        senderName: name || senderSec.slice(0, 8),
+        senderName: name || '',
         mentioned: m.isMentioned === true || mentionUids.some((id) => id === self?.uid || id === self?.sec),
         mentionUids,
         ...(replyToSid ? { replyToSid: String(replyToSid) } : {}),
@@ -243,11 +232,16 @@ const isEmoji = (pc: Record<string, unknown>, messageType?: unknown) =>
   pc.aweType === 516 ||
   (messageType === 5 && (['gif', 'emoji', 'sticker'].includes(clean(pc.image_type)) || !!clean(pc.emoji_type)))
 
+/**
+ * 分享卡片：视频是 aweType 800；图文是另一种消息（type 77、aweType 0、awemeType 68），
+ * 而且 is_slides 为 false，只能按「带作品 id 和卡片标题」认，再用 awemeType 68 区分图文。
+ */
 function messageShared(content: unknown): SharedWork | undefined {
   const pc = record(content)
-  if (pc.aweType !== 800 && pc.aweType !== 10500) return
+  const card = pc.aweType === 800 || (!!clean(pc.itemId) && 'content_title' in pc)
+  if (!card && pc.aweType !== 10500) return
   return {
-    kind: pc.aweType === 10500 ? 'comment' : pc.is_slides === true ? 'slides' : 'video',
+    kind: pc.aweType === 10500 ? 'comment' : pc.is_slides === true || pc.awemeType === 68 ? 'slides' : 'video',
     itemId: clean(pc.itemId) || clean(pc.item_id) || clean(pc.aweme_id),
     title: clean(pc.content_title) || clean(pc.aweme_title),
     ...(pc.aweType === 10500 ? { comment: clean(pc.comment) } : { author: clean(pc.content_name) }),
@@ -284,7 +278,7 @@ export function messageText(content: unknown, messageType?: unknown): string {
 /** 分享封面不算图片；明确的照片与新版表情进入附件路径。 */
 export function messageImageCount(content: unknown, messageType?: unknown): number {
   const pc = record(content)
-  if (pc.aweType === 800 || pc.aweType === 10500) return 0
+  if (messageShared(pc)) return 0
   if (pc.aweType === 2702 || isEmoji(pc, messageType)) return 1
   const type = String(pc.type || messageType || '').toLowerCase()
   if (pc.sticker || pc.sticker_id || /^(sticker|emoji|emoticon|share|video|aweme|card)$/.test(type)) return 0

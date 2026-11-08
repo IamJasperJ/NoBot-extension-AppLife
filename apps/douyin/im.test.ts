@@ -203,6 +203,23 @@ test('实测数字类型优先识别照片、空 id 表情、作品与评论，�
       count: 0,
       shared: { kind: 'slides' as const, itemId: '222', title: '图集', author: '' },
     },
+    // 真机：分享图文是 type 77、aweType 0、awemeType 68，is_slides 反而是 false
+    {
+      type: 77,
+      pc: {
+        aweType: 0,
+        awemeType: 68,
+        itemId: '444',
+        content_title: '人真的好奇怪',
+        content_name: '作者',
+        is_slides: false,
+        image_count: 1,
+        cover_url: { uri: 'cover' },
+      },
+      text: '[分享图文] 人真的好奇怪',
+      count: 0,
+      shared: { kind: 'slides' as const, itemId: '444', title: '人真的好奇怪', author: '作者' },
+    },
     {
       type: 105,
       pc: { aweType: 10500, itemId: '333', aweme_title: '视频', comment: '有趣', comment_user_name: '小明' },
@@ -379,6 +396,9 @@ test('群消息读取原型字段，忽略 isMyMessage，读取昵称、提及�
     self: { uid: 'self-uid', sec: 'self-sec' },
     document: {
       querySelectorAll: () => [
+        make('9', { parsedContent: { aweType: 2702, resource_url: {} } }),
+        make('8', { parsedContent: { aweType: 501, emoji_type: 'favorite_emoji', url: {} } }),
+        make('7', { parsedContent: { aweType: 100140, notice_by_create_group: true } }),
         make('6', { type: 1001 }),
         make('5', { clientId: 'AI-REPLY-1' }),
         make('4', { ext: { 'a:is_from_robot': 'true' } }),
@@ -403,6 +423,10 @@ test('群消息读取原型字段，忽略 isMyMessage，读取昵称、提及�
   expect(rows[3].robot).toBe(true)
   expect(rows[4].robot).toBe(true)
   expect(rows[5].system).toBe(true)
+  // 群里的照片和收藏表情不能被当成系统通知丢掉；建群通知仍跳过
+  expect(rows[6]).toMatchObject({ sid: '7', system: true })
+  expect(rows[7]).toMatchObject({ sid: '8', system: false })
+  expect(rows[8]).toMatchObject({ sid: '9', system: false })
 })
 
 test('打开群按会话 id 点击，面板 id 不符则放弃，发送回读只认 isFromMe', async () => {

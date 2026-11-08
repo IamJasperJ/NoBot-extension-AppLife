@@ -73,6 +73,26 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
   const login = browser ? createLogin(deps, api, browser) : null
   // 推荐流 / 搜索已经带了完整作品数据，read 时直接用，少发一次详情请求
   const recent = new Map<string, Record<string, unknown>>()
+  // 群消息里只有发言人的 sec_uid：按主页查一次昵称并缓存。查到的一天后再刷新（对方可能改名），
+  // 查不到的十分钟内不重查，避免每轮轮询都打主页接口。
+  const memberNames = new Map<string, { name: string; at: number }>()
+  const memberName = async (secUid: string, signal?: AbortSignal) => {
+    const now = deps.runtime.now()
+    const hit = memberNames.get(secUid)
+    if (hit && now - hit.at < (hit.name ? 86_400_000 : 600_000)) return hit.name
+    let name = hit?.name ?? ''
+    try {
+      name =
+        str(obj((await api.get('/aweme/v1/web/user/profile/other/', { sec_user_id: secUid }, signal)).user).nickname) ||
+        name
+    } catch {
+      if (signal?.aborted) throw signal.reason
+    }
+    memberNames.delete(secUid)
+    memberNames.set(secUid, { name, at: now })
+    for (const id of [...memberNames.keys()].slice(0, Math.max(0, memberNames.size - 500))) memberNames.delete(id)
+    return name
+  }
   const keep = (found: Map<string, Record<string, unknown>>) => {
     for (const [id, raw] of found) recent.set(id, raw)
     for (const id of [...recent.keys()].slice(0, Math.max(0, recent.size - 200))) recent.delete(id)
@@ -353,7 +373,12 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
           })
         }
         messages.sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0))
-        return limit > 0 ? messages.slice(-limit) : []
+        const kept = limit > 0 ? messages.slice(-limit) : []
+        // 页面没给群昵称时按 sec_uid 补；同一发言人只查一次
+        for (const message of kept)
+          if (group && !message.senderName && message.senderId)
+            message.senderName = (await memberName(message.senderId, signal)) || undefined
+        return kept
       },
       async captureImages(peerId, message, signal) {
         if (!browser || !message.imageCount) return []
