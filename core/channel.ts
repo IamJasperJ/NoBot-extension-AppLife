@@ -78,6 +78,8 @@ interface Ports {
   exclusiveWait<T>(work: () => Promise<T>, signal: AbortSignal, maxMs?: number): Promise<T>
   log(error: unknown): void
 }
+export const STICKER_GAP_MS = 30000
+
 interface Cursor {
   seq: string
   lastAt: number
@@ -226,8 +228,19 @@ export class DouyinChannel {
       accountFields: [],
       // 账号由应用生活自动建（ensureAccount），渠道页不提供「添加」。
       managedAccounts: true,
+      // 抖音网页做不到的项在渠道页停用；群里什么时候回、表情包沿用应用生活自己的设置，不套渠道的那一套。
+      capabilities: {
+        groupTrigger: 'managed',
+        stickers: 'managed',
+        groupInvite: 'unsupported',
+        friendRequest: 'unsupported',
+        leaveGroup: 'unsupported',
+        deleteMessage: 'unsupported',
+        mention: 'unsupported',
+        multiBot: 'unsupported',
+      },
       promptHint:
-        'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
+        'This is a Douyin direct message. Reply briefly like a DM, in plain text without Markdown. You may occasionally add Douyin inline emoji, written in square brackets inside the text, such as [捂脸] [笑哭] [暗中观察] [玫瑰] [泣不成声]; use only well-known ones and do not overdo it. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
       start: async (account, io, signal) => {
         if (signal.aborted) return
         const session = { io, signal }
@@ -284,7 +297,12 @@ export class DouyinChannel {
           peer.peerId !== this.p.self() &&
           (!cursors[peer.peerId] || peer.lastAt > cursors[peer.peerId]!.lastAt || peer.unread > 0),
       )
-      .sort((a, b) => a.lastAt - b.lastAt)
+      .sort((a, b) => {
+        // 读取不会清掉抖音未读，优先新动态，避免旧未读长期挤占名额。
+        const aNew = !cursors[a.peerId] || a.lastAt > cursors[a.peerId]!.lastAt
+        const bNew = !cursors[b.peerId] || b.lastAt > cursors[b.peerId]!.lastAt
+        return Number(bNew) - Number(aNew) || a.lastAt - b.lastAt
+      })
       .slice(0, 3)
     for (const peer of peers) {
       const known = cursors[peer.peerId]
@@ -406,40 +424,90 @@ export class DouyinChannel {
   ): Promise<{ id: string }> {
     const text = stripStage(message.text)
     if (!text) return { id: String(this.p.now()) }
+    return this.outbound(message.chatId, signal, async (p, now, group) => {
+      const result = await p.adapter.directMessages.send(
+        group ? `group:${message.chatId}` : message.chatId,
+        text,
+        signal,
+      )
+      return { value: { id: result?.id || String(now) }, count: true }
+    })
+  }
+  async sendSticker(chatId: string, name: string, signal: AbortSignal) {
+    if (chatId.startsWith('group:')) chatId = chatId.slice(6)
+    return this.outbound(
+      chatId,
+      signal,
+      async (p, now, group) => {
+        if (!this.p.settings().douyinChannelStickers) throw new ChannelSendError('not-sent', 'stickers-disabled')
+        const send = p.adapter.directMessages.sendSticker
+        if (!send) throw new ChannelSendError('not-sent', 'unsupported')
+        const key = `channel-sticker:${chatId}`
+        const last = p.kv.get<number>(key)
+        if (last !== undefined && now - last < STICKER_GAP_MS)
+          throw new ChannelSendError('not-sent', 'sticker-cooldown', { retryAfterMs: last + STICKER_GAP_MS - now })
+        try {
+          const result = await send.call(p.adapter.directMessages, group ? `group:${chatId}` : chatId, name, signal)
+          if (result.names.length) p.kv.set('douyin-sticker-names', result.names)
+          if (result.status === 'sent') p.kv.set(key, this.p.now())
+          return { value: result, count: result.status === 'sent' }
+        } catch (error) {
+          // 结果不确定时也占用配额和表情间隔，禁止工具紧接着再次发送。
+          if (
+            !(error instanceof DmNotSentError) &&
+            !(error instanceof BrowserSkippedError && error.beforeDispatch) &&
+            !(error instanceof Error && error.name === 'CaptchaError' && !('uncertain' in error && error.uncertain)) &&
+            (!(error instanceof TrafficError) || ['UNCERTAIN', 'DUPLICATE'].includes(error.code))
+          ) {
+            p.kv.set(key, this.p.now())
+            if (!(this.ownerViaChannel && chatId === p.settings.ownerId)) countAttempt(p, `channel:${chatId}`, now)
+          }
+          throw error
+        }
+      },
+      45000,
+    )
+  }
+  private async outbound<T>(
+    chatId: string,
+    signal: AbortSignal,
+    work: (p: DmPorts, now: number, group: boolean) => Promise<{ value: T; count: boolean }>,
+    maxMs?: number,
+  ): Promise<T> {
     try {
-      return await this.p.exclusiveWait(async () => {
-        signal.throwIfAborted()
-        const p = this.p.dm(),
-          now = this.p.now()
-        if (!this.enabled || !p.loggedIn()) throw new ChannelSendError('not-sent', 'offline')
-        if (p.paused()) {
-          this.sync()
-          throw new ChannelSendError('not-sent', this.p.captcha?.() ? 'captcha' : 'paused')
-        }
-        const group = /^\d+$/.test(message.chatId)
-        if (group && !this.groups) throw new ChannelSendError('not-sent', 'groups-disabled')
-        const key = `channel:${message.chatId}`
-        const owner = this.ownerViaChannel && message.chatId === p.settings.ownerId
-        if (!owner && todayCount(p, key, now) >= this.p.settings().douyinChannelDaily) {
-          activity(p, {
-            at: now,
-            kind: 'dm-channel',
-            ok: false,
-            title: t('抖音私信'),
-            text: message.chatId,
-            error: t('渠道每日回复上限已达到，本条未发送且不再补发'),
-          })
-          // 每日配额不占住宿主的账号发送队列；即使临近午夜也不自动补发。
-          throw new ChannelSendError('not-sent', 'daily-limit')
-        }
-        const result = await p.adapter.directMessages.send(
-          group ? `group:${message.chatId}` : message.chatId,
-          text,
-          signal,
-        )
-        if (!owner) countAttempt(p, key, now)
-        return { id: result?.id || String(now) }
-      }, signal)
+      return await this.p.exclusiveWait(
+        async () => {
+          signal.throwIfAborted()
+          const p = this.p.dm(),
+            now = this.p.now()
+          if (!this.enabled || !p.loggedIn()) throw new ChannelSendError('not-sent', 'offline')
+          if (p.paused()) {
+            this.sync()
+            throw new ChannelSendError('not-sent', this.p.captcha?.() ? 'captcha' : 'paused')
+          }
+          const group = /^\d+$/.test(chatId)
+          if (group && !this.groups) throw new ChannelSendError('not-sent', 'groups-disabled')
+          const key = `channel:${chatId}`
+          const owner = this.ownerViaChannel && chatId === p.settings.ownerId
+          if (!owner && todayCount(p, key, now) >= this.p.settings().douyinChannelDaily) {
+            activity(p, {
+              at: now,
+              kind: 'dm-channel',
+              ok: false,
+              title: t('抖音私信'),
+              text: chatId,
+              error: t('渠道每日回复上限已达到，本条未发送且不再补发'),
+            })
+            // 每日配额不占住宿主的账号发送队列；即使临近午夜也不自动补发。
+            throw new ChannelSendError('not-sent', 'daily-limit')
+          }
+          const result = await work(p, now, group)
+          if (!owner && result.count) countAttempt(p, key, now)
+          return result.value
+        },
+        signal,
+        maxMs,
+      )
     } catch (error) {
       // 宿主日志只记 code，原始错误在插件日志里留一份方便排查。
       this.p.log(error)

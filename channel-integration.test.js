@@ -285,7 +285,7 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
           .filter((t) => t.tool.name.startsWith('douyin_'))
           .map((t) => t.tool.name)
           .sort(),
-      ).toEqual(['douyin_search', 'douyin_watch'])
+      ).toEqual(['douyin_search', 'douyin_send_sticker', 'douyin_watch'])
       expect(availableTools(binding.chatId).some((t) => /bili_|life_history/.test(t.tool.name))).toBe(false)
       const prompt = model.requests.findLast((r) => r.stream)
       const promptText = prompt.messages.map((m) => m.content).join('\n')

@@ -1,4 +1,10 @@
 const en: Record<string, string> = {
+  '回读没在「我发的」消息里找到这条': 'Readback did not find a new message sent by me',
+  找不到表情面板入口: 'Cannot find the sticker panel button',
+  表情面板没有加载出来: 'The sticker panel did not load',
+  角色可以发表情包: 'Allow the character to send stickers',
+  '仅支持抖音自带的互动表情，受每日回复上限；同一会话至少间隔 30 秒':
+    'Only built-in Douyin interactive stickers; subject to the daily reply limit and a 30-second gap per conversation',
   主人: 'Owner',
   私信经渠道: 'DMs via channel',
   抖音渠道群聊: 'Douyin channel group chats',

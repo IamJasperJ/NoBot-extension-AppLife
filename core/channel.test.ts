@@ -164,7 +164,7 @@ test('渠道参数、幂等账号与角色同步、io 生命周期和状态', as
       defaults: { newLocation: { private: 'approve' } },
     })
     expect(f.provider.promptHint).toBe(
-      'This is a Douyin direct message. Reply briefly like a DM, in plain text only. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
+      'This is a Douyin direct message. Reply briefly like a DM, in plain text without Markdown. You may occasionally add Douyin inline emoji, written in square brackets inside the text, such as [捂脸] [笑哭] [暗中观察] [玫瑰] [泣不成声]; use only well-known ones and do not overdo it. Write in the same language as the conversation. In Douyin group chats, keep replies short, only speak when it adds something, never reveal private details about the owner.',
     )
     expect(f.io.status).toHaveBeenCalledWith('online', undefined)
     await f.channel.ensure()
@@ -211,6 +211,45 @@ test('入站排除主人、自身和群聊，首次仅建立基线，每轮最�
     // 渠道开启后才出现的新面孔：开启前的旧消息跳过，之后的照常投递。
     expect((f.io.emit as ReturnType<typeof mock>).mock.calls.map((args) => args[0].id)).toEqual(['2'])
     expect(f.kv.get('channel-cursors')).toMatchObject({ d: { seq: '2' } })
+  } finally {
+    await f.close()
+  }
+})
+
+test('三个旧未读会话不会挤掉没有游标的新群', async () => {
+  const f = fixture({ douyinChannelGroups: true })
+  try {
+    f.kv.set('channel-cursors', {
+      a: { seq: '1', lastAt: 1 },
+      b: { seq: '1', lastAt: 2 },
+      c: { seq: '1', lastAt: 3 },
+    })
+    f.peers([peer('c', 3), peer('b', 2), peer('a', 1), peer('group:7705', 4, true)])
+    f.messages([message('2')])
+    await f.channel.poll()
+    expect(f.list.mock.calls.map((args) => args[0])).toEqual(['group:7705', 'a', 'b'])
+    expect(f.kv.get('channel-cursors')).toMatchObject({ 'group:7705': { seq: '2', lastAt: 4 } })
+  } finally {
+    await f.close()
+  }
+})
+
+test('新动态不足三个时按时间顺序用旧未读会话补足名额', async () => {
+  const f = fixture()
+  try {
+    f.kv.set('channel-cursors', {
+      a: { seq: '1', lastAt: 1 },
+      b: { seq: '1', lastAt: 2 },
+      active: { seq: '1', lastAt: 3 },
+    })
+    f.peers([peer('b', 2), { ...peer('active', 5), unread: 0 }, peer('a', 1), { ...peer('new', 4), unread: 0 }])
+    await f.channel.poll()
+    expect(f.list.mock.calls.map((args) => args[0])).toEqual(['new', 'active', 'a'])
+    expect(f.kv.get('channel-cursors')).toMatchObject({
+      new: { seq: '0', lastAt: 4 },
+      active: { seq: '1', lastAt: 5 },
+      a: { seq: '1', lastAt: 1 },
+    })
   } finally {
     await f.close()
   }
@@ -732,5 +771,94 @@ test('群开关就地重建基线，关掉期间不读取不补投，私聊游�
     expect(f.kv.get('channel-cursors')).toMatchObject({ visitor: { seq: '10' } })
   } finally {
     await f.close()
+  }
+})
+
+test('渠道表情共用文字每日计数，并按位置执行 30 秒冷却', async () => {
+  const f = fixture({ douyinChannelDaily: 2 })
+  const sticker = mock(async () => ({ status: 'sent' as const, id: 's', names: ['比心'] }))
+  f.dm.adapter.directMessages.sendSticker = sticker
+  try {
+    await f.channel.sendSticker('visitor', '比心', f.lifetime.signal)
+    expect(f.kv.get('douyin-sticker-names')).toEqual(['比心'])
+    await expect(f.channel.sendSticker('visitor', '比心', f.lifetime.signal)).rejects.toMatchObject({
+      code: 'sticker-cooldown',
+      kind: 'not-sent',
+      retryAfterMs: 30000,
+    })
+    f.advance(29999)
+    await expect(f.channel.sendSticker('visitor', '比心', f.lifetime.signal)).rejects.toMatchObject({
+      code: 'sticker-cooldown',
+    })
+    f.advance(1)
+    await f.channel.sendSticker('visitor', '比心', f.lifetime.signal)
+    f.advance(30000)
+    await expect(
+      f.provider.send(
+        { id: 'account', config: {}, cursor: null },
+        { chatId: 'visitor', text: 'hello' },
+        f.lifetime.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'daily-limit' })
+    expect(sticker).toHaveBeenCalledTimes(2)
+    expect(f.exclusive).toHaveBeenCalled()
+  } finally {
+    await f.close()
+  }
+})
+
+test('渠道表情主人不计数，未知名称不占间隔，群聊与设置关闭时不发送', async () => {
+  const f = fixture({ douyinChannelDaily: 0 }, true)
+  const sticker = mock(
+    async (): ReturnType<NonNullable<AppAdapter['directMessages']['sendSticker']>> => ({
+      status: 'sent',
+      id: 's',
+      names: ['比心'],
+    }),
+  )
+  f.dm.adapter.directMessages.sendSticker = sticker
+  try {
+    await f.channel.sendSticker('owner', '比心', f.lifetime.signal)
+    f.advance(30000)
+    await f.channel.sendSticker('owner', '比心', f.lifetime.signal)
+    expect(sticker).toHaveBeenCalledTimes(2)
+    f.settings.douyinChannelDaily = 20
+    sticker.mockResolvedValue({ status: 'unknown-sticker', names: ['比心'] })
+    await f.channel.sendSticker('visitor', '不存在', f.lifetime.signal)
+    await f.channel.sendSticker('visitor', '不存在', f.lifetime.signal)
+    await expect(f.channel.sendSticker('7705', '比心', f.lifetime.signal)).rejects.toMatchObject({
+      code: 'groups-disabled',
+    })
+    f.settings.douyinChannelStickers = false
+    await expect(f.channel.sendSticker('owner', '比心', f.lifetime.signal)).rejects.toMatchObject({
+      code: 'stickers-disabled',
+    })
+  } finally {
+    await f.close()
+  }
+})
+
+test('渠道表情遵守登录与暂停，不确定结果占用间隔且不重试', async () => {
+  for (const state of ['offline', 'paused', 'uncertain'] as const) {
+    const f = fixture()
+    const sticker = mock(async () => {
+      throw new TrafficError('unknown', 'UNCERTAIN')
+    })
+    f.dm.adapter.directMessages.sendSticker = sticker
+    try {
+      if (state === 'offline') f.logout()
+      if (state === 'paused') f.pause()
+      await expect(f.channel.sendSticker('visitor', '比心', f.lifetime.signal)).rejects.toMatchObject({
+        kind: state === 'uncertain' ? 'unknown' : 'not-sent',
+      })
+      if (state === 'uncertain') {
+        await expect(f.channel.sendSticker('visitor', '比心', f.lifetime.signal)).rejects.toMatchObject({
+          code: 'sticker-cooldown',
+        })
+        expect(sticker).toHaveBeenCalledTimes(1)
+      } else expect(sticker).not.toHaveBeenCalled()
+    } finally {
+      await f.close()
+    }
   }
 })

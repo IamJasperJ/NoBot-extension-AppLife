@@ -397,6 +397,11 @@ export interface AppAdapter {
     captureImages?(peerId: string, message: DirectMessage, signal?: AbortSignal): Promise<Uint8Array[]>
     // biome-ignore lint/suspicious/noConfusingVoidType: 保留旧适配器的 Promise<void>，渠道适配器可额外返回回执
     send(peerId: string, text: string, signal?: AbortSignal): Promise<void | { id: string }>
+    sendSticker?(
+      peerId: string,
+      name: string,
+      signal?: AbortSignal,
+    ): Promise<{ status: 'sent'; id: string; names: string[] } | { status: 'unknown-sticker'; names: string[] }>
     shareVideo?(peerId: string, itemId: string, signal?: AbortSignal, opts?: { searchTerms?: string[] }): Promise<void>
     /** 双方是否互相关注（B 站私信专线的硬性前提） */
     mutual(peerId: string, signal?: AbortSignal): Promise<boolean>

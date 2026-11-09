@@ -157,6 +157,10 @@ export function settingsSchema(): ExtensionSettingField[] {
       ),
     },
     {
+      ...bool('douyinChannelStickers', '角色可以发表情包'),
+      hint: t('仅支持抖音自带的互动表情，受每日回复上限；同一会话至少间隔 30 秒'),
+    },
+    {
       ...bool('douyinChannelGroups', '抖音渠道群聊'),
       hint: t('群聊回复方式在下面选择；群消息同样受每日回复上限'),
     },
@@ -249,7 +253,7 @@ export function settingsSchema(): ExtensionSettingField[] {
       conditions.unshift({ key: `${platform}Enabled`, equals: true })
     if (field.key === 'douyinChromeCloseOnIdle') conditions.push({ key: 'douyinBrowserBackend', equals: 'chrome' })
     if (field.key === 'douyinBrowserProxy') conditions.push({ key: 'douyinBrowserBackend', equals: 'headless' })
-    if (['douyinChannelDaily', 'douyinChannelGroups', 'douyinGroupReply'].includes(field.key))
+    if (['douyinChannelDaily', 'douyinChannelGroups', 'douyinGroupReply', 'douyinChannelStickers'].includes(field.key))
       conditions.push({ key: 'douyinChannel', equals: true })
     if (['aiCommentGuard', 'shareDaily', 'shareThreshold', 'quietAfterIgnored'].includes(field.key))
       conditions.push({ key: 'shareEnabled', equals: true })

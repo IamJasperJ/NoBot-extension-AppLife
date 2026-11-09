@@ -24,6 +24,7 @@ export interface Settings extends PlanConfig, ShareSettings {
   bilibiliEnabled: boolean
   douyinGroupReply: 'mention' | 'batch'
   douyinChannelGroups: boolean
+  douyinChannelStickers: boolean
   douyinChannel: boolean
   douyinChannelDaily: number
   douyinEnabled: boolean
@@ -93,6 +94,7 @@ export const defaults: Settings = {
   bilibiliEnabled: true,
   douyinGroupReply: 'mention',
   douyinChannelGroups: false,
+  douyinChannelStickers: true,
   douyinChannel: false,
   douyinChannelDaily: 20,
   douyinEnabled: false,

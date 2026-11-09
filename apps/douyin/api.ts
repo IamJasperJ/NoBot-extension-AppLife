@@ -25,6 +25,7 @@ import {
   readConversation,
   readConversations,
   sendMessage,
+  sendSticker,
   shareVideo,
 } from './im'
 import { CaptchaError, captchaMessage, douyinRiskPolicy, UI_CODES } from './risk'
@@ -169,7 +170,7 @@ export function createTransport(
     const url = new URL(input instanceof Request ? input.url : input)
     if (url.hostname !== 'www.douyin.com') return fallback(input, init)
     const path = url.pathname
-    const imWrite = path === '/__ui/im/send' || path === '/__ui/im/share'
+    const imWrite = ['/__ui/im/send', '/__ui/im/share', '/__ui/im/sticker'].includes(path)
     const method = (init.method ?? 'GET').toUpperCase()
     const body =
       typeof init.body === 'string' ? init.body : init.body instanceof URLSearchParams ? init.body.toString() : null
@@ -229,21 +230,27 @@ export function createTransport(
             const result =
               path === '/__ui/im/share'
                 ? await shareVideo(page, str(data.itemId), peer, onCommit, searchTerms as string[] | undefined)
-                : await sendMessage(page, peer, str(data.text), onCommit)
+                : path === '/__ui/im/sticker'
+                  ? await sendSticker(page, peer, str(data.name), onCommit)
+                  : await sendMessage(page, peer, str(data.text), onCommit)
+            const extra = 'names' in result ? { names: result.names } : {}
+            if (result.status === 'unknown-sticker')
+              return synthetic(path, { status_code: UI_CODES.UNKNOWN_STICKER, ...extra })
             if ('disconnected' in result && result.disconnected && committed && path === '/__ui/im/share')
               throw new BrowserSkippedError(result.reason, false)
             if (result.status === 'sent')
               return synthetic(path, {
                 status_code: 0,
+                ...extra,
                 ...('sid' in result ? { sid: result.sid } : {}),
                 ...('confirmedBy' in result ? { confirmedBy: result.confirmedBy } : {}),
               })
             if (result.status === 'not-sent')
-              return synthetic(path, { status_code: UI_CODES.FAILED, status_msg: result.reason })
+              return synthetic(path, { status_code: UI_CODES.FAILED, status_msg: result.reason, ...extra })
             if (result.status === 'login') return synthetic(path, { status_code: UI_CODES.LOGIN })
             if (result.status === 'verify') return verify()
             // 不确定：不给业务码，请求保护层会把这次写操作记成「结果不确定」，禁止自动重发
-            return synthetic(path, { status_msg: result.reason })
+            return synthetic(path, { status_msg: result.reason, ...extra })
           }
           // 写评论要先站到视频页上
           const awemeId =

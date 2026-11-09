@@ -34,7 +34,7 @@ import {
 import { createLogin } from './auth'
 import { captureMessageImages, readConversation } from './im'
 import { resolveOwner } from './owner'
-import { douyinRiskPolicy, UI_CODES } from './risk'
+import { CaptchaError, douyinRiskPolicy, UI_CODES } from './risk'
 
 /** 递归找出所有「长得像作品」的对象（有 aweme_id 和 desc / statistics），不依赖各接口的外层结构。 */
 export function walkAwemes(value: unknown, out = new Map<string, Record<string, unknown>>()) {
@@ -428,6 +428,36 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
           throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(obj(payload).status_msg) }))
         api.ensure(response, payload)
         return str(obj(payload).sid) ? { id: str(obj(payload).sid) } : undefined
+      },
+      async sendSticker(peerId, name, signal) {
+        // 每次明确调用都是新操作；同一请求在保护层内部等待时保留原指纹。
+        const response = await deps.guardedFetch(`${BASE}/__ui/im/sticker`, {
+          method: 'POST',
+          waitWriteMs: 30000,
+          headers: { cookie: cookieHeader(deps.credentials()), 'content-type': 'application/json' },
+          body: JSON.stringify({ peer: peerId, name, operationId: crypto.randomUUID() }),
+          signal,
+        })
+        const payload = obj(
+          await response
+            .text()
+            .then(parseJson)
+            .catch(() => undefined),
+        )
+        const names = arr(payload.names).filter((value): value is string => typeof value === 'string' && !!value)
+        if (names.length) deps.cache.set('sticker-names', names)
+        if (payload.status_code === UI_CODES.UNKNOWN_STICKER) return { status: 'unknown-sticker', names }
+        if (!('status_code' in payload))
+          throw new TrafficError(str(payload.status_msg) || 'Sticker result uncertain. Do not retry.', 'UNCERTAIN')
+        if (payload.status_code === UI_CODES.FAILED)
+          throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(payload.status_msg) }))
+        if (payload.status_code === UI_CODES.VERIFY && payload.uncertain === true) {
+          const error = new CaptchaError()
+          error.uncertain = true
+          throw error
+        }
+        api.ensure(response, payload)
+        return { status: 'sent', id: str(payload.sid), names }
       },
       async shareVideo(peerId, itemId, signal, opts) {
         let searchTerms = opts?.searchTerms ?? []

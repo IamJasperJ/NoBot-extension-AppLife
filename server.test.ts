@@ -7,7 +7,7 @@ import * as dayCore from './core/day'
 import * as dmCore from './core/dm'
 import * as planCore from './core/plan'
 import * as host from './host'
-import type { ExtensionContext, Host } from './host-api'
+import { ChannelSendError, type ExtensionContext, type Host } from './host-api'
 import { setLanguageSource } from './i18n'
 import extension, { browserProxyReachable, Service } from './server'
 import { fixture, memory } from './test-utils'
@@ -674,5 +674,61 @@ test('渠道出站等待私信锁释放，五分钟超时才 busy，取消等待
     } finally {
       f.close()
     }
+  }
+})
+
+test('表情工具只提供给抖音来源回合，解析含冒号的目标，遵守设置并保留访客浏览工具', async () => {
+  const f = backgroundFixture()
+  f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
+  let clientMessageId = 'app-life.douyin:group:7705:123'
+  f.ctx.settings = { ...f.ctx.settings, bilibiliEnabled: false, douyinEnabled: true, douyinChannel: true }
+  f.ctx.host.getChatInfo = () =>
+    ({ characters: [{ id: 'character' }], messages: [{ role: 'user', meta: { clientMessageId } }] }) as ReturnType<
+      Host['getChatInfo']
+    >
+  f.ctx.channels = {
+    lookup: () => null,
+    lookupAll: () => [],
+    registerProvider: () => ({ unregister() {} }),
+    ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
+  }
+  const { DouyinChannel } = await import('./core/channel')
+  const send = spyOn(DouyinChannel.prototype, 'sendSticker').mockResolvedValue({
+    status: 'sent',
+    id: 's',
+    names: ['比心'],
+  })
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    const ctx: ExtensionContext = { ...f.ctx, chatId: 'visitor' }
+    const tool = extension.tools(ctx).find((tool) => tool.name === 'douyin_send_sticker')!
+    expect(tool).toBeDefined()
+    expect(extension.tools(ctx).map((tool) => tool.name)).toContain('douyin_watch')
+    expect(extension.tools(ctx).map((tool) => tool.name)).toContain('douyin_search')
+    expect(await tool.run({ name: '比心' }, { signal: f.lifetime.signal })).toEqual({ content: 'Sticker sent.' })
+    expect(send).toHaveBeenCalledWith('group:7705', '比心', f.lifetime.signal)
+    clientMessageId = 'app-life.douyin:peer:456'
+    await extension
+      .tools(ctx)
+      .find((tool) => tool.name === 'douyin_send_sticker')!
+      .run({ name: '比心' }, { signal: f.lifetime.signal })
+    expect(send).toHaveBeenLastCalledWith('peer', '比心', f.lifetime.signal)
+    send.mockResolvedValueOnce({ status: 'unknown-sticker', names: ['摇骰子'] })
+    expect((await tool.run({ name: '未知' }, {})).content).toContain('Available names: ["摇骰子"]')
+    send.mockRejectedValueOnce(new ChannelSendError('unknown', 'uncertain'))
+    expect((await tool.run({ name: '比心' }, {})).content).toBe('Sticker result uncertain. Do not retry.')
+    send.mockRejectedValueOnce(new ChannelSendError('not-sent', 'sticker-cooldown'))
+    expect((await tool.run({ name: '比心' }, {})).content).toContain('Sticker not sent: Wait at least 30 seconds')
+    clientMessageId = 'web-message'
+    expect(extension.tools(ctx).some((tool) => tool.name === 'douyin_send_sticker')).toBe(false)
+    clientMessageId = 'app-life.douyin:peer:456'
+    f.ctx.settings.douyinChannelStickers = false
+    expect(extension.tools(ctx).some((tool) => tool.name === 'douyin_send_sticker')).toBe(false)
+    f.ctx.settings.douyinChannelStickers = true
+    f.ctx.settings.douyinChannel = false
+    expect(extension.tools(ctx).some((tool) => tool.name === 'douyin_send_sticker')).toBe(false)
+  } finally {
+    send.mockRestore()
+    f.close()
   }
 })

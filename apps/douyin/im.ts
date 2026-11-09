@@ -527,6 +527,15 @@ const focusScript = () => {
   const active = document.activeElement
   return active === ed || ed.contains(active)
 }
+/** 输入框可能把 [捂脸] 这类文字表情就地换成图片，这时 innerText 里没有方括号。 */
+const editorHasImageScript = () => !!document.querySelector('[contenteditable="true"] img, textarea img')
+const withoutInlineEmoji = (text: string) => norm(text.replace(/\[[^[\]\s]{1,12}\]/g, ''))
+/** 比较输入框内容和要发的文字：方括号表情被换成图片时只比其余文字；整段都是表情时要求框里确实有图。 */
+export function typedMatches(typed: string, want: string, hasImage: boolean) {
+  if (typed === want) return true
+  const rest = withoutInlineEmoji(want)
+  return withoutInlineEmoji(typed) === rest && (hasImage || !!rest) && want !== rest
+}
 const typedScript = () => {
   const e = document.querySelector('[contenteditable="true"], textarea') as HTMLElement | null
   return e ? String(e.innerText || (e as HTMLTextAreaElement).value || '') : ''
@@ -657,7 +666,8 @@ export async function sendMessage(
   await page.keyboard.insertText(text)
   await sleep(page, 800)
   // 框里不是这段正文（旧残文、没输进去）就绝不按回车
-  if (norm(await page.evaluate(typedScript, null, { readonly: true })) !== want)
+  const typed = norm(await page.evaluate(typedScript, null, { readonly: true }))
+  if (typed !== want && !typedMatches(typed, want, await page.evaluate(editorHasImageScript, null, { readonly: true })))
     return { status: 'not-sent', reason: '输入框里的正文和要发的不一致' }
   // 从这里开始可能已经发出去了：后面任何失败都只能算「不确定」，由人核查
   try {
@@ -680,6 +690,157 @@ export async function sendMessage(
       throw error
     }
     return { status: 'uncertain', reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export type StickerResult = (SendResult & { names: string[] }) | { status: 'unknown-sticker'; names: string[] }
+
+/** 输入栏可能在视口之外，必须给图标本身派发冒泡事件，不能用坐标重新命中。 */
+export const openStickerPanel = () => {
+  if (document.querySelector('[class*="emojiEmojisModalTabsubTab"]')) return true
+  const icon = document.querySelector('svg[class*="messageMsgInputiconAction"]')
+  if (!icon) return false
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+    icon.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+  return true
+}
+
+/** 按属性识别发送入口，React 包装层数量变化时仍可找到；不缓存 fiber。 */
+export const stickerListScript = (selectFirst = false) => {
+  if (selectFirst) {
+    const tab = document.querySelector('[class*="emojiEmojisModalTabsubTab"]')
+    if (tab)
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+        tab.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+    return [] as string[]
+  }
+  const names: string[] = []
+  for (const node of Array.from(document.querySelectorAll('[class*="emojiEmojiItemimgBox"]'))) {
+    const key = Object.keys(node).find((key) => key.startsWith('__reactFiber$'))
+    let fiber = key ? (node as unknown as Record<string, unknown>)[key] : null
+    const seen = new Set<unknown>()
+    while (fiber && typeof fiber === 'object' && !seen.has(fiber)) {
+      seen.add(fiber)
+      const value = fiber as {
+        memoizedProps?: { sticker?: { display_name?: string }; handleSendEmoji?: unknown }
+        return?: unknown
+      }
+      const props = value.memoizedProps
+      if (props?.sticker && typeof props.handleSendEmoji === 'function' && props.sticker.display_name) {
+        names.push(props.sticker.display_name)
+        break
+      }
+      fiber = value.return
+    }
+  }
+  if (!names.length) {
+    const tab = document.querySelector('[class*="emojiEmojisModalTabsubTab"]')
+    if (tab)
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+        tab.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+  }
+  return [...new Set(names)]
+}
+
+export const stickerSendScript = (name: string) => {
+  const names: string[] = []
+  let match:
+    | { sticker: { display_name?: string }; handleSendEmoji: (sticker: unknown, index: number) => void; index: number }
+    | undefined
+  const nodes = Array.from(document.querySelectorAll('[class*="emojiEmojiItemimgBox"]'))
+  for (const [index, node] of nodes.entries()) {
+    const key = Object.keys(node).find((key) => key.startsWith('__reactFiber$'))
+    let fiber = key ? (node as unknown as Record<string, unknown>)[key] : null
+    const seen = new Set<unknown>()
+    while (fiber && typeof fiber === 'object' && !seen.has(fiber)) {
+      seen.add(fiber)
+      const value = fiber as {
+        memoizedProps?: {
+          sticker?: { display_name?: string }
+          index?: number
+          handleSendEmoji?: (sticker: unknown, index: number) => void
+        }
+        return?: unknown
+      }
+      const props = value.memoizedProps
+      if (props?.sticker && typeof props.handleSendEmoji === 'function' && props.sticker.display_name) {
+        names.push(props.sticker.display_name)
+        if (props.sticker.display_name === name)
+          match = { sticker: props.sticker, handleSendEmoji: props.handleSendEmoji, index: props.index ?? index }
+        break
+      }
+      fiber = value.return
+    }
+  }
+  if (match) {
+    match.handleSendEmoji(match.sticker, match.index)
+    return { called: true, names: [...new Set(names)] }
+  }
+  const icon = document.querySelector('svg[class*="messageMsgInputiconAction"]')
+  if (icon && document.querySelector('[class*="emojiEmojisModalTabsubTab"]'))
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+      icon.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+  return { called: false, names: [...new Set(names)] }
+}
+
+/** 表情调用后只回读，不再次调用页面发送函数，避免随机互动表情重复发送。 */
+export async function sendSticker(
+  page: BrowserPage,
+  peer: string,
+  name: string,
+  onCommit: () => void = () => {},
+): Promise<StickerResult> {
+  let names: string[] = []
+  let committed = false
+  try {
+    const opened = await openConversation(page, peer)
+    if (opened.status === 'login' || opened.status === 'verify') return { status: opened.status, names }
+    if (opened.status === 'failed') return { status: 'not-sent', reason: opened.reason, names }
+    const read = async () =>
+      (peer.startsWith('group:')
+        ? groupMessages(await page.evaluate(readGroupScript, null, { readonly: true }))
+        : attribute(await page.evaluate(readScript, null, { readonly: true }))
+      ).filter((row) => row.from === 'me')
+    const before = await read()
+    if (!(await page.evaluate(openStickerPanel, null)))
+      return { status: 'not-sent', reason: t('找不到表情面板入口'), names }
+    for (let i = 0; i < 12; i++) {
+      await sleep(page, 250)
+      names = await page.evaluate(stickerListScript, i === 0)
+      if (names.length) break
+    }
+    if (!names.includes(name)) {
+      // 未匹配时这个脚本只负责关闭面板，绝不会提交。
+      await page.evaluate(stickerSendScript, '')
+      return names.length
+        ? { status: 'unknown-sticker', names }
+        : { status: 'not-sent', reason: t('表情面板没有加载出来'), names }
+    }
+    if (await page.evaluate(blockedScript, null, { readonly: true })) return { status: 'verify', names }
+    if (await page.evaluate(loginScript, null, { readonly: true })) return { status: 'login', names }
+    // 从提交标记开始，脚本异常也只能报不确定，不能自动重发。
+    onCommit()
+    committed = true
+    const result = await page.evaluate(stickerSendScript, name)
+    names = result.names
+    if (!result.called) return { status: 'unknown-sticker', names }
+    await sleep(page, 2500)
+    const after = await read()
+    // 消息列表是虚拟滚动，条数可能不变，最新一条换了也算发出。
+    const newest = after.at(-1)?.sid
+    if (after.length > before.length || (newest && newest !== before.at(-1)?.sid))
+      return { status: 'sent', sid: newest ?? '', names }
+    return { status: 'uncertain', reason: t('回读没在「我发的」消息里找到这条'), names }
+  } catch (error) {
+    if (error instanceof CaptchaError) {
+      error.uncertain = committed
+      throw error
+    }
+    return {
+      status: committed ? 'uncertain' : 'not-sent',
+      reason: error instanceof Error ? error.message : String(error),
+      names,
+    }
   }
 }
 

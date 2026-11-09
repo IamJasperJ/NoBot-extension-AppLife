@@ -49,6 +49,7 @@ test('设置分组和字段顺序、折叠默认值及内部字段移除', () =>
   ])
   expect(groups.douyinChannelHeading).toEqual([
     'douyinChannel',
+    'douyinChannelStickers',
     'douyinChannelGroups',
     'douyinGroupReply',
     'douyinChannelDaily',
@@ -92,6 +93,7 @@ test('平台、后端和子开关条件同时满足，平台总开关始终可�
   }
   expect(conditions('douyinChromeCloseOnIdle')).toContainEqual({ key: 'douyinBrowserBackend', equals: 'chrome' })
   expect(conditions('douyinBrowserProxy')).toContainEqual({ key: 'douyinBrowserBackend', equals: 'headless' })
+  expect(conditions('douyinChannelStickers')).toContainEqual({ key: 'douyinChannel', equals: true })
   expect(conditions('douyinChannelGroups')).toContainEqual({ key: 'douyinChannel', equals: true })
   expect(conditions('douyinGroupReply')).toEqual(
     expect.arrayContaining([

@@ -16,12 +16,14 @@ export const UI_CODES = {
   LOGIN: -1001,
   /** 页面操作失败（找不到会话、输入框等），没有发出任何东西 */
   FAILED: -1002,
+  /** 表情名称不存在，没有发送 */
+  UNKNOWN_STICKER: -1003,
 } as const
 const num = (x: unknown) =>
   typeof x === 'number' && Number.isFinite(x) ? x : typeof x === 'string' && /^-?\d+$/.test(x) ? Number(x) : null
 export const douyinRiskPolicy: RiskPolicy = {
   guards: (url) => url.hostname === 'www.douyin.com',
-  isDirectMessage: (url) => ['/__ui/im/send', '/__ui/im/share'].includes(url.pathname),
+  isDirectMessage: (url) => ['/__ui/im/send', '/__ui/im/share', '/__ui/im/sticker'].includes(url.pathname),
   // 私信列表和会话内容是读浏览器里已经打开的抖音页面，不调用抖音接口；15 秒轮询一天要读几千次，不能占读取预算
   unmetered: (url) => ['/__ui/im/conversations', '/__ui/im/list'].includes(url.pathname),
   volatileFields: /^(a_bogus|msToken|X-Bogus|verifyFp|fp|_signature|ts|timestamp)$/,

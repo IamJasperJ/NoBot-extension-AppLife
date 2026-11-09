@@ -502,3 +502,14 @@ test('当前群校验读取消息 getter，会话缺消息或缺 id 时不猜测
     expect(result).toBe(id ?? '')
   }
 })
+
+test('方括号表情被输入框换成图片时仍算输入正确，其他差异不放行', async () => {
+  const { typedMatches } = await import('./im')
+  expect(typedMatches('好的[捂脸]', '好的[捂脸]', false)).toBe(true)
+  expect(typedMatches('好的', '好的[捂脸]', true)).toBe(true)
+  expect(typedMatches('', '[捂脸]', true)).toBe(true)
+  // 只有表情但框里什么都没有：没输进去，不能按回车
+  expect(typedMatches('', '[捂脸]', false)).toBe(false)
+  expect(typedMatches('旧残文', '好的[捂脸]', true)).toBe(false)
+  expect(typedMatches('好的', '好的呀', true)).toBe(false)
+})

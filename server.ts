@@ -63,6 +63,86 @@ import { ChannelSendError, defineExtension, type Extension, type ExtensionContex
 import { setLanguageSource, t } from './i18n'
 import { settingsSchema } from './settings'
 
+const DEFAULT_STICKERS = [
+  '续火花',
+  '比心',
+  '在干嘛',
+  '笑死',
+  '麻了',
+  '躺平',
+  '摇骰子',
+  '猜拳',
+  '开心',
+  '嗨',
+  '吹泡泡',
+  '黑人问号',
+  '早上好',
+  '晚上好',
+]
+
+function stickerTools(ctx: ExtensionContext, svc: Service): ReturnType<Extension['tools']> {
+  if (!svc.s.douyinChannel || !svc.s.douyinChannelStickers || !svc.channel?.enabled) return []
+  let chat: string | undefined
+  try {
+    const latest = ctx.host.getChatInfo(ctx.chatId, 1000).messages.findLast((message) => message.role === 'user')
+    // 聊天 id 自身可以包含冒号，消息 id 取最后一段。
+    chat = latest?.meta?.clientMessageId?.match(/^app-life\.douyin:(.+):[^:]+$/)?.[1]
+  } catch {
+    return []
+  }
+  if (!chat) return []
+  const target = chat
+  const names = svc.kv.get<string[]>('douyin-sticker-names') ?? DEFAULT_STICKERS
+  return [
+    {
+      name: 'douyin_send_sticker',
+      description: `Send one built-in interactive Douyin sticker to the current conversation. Use occasionally, only when appropriate. Do not send stickers repeatedly. Do not describe sending a sticker in your text reply. Available names: ${JSON.stringify(names)}.`,
+      timeoutMs: 120000,
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Exact sticker name from the available names.' } },
+        required: ['name'],
+        additionalProperties: false,
+      },
+      async run(args, { signal }) {
+        if (typeof args.name !== 'string' || !args.name.trim())
+          return { content: 'Sticker not sent: a name is required.' }
+        try {
+          if (!svc.s.douyinChannelStickers || !svc.channel?.enabled)
+            return { content: 'Sticker not sent: stickers or the channel are disabled.' }
+          const result = await svc.channel.sendSticker(target, args.name, signal ?? AbortSignal.timeout(120000))
+          return {
+            content:
+              result.status === 'sent'
+                ? 'Sticker sent.'
+                : `Unknown sticker name. Sticker not sent. Available names: ${JSON.stringify(result.names)}`,
+          }
+        } catch (error) {
+          if (error instanceof ChannelSendError) {
+            const reasons: Record<string, string> = {
+              'sticker-cooldown': 'Wait at least 30 seconds between stickers in the same conversation.',
+              'daily-limit': 'The daily channel reply limit has been reached.',
+              'groups-disabled': 'Douyin group chats are disabled.',
+              'stickers-disabled': 'Sticker sending is disabled.',
+              offline: 'The channel is disabled or Douyin is not logged in.',
+              paused: 'Platform requests are paused.',
+              captcha: 'Human verification is required.',
+              'not-sent': 'The page could not send the sticker.',
+            }
+            return {
+              content:
+                error.kind === 'unknown'
+                  ? 'Sticker result uncertain. Do not retry.'
+                  : `Sticker not sent: ${reasons[error.code] ?? error.code}`,
+            }
+          }
+          return { content: 'Sticker result uncertain. Do not retry.' }
+        }
+      },
+    },
+  ]
+}
+
 setLanguageSource(getLanguage)
 type Context = Omit<ExtensionContext, 'chatId'>
 const runtime: Runtime = {
@@ -328,10 +408,12 @@ export class Service {
     if (!Object.hasOwn(apps, app) || !factory) throw new RouteError('APP', t('不支持此应用'))
     const old = this.components.get(app)
     if (old) return old
+    const cacheKey = (key: string) =>
+      app === 'douyin' && key === 'sticker-names' ? 'douyin-sticker-names' : `cache:${app}:${key}`
     const cache: KV = {
-      get: <T>(key: string) => this.kv.get<T>(`cache:${app}:${key}`),
-      set: (key, value) => this.kv.set(`cache:${app}:${key}`, value),
-      delete: (key) => this.kv.delete(`cache:${app}:${key}`),
+      get: <T>(key: string) => this.kv.get<T>(cacheKey(key)),
+      set: (key, value) => this.kv.set(cacheKey(key), value),
+      delete: (key) => this.kv.delete(cacheKey(key)),
     }
     let guard: TrafficGuard
     const serviceContext = () => this.ctx
@@ -1059,19 +1141,26 @@ const extension: Extension = {
     },
   },
   tools(ctx) {
+    const stickers = stickerTools(ctx, service(ctx))
     if (visitorTurn(ctx))
-      return homeTools(service(ctx)).filter((tool) => ['douyin_watch', 'douyin_search'].includes(tool.name))
+      return [
+        ...homeTools(service(ctx)).filter((tool) => ['douyin_watch', 'douyin_search'].includes(tool.name)),
+        ...stickers,
+      ]
     const svc = service(ctx),
       home = ctx.storage.get<{ chatId: string; characterId: string }>('home')
-    if (!home || home.chatId !== ctx.chatId || home.characterId !== svc.s.characterId) return []
-    return homeTools(svc).map((tool) => ({
-      ...tool,
-      async run(args, options) {
-        if (svc.s.douyinEnabled && (tool.name.startsWith('douyin_') || tool.name.startsWith('life_')))
-          await svc.ensureDouyinOwner()
-        return tool.run(args, options)
-      },
-    }))
+    if (!home || home.chatId !== ctx.chatId || home.characterId !== svc.s.characterId) return stickers
+    return [
+      ...stickers,
+      ...homeTools(svc).map((tool) => ({
+        ...tool,
+        async run(args: Record<string, unknown>, options: { signal?: AbortSignal }) {
+          if (svc.s.douyinEnabled && (tool.name.startsWith('douyin_') || tool.name.startsWith('life_')))
+            await svc.ensureDouyinOwner()
+          return tool.run(args, options)
+        },
+      })),
+    ]
   },
   commands: [
     {

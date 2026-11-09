@@ -126,6 +126,8 @@ export interface ChannelProvider {
   accountFields: ExtensionSettingField[]
   /** 账号由扩展自己管理（v2.1），渠道页不显示「添加」。 */
   managedAccounts?: boolean
+  /** 渠道页按能力停用设置并说明原因；旧宿主忽略。 */
+  capabilities?: Record<string, 'supported' | 'unsupported' | 'unknown' | 'managed'>
   promptHint?: string
   start(account: ChannelAccount, io: ChannelIO, signal: AbortSignal): void | Promise<void>
   send(
