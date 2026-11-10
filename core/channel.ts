@@ -222,7 +222,7 @@ export class DouyinChannel {
       canInitiate: false,
       // 发送间隔不在宿主侧写死：由风控里的「私信发送冷却」控制（可设 0），拟人分条才能连续发出。
       limits: { maxTextLength: 500 },
-      media: { inboundImages: true, outboundImages: false, voice: false },
+      media: { inboundImages: true, outboundImages: true, voice: false },
       // 群回复方式由入站提及标记控制，已有绑定无需调整触发方式。
       defaults: { newLocation: { private: 'approve', group: 'approve' }, trigger: { group: 'mention' } },
       accountFields: [],
@@ -230,6 +230,8 @@ export class DouyinChannel {
       managedAccounts: true,
       // 抖音网页做不到的项在渠道页停用；群里什么时候回、表情包沿用应用生活自己的设置，不套渠道的那一套。
       capabilities: {
+        outboundImages: 'supported',
+        sceneImages: 'unsupported',
         groupTrigger: 'managed',
         stickers: 'managed',
         groupInvite: 'unsupported',
@@ -258,6 +260,7 @@ export class DouyinChannel {
           this.ownerBindings.delete(io)
         }
       },
+      sendImage: (_account, message, signal) => this.sendImage(message.chatId, message, signal),
       send: (account, message, signal) => this.send(account, message, signal),
     }
   }
@@ -432,6 +435,38 @@ export class DouyinChannel {
       )
       return { value: { id: result?.id || String(now) }, count: true }
     })
+  }
+  async sendImage(chatId: string, image: { bytes: Uint8Array; mime: string }, signal: AbortSignal) {
+    if (chatId.startsWith('group:')) chatId = chatId.slice(6)
+    return this.outbound(
+      chatId,
+      signal,
+      async (p, now, group) => {
+        const send = p.adapter.directMessages.sendImage
+        if (!send) throw new ChannelSendError('not-sent', 'unsupported')
+        try {
+          const result = await send.call(
+            p.adapter.directMessages,
+            group ? `group:${chatId}` : chatId,
+            { base64: Buffer.from(image.bytes).toString('base64'), mime: image.mime },
+            signal,
+          )
+          return { value: { id: result.id || String(now) }, count: true }
+        } catch (error) {
+          // 不确定的图片也占配额，避免后续任务绕过每日上限。
+          if (
+            !(error instanceof DmNotSentError) &&
+            !(error instanceof BrowserSkippedError && error.beforeDispatch) &&
+            !(error instanceof Error && error.name === 'CaptchaError' && !('uncertain' in error && error.uncertain)) &&
+            (!(error instanceof TrafficError) || ['UNCERTAIN', 'DUPLICATE'].includes(error.code)) &&
+            !(this.ownerViaChannel && chatId === p.settings.ownerId)
+          )
+            countAttempt(p, `channel:${chatId}`, now)
+          throw error
+        }
+      },
+      45000,
+    )
   }
   async sendSticker(chatId: string, name: string, signal: AbortSignal) {
     if (chatId.startsWith('group:')) chatId = chatId.slice(6)

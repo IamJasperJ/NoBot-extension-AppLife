@@ -397,6 +397,7 @@ export interface AppAdapter {
     captureImages?(peerId: string, message: DirectMessage, signal?: AbortSignal): Promise<Uint8Array[]>
     // biome-ignore lint/suspicious/noConfusingVoidType: 保留旧适配器的 Promise<void>，渠道适配器可额外返回回执
     send(peerId: string, text: string, signal?: AbortSignal): Promise<void | { id: string }>
+    sendImage?(peerId: string, image: { base64: string; mime: string }, signal?: AbortSignal): Promise<{ id: string }>
     sendSticker?(
       peerId: string,
       name: string,

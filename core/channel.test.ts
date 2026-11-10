@@ -862,3 +862,59 @@ test('渠道表情遵守登录与暂停，不确定结果占用间隔且不重�
     }
   }
 })
+
+test('图片 provider 声明与场景图隔离；图片走配额、群开关和主人豁免', async () => {
+  const image = { bytes: new Uint8Array([1, 2]), mime: 'image/png' }
+  const signal = new AbortController().signal
+  const account = { id: 'account', config: {}, cursor: null }
+  const f = fixture({ douyinChannelDaily: 1 })
+  const sent = mock(async () => ({ id: 'image-id' }))
+  f.dm.adapter.directMessages.sendImage = sent
+  try {
+    expect(f.provider.media.outboundImages).toBe(true)
+    expect(f.provider.capabilities).toMatchObject({ outboundImages: 'supported', sceneImages: 'unsupported' })
+    expect(await f.provider.sendImage!(account, { chatId: 'visitor', ...image }, signal)).toEqual({ id: 'image-id' })
+    await expect(f.channel.sendImage('visitor', image, signal)).rejects.toMatchObject({
+      kind: 'not-sent',
+      message: 'daily-limit',
+    })
+    await expect(f.channel.sendImage('123', image, signal)).rejects.toMatchObject({
+      kind: 'not-sent',
+      message: 'groups-disabled',
+    })
+    expect(sent).toHaveBeenCalledTimes(1)
+  } finally {
+    await f.close()
+  }
+  const owner = fixture({ douyinChannelDaily: 1 }, true)
+  owner.dm.adapter.directMessages.sendImage = sent
+  try {
+    await owner.channel.sendImage('owner', image, signal)
+    await owner.channel.sendImage('owner', image, signal)
+  } finally {
+    await owner.close()
+  }
+})
+
+test('图片不确定结果占每日配额，明确未发送不占配额', async () => {
+  const image = { bytes: new Uint8Array([1]), mime: 'image/png' }
+  const signal = new AbortController().signal
+  for (const uncertain of [true, false]) {
+    const f = fixture({ douyinChannelDaily: 1 })
+    f.dm.adapter.directMessages.sendImage = async () => {
+      if (uncertain) throw new TrafficError('uncertain', 'UNCERTAIN')
+      throw new DmNotSentError('not-sent')
+    }
+    try {
+      await expect(f.channel.sendImage('visitor', image, signal)).rejects.toMatchObject({
+        kind: uncertain ? 'unknown' : 'not-sent',
+      })
+      f.dm.adapter.directMessages.sendImage = async () => ({ id: 'ok' })
+      if (uncertain)
+        await expect(f.channel.sendImage('visitor', image, signal)).rejects.toMatchObject({ message: 'daily-limit' })
+      else expect(await f.channel.sendImage('visitor', image, signal)).toEqual({ id: 'ok' })
+    } finally {
+      await f.close()
+    }
+  }
+})

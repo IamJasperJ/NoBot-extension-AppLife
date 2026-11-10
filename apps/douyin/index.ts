@@ -429,6 +429,32 @@ export function createDouyinAdapter(deps: AdapterDeps): AppAdapter {
         api.ensure(response, payload)
         return str(obj(payload).sid) ? { id: str(obj(payload).sid) } : undefined
       },
+      async sendImage(peerId, image, signal) {
+        const response = await deps.guardedFetch(`${BASE}/__ui/im/image`, {
+          method: 'POST',
+          waitWriteMs: 30000,
+          headers: { cookie: cookieHeader(deps.credentials()), 'content-type': 'application/json' },
+          body: JSON.stringify({ peer: peerId, ...image, operationId: crypto.randomUUID() }),
+          signal,
+        })
+        const payload = obj(
+          await response
+            .text()
+            .then(parseJson)
+            .catch(() => undefined),
+        )
+        if (!('status_code' in payload))
+          throw new TrafficError(str(payload.status_msg) || t('图片发送结果不确定，禁止自动重发'), 'UNCERTAIN')
+        if (payload.status_code === UI_CODES.FAILED)
+          throw new DmNotSentError(t('抖音请求失败：{reason}', { reason: str(payload.status_msg) }))
+        if (payload.status_code === UI_CODES.VERIFY && payload.uncertain === true) {
+          const error = new CaptchaError()
+          error.uncertain = true
+          throw error
+        }
+        api.ensure(response, payload)
+        return { id: str(payload.sid) }
+      },
       async sendSticker(peerId, name, signal) {
         // 每次明确调用都是新操作；同一请求在保护层内部等待时保留原指纹。
         const response = await deps.guardedFetch(`${BASE}/__ui/im/sticker`, {

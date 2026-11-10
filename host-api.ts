@@ -130,6 +130,11 @@ export interface ChannelProvider {
   capabilities?: Record<string, 'supported' | 'unsupported' | 'unknown' | 'managed'>
   promptHint?: string
   start(account: ChannelAccount, io: ChannelIO, signal: AbortSignal): void | Promise<void>
+  sendImage?(
+    account: ChannelAccount,
+    message: { chatId: string; bytes: Uint8Array; mime: string; replyTo?: string },
+    signal: AbortSignal,
+  ): Promise<{ id: string }>
   send(
     account: ChannelAccount,
     message: { chatId: string; text: string; replyTo?: string },

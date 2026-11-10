@@ -24,6 +24,7 @@ import {
   loginScript,
   readConversation,
   readConversations,
+  sendImage,
   sendMessage,
   sendSticker,
   shareVideo,
@@ -170,7 +171,7 @@ export function createTransport(
     const url = new URL(input instanceof Request ? input.url : input)
     if (url.hostname !== 'www.douyin.com') return fallback(input, init)
     const path = url.pathname
-    const imWrite = ['/__ui/im/send', '/__ui/im/share', '/__ui/im/sticker'].includes(path)
+    const imWrite = ['/__ui/im/send', '/__ui/im/share', '/__ui/im/sticker', '/__ui/im/image'].includes(path)
     const method = (init.method ?? 'GET').toUpperCase()
     const body =
       typeof init.body === 'string' ? init.body : init.body instanceof URLSearchParams ? init.body.toString() : null
@@ -232,7 +233,9 @@ export function createTransport(
                 ? await shareVideo(page, str(data.itemId), peer, onCommit, searchTerms as string[] | undefined)
                 : path === '/__ui/im/sticker'
                   ? await sendSticker(page, peer, str(data.name), onCommit)
-                  : await sendMessage(page, peer, str(data.text), onCommit)
+                  : path === '/__ui/im/image'
+                    ? await sendImage(page, peer, { base64: str(data.base64), mime: str(data.mime) }, onCommit)
+                    : await sendMessage(page, peer, str(data.text), onCommit)
             const extra = 'names' in result ? { names: result.names } : {}
             if (result.status === 'unknown-sticker')
               return synthetic(path, { status_code: UI_CODES.UNKNOWN_STICKER, ...extra })

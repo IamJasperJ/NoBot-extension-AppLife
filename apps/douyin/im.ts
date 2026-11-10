@@ -844,6 +844,200 @@ export async function sendSticker(
   }
 }
 
+/** 输入区定位不依赖视口，避免误用替换附件的上传控件。 */
+export const imageStateScript = (send: boolean) => {
+  const input = document.querySelector<HTMLInputElement>('input.semi-upload-hidden-input[type="file"]')
+  let root: Element | null = input?.parentElement ?? null
+  while (root?.parentElement && !root.querySelector('svg.e2e-send-msg-btn')) root = root.parentElement
+  const button = root?.querySelector('svg.e2e-send-msg-btn')
+  const disabled =
+    !button || button.getAttribute('aria-disabled') === 'true' || !!button.closest('[disabled], [aria-disabled="true"]')
+  const preview = !!root?.querySelector(
+    '[class*="upload"][class*="preview"], [class*="Upload"][class*="Preview"], [class*="attachment"], .semi-upload-file-list img, [contenteditable="true"] img, [class*="preview"] img, [class*="Preview"] img, img[src^="blob:"], img[src^="data:image/"]',
+  )
+  if (send && preview && button && !disabled)
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return {
+    preview,
+    dialog: !!document.querySelector('[role="dialog"], .semi-modal-content'),
+    button: !button ? 'missing' : disabled ? 'disabled' : 'enabled',
+  }
+}
+
+/** 只检查可见对话框，按文字定位以兼容 div 按钮和嵌套文案。 */
+export const imageDialogScript = (action: 'inspect' | 'confirm' | 'cancel') => {
+  const visible = (element: Element) => {
+    const rect = element.getBoundingClientRect()
+    return rect.width > 0 && rect.height > 0
+  }
+  const text = (element: Element) => (element.textContent ?? '').replace(/\s/g, '')
+  const matches = Array.from(document.querySelectorAll('[role="dialog"], .semi-modal-content')).filter(visible)
+  const dialogs = matches.filter((element) => !matches.some((other) => other !== element && other.contains(element)))
+  const elements = dialogs.flatMap((dialog) => Array.from(dialog.querySelectorAll<HTMLElement>('*'))).filter(visible)
+  const deepest = elements.filter(
+    (element) => !Array.from(element.querySelectorAll('*')).some((child) => text(child) === text(element)),
+  )
+  const enabled = (element: Element) => {
+    // 私信面板可能挂在页面 header 内，禁用状态只继承到所属对话框根（含根）。
+    for (let current: Element | null = element; current; current = current.parentElement) {
+      if (current.matches('[disabled], [aria-disabled="true"], .semi-button-disabled')) return false
+      if (dialogs.includes(current)) break
+    }
+    return true
+  }
+  const candidates = deepest.filter(enabled)
+  const priority = ['发送', '确认', '确定', '确认发送', 'Send', 'Confirm', 'OK']
+  const confirmText = (element: Element) => text(element).replace(/^发送[（(]\d+[）)]$/, '发送')
+  const confirm = priority.map((label) => candidates.find((element) => confirmText(element) === label)).find(Boolean)
+  const cancel =
+    ['取消', '关闭', 'Cancel', 'Close']
+      .map((label) => candidates.find((element) => text(element) === label))
+      .find(Boolean) ??
+    elements.find(
+      (element) => element.matches('.semi-modal-close, [aria-label="close"], [aria-label="关闭"]') && enabled(element),
+    )
+  const labels = [...new Set(elements.filter((element) => !element.children.length).map(text))]
+    .filter((label) => label.length >= 1 && label.length <= 12)
+    .slice(0, 12)
+  const target = action === 'confirm' ? confirm : action === 'cancel' ? cancel : undefined
+  if (target) target.click()
+  return {
+    count: dialogs.length,
+    confirm: confirm ? text(confirm) : null,
+    cancel: cancel ? text(cancel) || cancel.getAttribute('aria-label') : null,
+    clicked: !!target,
+    labels,
+  }
+}
+
+/** 只派发一次 change；不能同时调用 React onChange，否则可能重复发送。 */
+export const imageUploadScript = async ({ base64, mime }: { base64: string; mime: string }) => {
+  const input = document.querySelector<HTMLInputElement>('input.semi-upload-hidden-input[type="file"]')
+  if (!input) throw new Error('IMAGE_INPUT_MISSING')
+  const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0))
+  let blob = new Blob([bytes], { type: mime })
+  if (!['image/jpeg', 'image/png', 'image/gif'].includes(mime)) {
+    const bitmap = await createImageBitmap(blob)
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = bitmap.width
+      canvas.height = bitmap.height
+      const context = canvas.getContext('2d')
+      if (!context) throw new Error('IMAGE_CANVAS_UNAVAILABLE')
+      context.drawImage(bitmap, 0, 0)
+      blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((value) => (value ? resolve(value) : reject(new Error('IMAGE_CONVERSION_FAILED'))), 'image/png'),
+      )
+    } finally {
+      bitmap.close()
+    }
+  }
+  const extension = blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/gif' ? 'gif' : 'png'
+  const transfer = new DataTransfer()
+  transfer.items.add(new File([blob], `image.${extension}`, { type: blob.type }))
+  input.files = transfer.files
+  input.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+/** 提交后持续回读；确认和输入栏发送各最多点一次，不自动重传。 */
+export async function sendImage(
+  page: BrowserPage,
+  peer: string,
+  image: { base64: string; mime: string },
+  onCommit: () => void = () => {},
+): Promise<SendResult> {
+  let committed = false
+  let cancelAttempted = false
+  const cancelDialog = async () => {
+    if (cancelAttempted) return
+    cancelAttempted = true
+    await page.evaluate(imageDialogScript, 'cancel')
+  }
+  try {
+    if (!/^image\/[a-z0-9.+-]+$/i.test(image.mime) || Buffer.from(image.base64, 'base64').length > 8 * 1024 * 1024)
+      return { status: 'not-sent', reason: t('图片格式无效或超过 8MB') }
+    if ((await page.evaluate(imageDialogScript, 'inspect', { readonly: true })).count > 0)
+      return { status: 'not-sent', reason: t('抖音有未关闭的对话框，图片未发送') }
+    const opened = await openConversation(page, peer)
+    if (opened.status === 'login' || opened.status === 'verify')
+      return { status: 'not-sent', reason: opened.status === 'login' ? t('抖音登录已失效') : t('抖音需要验证') }
+    if (opened.status === 'failed') return { status: 'not-sent', reason: opened.reason }
+    const read = async () =>
+      (peer.startsWith('group:')
+        ? groupMessages(await page.evaluate(readGroupScript, null, { readonly: true }))
+        : attribute(await page.evaluate(readScript, null, { readonly: true }))
+      ).filter((row) => row.from === 'me')
+    const before = await read()
+    if (await page.evaluate(blockedScript, null, { readonly: true }))
+      return { status: 'not-sent', reason: t('抖音需要验证') }
+    if (await page.evaluate(loginScript, null, { readonly: true }))
+      return { status: 'not-sent', reason: t('抖音登录已失效') }
+    if ((await page.evaluate(imageDialogScript, 'inspect', { readonly: true })).count > 0)
+      return { status: 'not-sent', reason: t('抖音有未关闭的对话框，图片未发送') }
+    onCommit()
+    committed = true
+    await page.evaluate(imageUploadScript, image)
+    let clicked = false
+    let confirmed = false
+    for (let i = 1; i <= 40; i++) {
+      await sleep(page, 500)
+      const after = await read()
+      const newest = after.at(-1)?.sid
+      if (after.length > before.length || (newest && newest !== before.at(-1)?.sid))
+        return { status: 'sent', sid: newest ?? '' }
+      const dialog = await page.evaluate(imageDialogScript, 'inspect', { readonly: true })
+      if (dialog.count > 0) {
+        if (dialog.confirm && !confirmed) {
+          // 先置标记，派发后即使页面断连也不能再次确认。
+          confirmed = true
+          await page.evaluate(imageDialogScript, 'confirm')
+        }
+        continue
+      }
+      if (i >= 8 && !clicked) {
+        const state = await page.evaluate(imageStateScript, false, { readonly: true })
+        if (state.preview && state.button === 'enabled') {
+          // 先置标记，派发后即使页面断连也不能再点。
+          clicked = true
+          await page.evaluate(imageStateScript, true)
+        }
+      }
+    }
+    const state = await page.evaluate(imageStateScript, false, { readonly: true })
+    const dialog = await page.evaluate(imageDialogScript, 'inspect', { readonly: true })
+    if (dialog.count > 0) {
+      try {
+        await cancelDialog()
+      } catch (error) {
+        if (error instanceof CaptchaError) throw error
+        // 取消失败也不能改变已提交的语义，诊断中保留尝试记录。
+      }
+    }
+    return {
+      status: 'uncertain',
+      reason: t('图片发送未确认：{state}', {
+        state: JSON.stringify({ state, dialog, confirmed, cancelAttempted }),
+      }),
+    }
+  } catch (error) {
+    if (error instanceof CaptchaError) {
+      error.uncertain = committed
+      throw error
+    }
+    if (committed) {
+      try {
+        await cancelDialog()
+      } catch {
+        // 断连时尽力解除选图对话框，不覆盖原异常。
+      }
+    }
+    return {
+      status: committed ? 'uncertain' : 'not-sent',
+      reason: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
 export type ShareResult =
   | { status: 'sent'; confirmedBy: 'button' | 'readback' | 'readback-reattach' }
   | { status: 'not-sent' | 'uncertain'; reason: string; disconnected?: boolean }

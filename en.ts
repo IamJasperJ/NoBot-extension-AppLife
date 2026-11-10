@@ -1,4 +1,10 @@
 const en: Record<string, string> = {
+  '抖音有未关闭的对话框，图片未发送': 'Douyin has an unclosed dialog. The image was not sent.',
+  '图片格式无效或超过 8MB': 'Invalid image format or image exceeds 8MB',
+  抖音登录已失效: 'Douyin login has expired',
+  '图片发送未确认：{state}': 'Image delivery was not confirmed: {state}',
+  '图片发送结果不确定，禁止自动重发': 'Image delivery is uncertain. Automatic retry is forbidden.',
+
   '回读没在「我发的」消息里找到这条': 'Readback did not find a new message sent by me',
   找不到表情面板入口: 'Cannot find the sticker panel button',
   表情面板没有加载出来: 'The sticker panel did not load',
