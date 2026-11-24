@@ -99,26 +99,58 @@ test('回复只回到来源：在回别处的话时不发私信、不消费队�
   expect(x.sends).toEqual(['回私信'])
   expect(dmOf(x.f.kv).pendingReplies).toHaveLength(0)
 })
+test('乱序回复只消费匹配的私信，过期回复不发送', async () => {
+  const x = setup()
+  x.f.kv.set('dm', {
+    ...dmOf(x.f.kv),
+    pendingReplies: [
+      { userMessageId: 'expired', peerId: 'owner', at: now - 600000 },
+      { userMessageId: 'early', peerId: 'owner', at: now - 10 },
+      { userMessageId: 'latest', peerId: 'owner', at: now },
+    ],
+  })
+  await replyOwnerDm(x.p, '过期内容', now, undefined, 'expired')
+  await replyOwnerDm(x.p, '先回复最新消息', now, undefined, 'latest')
+  expect(dmOf(x.f.kv).pendingReplies.map((reply) => reply.userMessageId)).toEqual(['early'])
+  await replyOwnerDm(x.p, '再回复上一条', now, undefined, 'early')
+  expect(x.sends).toEqual(['先回复最新消息', '再回复上一条'])
+})
+
+test('平台回传旧批次不会回退游标，换联系人后重新建立基线', async () => {
+  const x = setup()
+  x.f.kv.set('dm', { ...dmOf(x.f.kv), cursor: '100', cursorPeer: 'owner' })
+  x.setMessages([msg('98', '旧消息')])
+  await pollOwnerDm(x.p, now)
+  expect(dmOf(x.f.kv).cursor).toBe('100')
+  x.p.settings.ownerId = 'new-owner'
+  x.setMessages([msg('2', '新主人的历史', 'new-owner')])
+  await pollOwnerDm(x.p, now + 60000)
+  expect(x.appends).toEqual([])
+  expect(dmOf(x.f.kv)).toMatchObject({ cursor: '2', cursorPeer: 'new-owner' })
+  x.setMessages([msg('3', '新主人的新消息', 'new-owner')])
+  await pollOwnerDm(x.p, now + 120000)
+  expect(x.appends).toEqual(['新主人的新消息'])
+})
 test('回复只发一次、舞台清理、最多三段、互关缓存六小时、单日收件人锁', async () => {
   const x = setup()
-  const pending = () => {
-    x.f.kv.set('dm', { ...dmOf(x.f.kv), pendingReplies: [{ userMessageId: 'user', peerId: 'owner', at: now }] })
+  const pending = (at = now) => {
+    x.f.kv.set('dm', { ...dmOf(x.f.kv), pendingReplies: [{ userMessageId: 'user', peerId: 'owner', at }] })
   }
   pending()
-  await replyOwnerDm(x.p, `<stage>secret</stage>${'好'.repeat(1600)}`, now)
+  await replyOwnerDm(x.p, `<stage>secret</stage>${'好'.repeat(1600)}`, now, undefined, 'user')
   expect(x.sends.map((s) => s.length)).toEqual([500, 500, 500])
-  await replyOwnerDm(x.p, 'duplicate', now)
+  await replyOwnerDm(x.p, 'duplicate', now, undefined, 'user')
   expect(x.sends).toHaveLength(3)
-  pending()
-  await replyOwnerDm(x.p, 'next', now + 3600000)
+  pending(now + 3600000)
+  await replyOwnerDm(x.p, 'next', now + 3600000, undefined, 'user')
   expect(x.counts().mutual).toBe(1)
-  pending()
-  await replyOwnerDm(x.p, 'later', now + 7 * 3600000)
+  pending(now + 7 * 3600000)
+  await replyOwnerDm(x.p, 'later', now + 7 * 3600000, undefined, 'user')
   expect(x.counts().mutual).toBe(2)
   expect(splitDm('<cg src="x"/>hello')).toEqual(['hello'])
   pending()
   x.p.settings.ownerId = 'different'
-  await replyOwnerDm(x.p, 'refuse', now)
+  await replyOwnerDm(x.p, 'refuse', now, undefined, 'user')
   expect(x.sends).toHaveLength(5)
 })
 test('仅失败退避、空结果成功、窗口外不轮询', async () => {
@@ -139,22 +171,22 @@ test('空段和纯舞台内容保留队列，第一条可见正文发送后不�
   const x = setup()
   x.f.kv.set('dm', { ...dmOf(x.f.kv), pendingReplies: [{ userMessageId: 'user', peerId: 'owner', at: now }] })
   for (const text of ['', '  ', '<stage>secret</stage><cg src="x"/>', '[sprite happy]']) {
-    await replyOwnerDm(x.p, text, now)
+    await replyOwnerDm(x.p, text, now, undefined, 'user')
     expect(dmOf(x.f.kv).pendingReplies).toHaveLength(1)
     expect(x.sends).toEqual([])
     expect(x.counts().mutual).toBe(0)
   }
   x.p.displayText = () => '<stage>hidden</stage>'
-  await replyOwnerDm(x.p, '内部内容', now)
+  await replyOwnerDm(x.p, '内部内容', now, undefined, 'user')
   expect(dmOf(x.f.kv).pendingReplies).toHaveLength(1)
   let displays = 0
   x.p.displayText = () => {
     displays++
     return '<cg src="x"/>看到啦'
   }
-  await replyOwnerDm(x.p, '内部内容', now)
+  await replyOwnerDm(x.p, '内部内容', now, undefined, 'user')
   expect(displays).toBe(1)
-  await replyOwnerDm(x.p, '工具之后的第二段正文', now)
+  await replyOwnerDm(x.p, '工具之后的第二段正文', now, undefined, 'user')
   expect(x.sends).toEqual(['看到啦'])
   expect(dmOf(x.f.kv).pendingReplies).toEqual([])
 })
@@ -175,7 +207,7 @@ test('十分钟到期时清理等待，即使尚未到轮询时间，后续私�
   x.setMessages([msg('2', '新私信')])
   await pollOwnerDm(x.p, now + 20 * 60000)
   expect(dmOf(x.f.kv).pendingReplies[0]?.at).toBe(now + 20 * 60000)
-  await replyOwnerDm(x.p, '新回复', now + 20 * 60000)
+  await replyOwnerDm(x.p, '新回复', now + 20 * 60000, undefined, 'user')
   expect(x.sends).toEqual(['新回复'])
 })
 
@@ -379,7 +411,7 @@ test('观看报错或不响应取消而超时，仍追加作品 id 并触发，�
     }
     x.p.append = (_id, text, meta) => {
       expect(text).toBe('[分享视频] 猫')
-      expect(meta.context).toContain('id: 111')
+      expect(meta.context).toContain('id_or_url: 111')
       expect(meta.context).toContain('look: true')
       expect(meta.context).toContain('Do not claim to have watched it')
       expect(meta.images).toBeUndefined()

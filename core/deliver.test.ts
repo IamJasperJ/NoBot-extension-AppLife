@@ -124,6 +124,22 @@ test('明确未发送只重试失败分段一次，保留成功分段', async ()
   expect(x.notes).toEqual([])
 })
 
+test('后续分段失败时保留实际发出的前缀，即使失败通知也无法写入', async () => {
+  const x = socialFixture()
+  const e = item()
+  x.p.settings.shareVia = 'dm'
+  x.p.adapter.directMessages.mutual = async () => true
+  let sends = 0
+  x.p.adapter.directMessages.send = async () => {
+    if (++sends === 2) throw new Error('部分发送后失败')
+  }
+  x.p.note = () => {
+    throw new Error('绑定会话不可写')
+  }
+  expect(await deliver(x.p, e, '字'.repeat(510), 1)).toEqual({ status: 'partial', text: '字'.repeat(500) })
+  expect(e.delivered?.at(-1)).toMatchObject({ ok: false, error: expect.stringContaining('部分发送后失败') })
+})
+
 for (const code of ['UNCERTAIN', 'MANUAL', 'PAUSED'] as const) {
   test(`私信分享 ${code} 不重试并保留失败原因`, async () => {
     const x = socialFixture(),
@@ -189,7 +205,10 @@ for (const mode of ['sent', 'text-failed', 'not-sent', 'uncertain', 'bilibili'] 
       calls.push(text)
       if (mode === 'text-failed') throw new Error('文字失败')
     }
-    expect(await deliver(x.p, e, '随手一句', 1)).toEqual({ status: 'sent', text: '随手一句' })
+    const result = await deliver(x.p, e, '随手一句', 1)
+    if (mode === 'uncertain') expect(result).toEqual({ status: 'uncertain' })
+    else if (mode === 'text-failed') expect(result).toEqual({ status: 'partial', text: '' })
+    else expect(result).toEqual({ status: 'sent', text: mode === 'sent' ? '随手一句' : `随手一句\n${e.url}` })
     expect(calls).toEqual(
       mode === 'bilibili'
         ? [`随手一句\n${e.url}`]
@@ -197,7 +216,7 @@ for (const mode of ['sent', 'text-failed', 'not-sent', 'uncertain', 'bilibili'] 
           ? ['card']
           : ['card', mode === 'not-sent' ? `随手一句\n${e.url}` : '随手一句'],
     )
-    expect(e.delivered).toMatchObject([{ ok: true }])
+    expect(e.delivered).toMatchObject([{ ok: !['uncertain', 'text-failed'].includes(mode) }])
     if (['text-failed', 'not-sent', 'uncertain'].includes(mode))
       expect(x.p.kv.get<Activity[]>('activity')?.some((a) => !!a.error)).toBe(true)
   })

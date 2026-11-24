@@ -151,21 +151,20 @@ export function createTransport(
       await page.waitForTimeout(2500)
     }
   }
-  /**
-   * 浏览器里完全没有登录态（用户目录丢了、Cookie 没落盘）时，把保存的凭据写回浏览器。
-   * 浏览器已有登录态时以浏览器为准：扫码 / 手动登录会自己写 Cookie，这里不能拿旧凭据覆盖新账号。
-   * 每次请求都要查：浏览器空闲会被关掉重开，不能只在第一次写入后就不管了。
-   */
-  async function syncCookies() {
-    // 我的 Chrome 以用户的当前登录态为准，不能把 NoBot 的旧凭据写回去复活已退出的账号。
-    if (browser.backend === 'chrome') return
+  async function syncCookies(headers?: HeadersInit) {
     const credentials = opts.credentials()
-    if (!credentials?.sessionid) return
-    const current = await browser.cookies()
-    if (!current.some((c) => c.name === 'sessionid' && c.value))
+    const expected = douyinRiskPolicy.accountOf(new Headers(headers)) || credentials?.sessionid
+    if (!expected) return
+    const current = (await browser.cookies()).find((c) => c.name === 'sessionid' && c.value)?.value
+    if (current === expected) return
+    // 只有服务器浏览器丢失 Cookie 时才恢复保存的凭据。换号后须由用户确认新的登录态。
+    if (!current && browser.backend !== 'chrome' && credentials?.sessionid === expected) {
       await browser.setCookies(
         Object.entries(credentials).map(([name, value]) => ({ name, value, domain: '.douyin.com' })),
       )
+      return
+    }
+    throw new BrowserSkippedError(t('抖音浏览器登录态已变化，请重新确认登录'))
   }
   const handler = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(input instanceof Request ? input.url : input)
@@ -182,19 +181,15 @@ export function createTransport(
     const prepare = async () => {
       if (opts.blocked()) throw new Error(t('正在扫码登录抖音，请稍后'))
       init.signal?.throwIfAborted()
-      await syncCookies()
+      await syncCookies(init.headers)
     }
-    // 其他接口保留原先准备阶段的异常语义，只为私信发送扩大捕获范围。
-    if (!imWrite) await prepare()
     // ready() 也会在回调前失败，因此提交标记必须由传输层持有。
     let committed = false
     let committedAt = 0
     return Promise.resolve()
       .then(async () => {
-        if (imWrite) {
-          if (opts.blocked()) return synthetic(path, { status_code: UI_CODES.LOGIN })
-          await prepare()
-        }
+        if (imWrite && opts.blocked()) return synthetic(path, { status_code: UI_CODES.LOGIN })
+        await prepare()
         return browser.run(async (page) => {
           if (path === '/__ui/im/conversations') {
             const read = await readConversations(page)

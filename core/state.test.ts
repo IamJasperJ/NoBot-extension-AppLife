@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test'
 import { defaults, settingsOf } from './state'
 
+test('作息设置忽略空白和无效时间，保留合法的跨午夜设置', () => {
+  const overnight = { start: '23:00', end: '02:00', wakes: 2 }
+  const raw = [null, 0, {}, { start: '', end: '01:00' }, { start: '24:00', end: '01:00' }, overnight]
+  expect(settingsOf({ windows: raw }).windows).toEqual([overnight])
+  expect(settingsOf({ windows: [] }).windows).toEqual([])
+})
+
 test('二期功能默认关闭、家分享默认值，以及枚举和额度规范化', () => {
   expect(defaults).toMatchObject({
     shareVia: 'home',

@@ -1,5 +1,6 @@
 import { createConnection } from 'node:net'
 import { join } from 'node:path'
+import type { GenerateEvent, MessageDTO } from '../../packages/shared/src'
 import { apps, BROWSER_APPS } from './apps'
 import { CdpSession, validBrowserInput } from './apps/douyin/cdp'
 import { createInstaller } from './apps/douyin/install'
@@ -7,10 +8,10 @@ import { ensureOwner, type OwnerCache } from './apps/douyin/owner'
 import { BridgeOfflineError, BridgePausedError, ChromeBridge } from './browser/bridge'
 import { ExtensionSession } from './browser/extension-session'
 import { chromeExtensionVersion, chromeExtensionZip } from './browser/zip'
-import { DouyinChannel, visitorMemory, visitorTurn } from './core/channel'
+import { DouyinChannel, releaseOwnerCursor, visitorMemory, visitorTurn } from './core/channel'
 import { commentsOf, DraftError, pollComments, sendDraft } from './core/comments'
 import { type DayPorts, runDay } from './core/day'
-import { type DmPorts, pollOwnerDm, replyOwnerDm } from './core/dm'
+import { type DmPorts, pollOwnerDm, pruneDmReplies, replyOwnerDm } from './core/dm'
 import { runGate } from './core/gate'
 import { normalizeLimits, RISK_DEFAULTS } from './core/limits'
 import { liveOf, liveStatus, pollLive } from './core/live'
@@ -80,18 +81,39 @@ const DEFAULT_STICKERS = [
   '晚上好',
 ]
 
-function stickerTools(ctx: ExtensionContext, svc: Service): ReturnType<Extension['tools']> {
-  if (!svc.s.douyinChannel || !svc.s.douyinChannelStickers || !svc.channel?.enabled) return []
-  let chat: string | undefined
+function stickerSource(ctx: ExtensionContext) {
+  if (!ctx.channels) return
   try {
     const latest = ctx.host.getChatInfo(ctx.chatId, 1000).messages.findLast((message) => message.role === 'user')
     // 聊天 id 自身可以包含冒号，消息 id 取最后一段。
-    chat = latest?.meta?.clientMessageId?.match(/^app-life\.douyin:(.+):[^:]+$/)?.[1]
+    const source = latest?.meta?.clientMessageId
+    const target = source?.match(/^app-life\.douyin:(.+):[^:]+$/)?.[1]
+    if (!target) return
+    const bindings = ctx.channels.lookupAll?.(ctx.chatId) ?? [ctx.channels.lookup(ctx.chatId)]
+    const binding = bindings.find(
+      (item) =>
+        item?.provider === 'app-life.douyin' &&
+        (item.external.chat === target || (item.scope === 'group' && `group:${item.external.chat}` === target)),
+    )
+    if (binding) return { source, target, binding }
   } catch {
-    return []
+    // 会话可能已删除，无法验证来源时不给出外发工具。
   }
-  if (!chat) return []
-  const target = chat
+}
+
+function stickerTools(ctx: ExtensionContext, svc: Service): ReturnType<Extension['tools']> {
+  if (!svc.s.douyinChannel || !svc.s.douyinChannelStickers || !svc.channel?.enabled) return []
+  const destination = stickerSource(ctx)
+  if (!destination) return []
+  const assertBinding = () => {
+    const current = stickerSource(ctx)
+    if (
+      current?.source !== destination.source ||
+      current?.binding.bindingId !== destination.binding.bindingId ||
+      current?.binding.accountId !== destination.binding.accountId
+    )
+      throw new ChannelSendError('not-sent', 'binding-changed')
+  }
   const names = svc.kv.get<string[]>('douyin-sticker-names') ?? DEFAULT_STICKERS
   return [
     {
@@ -110,7 +132,17 @@ function stickerTools(ctx: ExtensionContext, svc: Service): ReturnType<Extension
         try {
           if (!svc.s.douyinChannelStickers || !svc.channel?.enabled)
             return { content: 'Sticker not sent: stickers or the channel are disabled.' }
-          const result = await svc.channel.sendSticker(target, args.name, signal ?? AbortSignal.timeout(120000))
+          assertBinding()
+          const result = await svc.channel.sendSticker(
+            destination.target,
+            args.name,
+            signal ?? AbortSignal.timeout(120000),
+            () => {
+              assertBinding()
+              const session = svc.channel?.sessions.get(destination.binding.accountId)
+              if (!session || session.signal.aborted) throw new ChannelSendError('not-sent', 'offline')
+            },
+          )
           return {
             content:
               result.status === 'sent'
@@ -124,6 +156,7 @@ function stickerTools(ctx: ExtensionContext, svc: Service): ReturnType<Extension
               'daily-limit': 'The daily channel reply limit has been reached.',
               'groups-disabled': 'Douyin group chats are disabled.',
               'stickers-disabled': 'Sticker sending is disabled.',
+              'binding-changed': 'The source chat binding has changed.',
               offline: 'The channel is disabled or Douyin is not logged in.',
               paused: 'Platform requests are paused.',
               captcha: 'Human verification is required.',
@@ -219,32 +252,44 @@ const browsers = new Map<
   string,
   { installer: ReturnType<typeof createInstaller>; browser: CdpSession; state: { ctx: Context } }
 >()
+const browserClosures = new Map<string, Promise<void>>()
+function trafficHeaders(kv: KV, app: string): HeadersInit {
+  const cred = kv.get<Record<string, string>>(`cred:${app}`)
+  return { cookie: app === 'douyin' ? `sessionid=${cred?.sessionid ?? ''}` : `SESSDATA=${cred?.SESSDATA ?? ''}` }
+}
 function browserSession(ctx: Context) {
   const root = userRoot()
   let entry = browsers.get(root)
   if (!entry) {
     // 记住最近一次的上下文：用户改了后端设置后，空闲检查要按新设置判断
     const state = { ctx }
-    const installer = createInstaller(() => join(root, 'app-life', 'browser'))
-    entry = {
-      installer,
-      browser: new CdpSession({
-        binary: installer.find,
-        profileDir: () => join(root, 'app-life', 'douyin-profile'),
-        proxy: () => settingsOf(ctx.settings).douyinBrowserProxy,
-        keepAlive: () => {
-          // 选了「我的 Chrome」后服务器浏览器没人用，暂停也不该把它留着占内存
-          if (settingsOf(state.ctx.settings).douyinBrowserBackend === 'chrome') return false
-          // 只读取已有平台，避免为了检查暂停状态再次创建浏览器会话。
-          try {
-            return [...services.values()].some((svc) => !!svc.components.get('douyin')?.guard.status().manual.length)
-          } catch {
-            return false
-          }
-        },
-      }),
-      state,
-    }
+    const installer = createInstaller(() => join(root, 'app-life', 'browser'), {
+      beforeStart: () => browserClosures.get(root),
+      stopBrowser: (): Promise<void> => browser.close(),
+    })
+    const browser = new CdpSession({
+      binary: installer.find,
+      profileDir: () => join(root, 'app-life', 'douyin-profile'),
+      proxy: () => settingsOf(state.ctx.settings).douyinBrowserProxy,
+      beforeLaunch: async () => {
+        await browserClosures.get(root)
+        await installer.waitForComponentChange()
+      },
+      keepAlive: () => {
+        // 选了「我的 Chrome」后服务器浏览器没人用，暂停也不该把它留着占内存
+        if (settingsOf(state.ctx.settings).douyinBrowserBackend === 'chrome') return false
+        // 只读取已有平台，避免为了检查暂停状态再次创建浏览器会话。
+        try {
+          const kv = state.ctx.storage
+          const id = kv.get<string>('instance')
+          const guard = id ? services.get(id)?.components.get('douyin')?.guard : undefined
+          return !!guard?.status(trafficHeaders(kv, 'douyin')).manual.length
+        } catch {
+          return false
+        }
+      },
+    })
+    entry = { installer, browser, state }
     browsers.set(root, entry)
   }
   entry.state.ctx = ctx
@@ -268,6 +313,33 @@ function chromeSession(ctx: Context) {
   }
   entry.state.ctx = ctx
   return entry
+}
+
+/** 重载时要等浏览器和安装任务释放该用户的资料目录。 */
+function closeUserBrowsers(root: string) {
+  const headless = browsers.get(root)
+  const chrome = chromeSessions.get(root)
+  if (!headless && !chrome) return
+  browsers.delete(root)
+  chromeSessions.delete(root)
+  const closeChrome =
+    chrome &&
+    (async () => {
+      try {
+        chrome.bridge.close()
+      } finally {
+        await chrome.browser.close()
+      }
+    })()
+  const closing = Promise.allSettled([
+    browserClosures.get(root),
+    headless?.installer.cancel(),
+    headless?.browser.close(),
+    closeChrome,
+  ]).then(() => {
+    if (browserClosures.get(root) === closing) browserClosures.delete(root)
+  })
+  browserClosures.set(root, closing)
 }
 function selectedBrowser(ctx: Context) {
   if (settingsOf(ctx.settings).douyinBrowserBackend !== 'chrome') return browserSession(ctx).browser
@@ -332,8 +404,13 @@ export class Service {
   channel?: DouyinChannel
   channelHandle?: { unregister(): void }
   registerChannel() {
+    const enabled = this.s.douyinEnabled && this.s.douyinChannel
+    if (!enabled && this.kv.get('channel-owner')) {
+      const owner = scopedSettings(this.s, 'douyin', this.kv.get<OwnerCache>('douyin-owner')).ownerId
+      releaseOwnerCursor(scopedKv(this.kv, 'douyin'), owner)
+    }
     // 设置关掉后主动注销平台（v2 宿主），渠道页立即显示「平台不可用」，数据保留；之后重新开启会再注册。
-    if (this.channel && (!this.s.douyinEnabled || !this.s.douyinChannel || !this.signal || this.signal.aborted)) {
+    if (this.channel && (!enabled || !this.signal || this.signal.aborted)) {
       try {
         this.channelHandle?.unregister()
       } catch (error) {
@@ -342,30 +419,23 @@ export class Service {
       this.channelHandle = undefined
       this.channel = undefined
       // 关掉期间的私信不补投：下次打开重新以那时为界。
-      if (!this.s.douyinEnabled || !this.s.douyinChannel) {
-        scopedKv(this.kv, 'douyin').delete('channel-owner')
-        this.kv.delete('channel-since')
-        this.kv.delete('channel-groups-since')
-      }
-      if (!this.s.douyinEnabled || !this.s.douyinChannel || !this.signal || this.signal.aborted) return
     }
-    if (
-      !this.channel &&
-      this.signal &&
-      !this.signal.aborted &&
-      this.s.douyinEnabled &&
-      this.s.douyinChannel &&
-      this.ctx.channels?.registerProvider
-    ) {
+    if (!enabled) {
+      for (const key of ['channel-since', 'channel-groups-since']) {
+        if (this.kv.get(key) !== undefined) this.kv.delete(key)
+      }
+      return
+    }
+    if (!this.channel && this.signal && !this.signal.aborted && this.ctx.channels?.registerProvider) {
       this.channel = new DouyinChannel(this.ctx.channels, {
         settings: () => this.s,
         ownerHome: () => this.ownerHome(),
         dm: () => this.dmPorts('douyin'),
         self: () => this.account('douyin')?.id ?? '',
         now: () => this.rt.now(),
-        captcha: () => !!this.platform('douyin').guard.status().manual.length,
+        captcha: () => !!this.platform('douyin').guard.status(trafficHeaders(this.kv, 'douyin')).manual.length,
         reason: () => {
-          const traffic = this.platform('douyin').guard.status()
+          const traffic = this.platform('douyin').guard.status(trafficHeaders(this.kv, 'douyin'))
           if (traffic.manual.length) return t('抖音需要验证')
           if (traffic.pausedUntil && traffic.pausedUntil > this.rt.now()) return traffic.pauseReason ?? t('私信已暂停')
           if (this.s.douyinBrowserBackend === 'chrome') {
@@ -492,13 +562,16 @@ export class Service {
   paused = (app: string) => {
     if (app === 'douyin' && this.s.douyinBrowserBackend === 'chrome' && !chromeSession(this.ctx).browser.available().ok)
       return true
-    const x = this.platform(app).guard.status()
+    const x = this.platform(app).guard.status(trafficHeaders(this.kv, app))
     return !!(x.manual.length || (x.pausedUntil && x.pausedUntil > this.rt.now()))
   }
-  pending() {
-    return Object.keys(apps).some(
-      (app) => !(app === 'douyin' && this.ownerViaChannel) && dmOf(scopedKv(this.kv, app)).pendingReplies.length,
+  pendingDm(app: string, messageId?: string) {
+    return pruneDmReplies(scopedKv(this.kv, app), this.rt.now()).pendingReplies.some(
+      (reply) => messageId === undefined || reply.userMessageId === messageId,
     )
+  }
+  pending() {
+    return enabledApps(this.s).some((app) => this.pendingDm(app))
   }
   log = (error: unknown) => {
     if (error instanceof BrowserSkippedError) return
@@ -525,18 +598,48 @@ export class Service {
   }
   async trigger(chatId: string, instruction: string, signal = this.signal) {
     signal?.throwIfAborted()
-    await this.ctx.host.waitIdle(chatId, 120000)
+    await this.ctx.host.waitIdle(chatId, 120000, signal)
     signal?.throwIfAborted()
-    const before = new Set(this.ctx.host.getChatInfo(chatId, 100).messages.map((m) => m.id))
-    this.ctx.host.trigger(chatId, { instruction })
-    await this.ctx.host.waitIdle(chatId, 120000)
-    signal?.throwIfAborted()
-    const message = this.ctx.host
-      .getChatInfo(chatId, 100)
-      .messages.filter((m) => m.role === 'assistant' && !before.has(m.id) && m.status !== 'error')
-      .at(-1)
-    if (!message) throw new RouteError('GENERATION', t('未找到本轮角色回复'))
-    return { id: message.id, text: message.content }
+
+    // 当前分支可能在完成后变化，只读取这次任务保存的回复。
+    const replies = new Map<string, MessageDTO>()
+    const completion = Promise.withResolvers<void>()
+    let failed = false
+    let timedOut = false
+    const onEvent = (event: GenerateEvent) => {
+      if (event.type === 'complete') completion.resolve()
+      else if (event.type === 'error') failed = true
+      else if ((event.type === 'done' || event.type === 'message') && event.message.chatId === chatId) {
+        const message = event.message
+        if (message.role === 'assistant' && (event.type === 'done' || replies.has(message.id)))
+          replies.set(message.id, message)
+      }
+    }
+    const abort = () => completion.resolve()
+    signal?.addEventListener('abort', abort, { once: true })
+    const timer = setTimeout(() => {
+      timedOut = true
+      completion.resolve()
+    }, 120000)
+    let unsubscribe: (() => void) | undefined
+    try {
+      const stopListening = this.ctx.host.trigger(chatId, { instruction, onEvent })
+      if (typeof stopListening !== 'function')
+        throw new RouteError('GENERATION', t('当前 NoBot 版本无法确认本轮角色回复，请升级后重试'))
+      unsubscribe = stopListening
+      await completion.promise
+      signal?.throwIfAborted()
+      if (timedOut) throw new RouteError('GENERATION', t('等待本轮角色回复超时'))
+      const saved = [...replies.values()]
+      const message = saved.findLast((reply) => !reply.meta.toolCalls?.length && reply.content.trim())
+      if (failed || saved.some((reply) => reply.status !== 'done' || reply.meta.error) || !message)
+        throw new RouteError('GENERATION', t('未找到本轮角色回复'))
+      return { id: message.id, text: message.content }
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      unsubscribe?.()
+    }
   }
   ports(app: string, signal = this.signal): DayPorts {
     const { adapter, guard } = this.platform(app)
@@ -545,6 +648,7 @@ export class Service {
       displayText: (text) => toDisplayText(text, { knownNames: [], speaker: 'none' }),
       adapter,
       guard,
+      trafficHeaders: () => trafficHeaders(this.kv, app),
       kv: scopedKv(this.kv, app),
       settings: scopedSettings(this.s, app, this.kv.get<OwnerCache>('douyin-owner')),
       loggedIn: () => this.loggedIn(app),
@@ -632,13 +736,13 @@ export class Service {
     if (this.running || this.dmBusy || this.replying) throw new RouteError('BUSY', t('正在运行，请稍后重试'))
     if (!this.s.characterId || !listCharacters().some((c) => c.id === this.s.characterId))
       throw new RouteError('CHARACTER', t('请先选择角色'))
+    if (!enabledApps(this.s).some((app) => this.loggedIn(app)))
+      throw new RouteError('INVALID', t('尚未登录，今日浏览已跳过'))
     try {
       this.home()
     } catch {
       throw new RouteError('HOME', t('会话不属于所选角色'))
     }
-    if (!enabledApps(this.s).some((app) => this.loggedIn(app)))
-      throw new RouteError('INVALID', t('尚未登录，今日浏览已跳过'))
     // wake 在首次 await 前占用同一运行锁，路由返回后 tick 和重复请求也不能插入。
     void this.wake(true).catch(this.log)
   }
@@ -648,10 +752,13 @@ export class Service {
     let plan: import('./core/plan').Plan | undefined
     try {
       signal?.throwIfAborted()
-      const now = this.rt.now()
-      plan = makePlan(this.s, this.kv.get('plan'), now, this.rt.random)
-      this.kv.set('plan', plan)
-      if (!force && (plan.action === 'done' || plan.atMs! > now)) return false
+      const plannedAt = this.rt.now()
+      if (!force && (!this.s.characterId || !enabledApps(this.s).length)) return false
+      plan = makePlan(this.s, this.kv.get('plan'), plannedAt, this.rt.random)
+      if (!force) {
+        this.kv.set('plan', plan)
+        if (plan.action === 'done' || plan.atMs! > plannedAt) return false
+      }
       const home = await this.home()
       if (this.ctx.host.isGenerating(home)) {
         try {
@@ -660,6 +767,13 @@ export class Service {
           return false
         }
       }
+      signal?.throwIfAborted()
+      if (plan.action !== 'skip' || force) {
+        if (this.s.douyinEnabled) await this.ensureDouyinOwner()
+        signal?.throwIfAborted()
+      }
+      const now = this.rt.now()
+      if (!force && (plan.slotEndsAt ?? plan.endsAt ?? Infinity) <= now) return false
       if (force) {
         const h = historyOf(plan, now)
         plan = {
@@ -673,7 +787,6 @@ export class Service {
           endsAt: now + 1,
         }
       }
-      if (this.s.douyinEnabled) await this.ensureDouyinOwner()
       try {
         await runDay(
           this.mainPorts(signal),
@@ -681,13 +794,13 @@ export class Service {
           this.rt.random,
           signal,
           force ? 'wake' : plan.action === 'skip' ? 'skip' : 'wake',
+          propagateError,
         )
       } finally {
-        this.kv.set('plan', completePlan(plan, this.rt.now()))
+        this.kv.set('plan', completePlan(plan, now))
       }
       return true
     } catch (error) {
-      if (plan?.windowKey && !plan.fired) this.kv.set('plan', completePlan(plan, this.rt.now()))
       this.log(error)
       this.kv.set('lastRun', {
         at: this.rt.now(),
@@ -724,34 +837,40 @@ export class Service {
         this.running = false
       }
     }
-    await this.pollDm(taskSignal)
   }
   async pollDm(taskSignal?: AbortSignal) {
-    this.registerChannel()
-    await this.channel?.ensure()
-    this.channel?.sync()
-    // 绑定只操作宿主数据，登录离线也应重试，不必等待读取私信。
-    if (this.channel) await this.channel.bindOwner()
     const signal = this.roundSignal(taskSignal)
     if (signal?.aborted || this.running || this.dmBusy || this.replying) return
     this.dmBusy = true
     // 一个平台出错不影响其他平台本轮轮询；全部跑完后再把第一个错误交给宿主记录 failed
     let failure: unknown
     try {
+      let channelReady = true
+      try {
+        this.registerChannel()
+        if (this.channel) {
+          await this.channel.ensure()
+          signal?.throwIfAborted()
+          this.channel.sync()
+          // 登录离线时也可先向宿主确认现有绑定。
+          await this.channel.bindOwner()
+        }
+      } catch (error) {
+        signal?.throwIfAborted()
+        channelReady = false
+        failure = error
+        this.log(error)
+      }
       for (const app of enabledApps(this.s)) {
         signal?.throwIfAborted()
         if (!this.loggedIn(app)) continue
         try {
           if (app === 'douyin') await this.ensureDouyinOwner()
           if (!(app === 'douyin' && this.ownerViaChannel)) await pollOwnerDm(this.dmPorts(app), this.rt.now(), signal)
-          if (app === 'douyin') await this.channel?.poll(signal)
+          if (app === 'douyin' && channelReady) await this.channel?.poll(signal)
           signal?.throwIfAborted()
           // 待回复私信只阻止所属平台的公开互动。
-          if (
-            (!(app === 'douyin' && this.ownerViaChannel) && dmOf(scopedKv(this.kv, app)).pendingReplies.length) ||
-            this.replying
-          )
-            continue
+          if (this.pendingDm(app) || this.replying) continue
           await pollComments(this.socialPorts(app, signal), this.rt.now(), signal)
           signal?.throwIfAborted()
           await pollLive(this.socialPorts(app, signal), this.rt.now(), signal)
@@ -771,35 +890,51 @@ export class Service {
     if (this.running) throw new RouteError('BUSY', t('正在运行，请稍后重试'))
     const now = this.rt.now(),
       h = historyOf(this.kv.get('plan'), now)
-    this.kv.set('plan', { ...h, action: 'done', fired: true, wakes: maxWakes(this.s), reason: t('今天已手动休息') })
+    this.kv.set('plan', { ...h, action: 'done', fired: true, manualRestDate: dayOf(now), reason: t('今天已手动休息') })
   }
   account(app: string) {
     return this.kv.get<AccountInfo>(`account:${app}`) ?? null
   }
+  async loginOperation<T>(app: string, work: () => Promise<T>) {
+    return this.exclusive(async () => {
+      // 抖音查验登录前会更改浏览器里的账号，须先保护仍在等旧账号回复的私信。
+      if (app === 'douyin' && this.pendingDm(app)) throw new RouteError('PENDING_DM', t('仍有待回复私信，不能切换账号'))
+      return work()
+    })
+  }
   storeLogin(app: string, credentials: Record<string, string>, account: AccountInfo) {
-    if (this.running || this.dmBusy || this.replying) throw new RouteError('BUSY', t('正在运行，请稍后重试'))
     const old = this.account(app)
-    if (old?.id !== account.id && dmOf(scopedKv(this.kv, app)).pendingReplies.length)
+    if (old?.id !== account.id && this.pendingDm(app))
       throw new RouteError('PENDING_DM', t('仍有待回复私信，不能切换账号'))
     this.kv.set(`cred:${app}`, credentials)
     this.kv.set(`account:${app}`, { id: account.id, name: account.name })
-    if (old?.id !== account.id) {
-      for (const key of PER_APP) scopedKv(this.kv, app).delete(key)
+    if (old?.id !== account.id) this.resetPlatformAccount(app)
+  }
+  private resetPlatformAccount(app: string) {
+    const kv = scopedKv(this.kv, app)
+    for (const key of PER_APP) kv.delete(key)
+    if (app === 'douyin') {
+      kv.delete('channel-owner')
+      kv.delete('channel-cursors')
+      kv.delete('channel-groups-since')
+      if (this.s.douyinEnabled && this.s.douyinChannel) kv.set('channel-since', this.rt.now())
+      else kv.delete('channel-since')
     }
   }
   async logout(app: string) {
-    if (this.running || this.dmBusy || this.replying || dmOf(scopedKv(this.kv, app)).pendingReplies.length)
-      throw new RouteError('BUSY', t('仍有待回复私信，不能切换账号'))
-    await this.platform(app).adapter.logout?.()
-    this.kv.delete(`cred:${app}`)
-    this.kv.delete(`account:${app}`)
-    for (const key of PER_APP) scopedKv(this.kv, app).delete(key)
+    await this.exclusive(async () => {
+      if (this.pendingDm(app)) throw new RouteError('BUSY', t('仍有待回复私信，不能切换账号'))
+      await this.platform(app).adapter.logout?.()
+      this.kv.delete(`cred:${app}`)
+      this.kv.delete(`account:${app}`)
+      this.resetPlatformAccount(app)
+    })
   }
   appStatus(app: string, now: number) {
     const p = this.ports(app),
       s = p.settings,
       dm = dmOf(p.kv),
-      traffic = p.guard.status()
+      traffic = p.guard.status(trafficHeaders(this.kv, app))
     const comments = commentsOf(p)
     const browser = BROWSER_APPS.has(app) ? browserSession(this.ctx).installer.status() : null
     return {
@@ -885,7 +1020,8 @@ export class Service {
     try {
       sharing = shareState(this.kv, s, now)
     } catch {}
-    const plan = makePlan(s, this.kv.get('plan'), now, this.rt.random)
+    const config = enabledApps(s).length ? s : { ...s, windows: [] }
+    const plan = makePlan(config, this.kv.get('plan'), now, this.rt.random)
     this.kv.set('plan', plan)
     return {
       apps: Object.keys(apps).map((app) => ({
@@ -923,7 +1059,7 @@ export class Service {
       today: {
         pendingJudge: ownerMessages(this.kv).length,
         wakes: plan.wakes,
-        maxWakes: maxWakes(s),
+        maxWakes: maxWakes(config),
         ...sharing,
         shareVia: s.shareVia,
         douyinShareVia: s.douyinShareVia,
@@ -972,8 +1108,23 @@ const extension: Extension = {
     return settingsSchema()
   },
   startBackground(ctx, signal) {
+    if (signal.aborted) return
     const svc = service(ctx)
+    const root = userRoot()
     svc.signal = signal
+    let timer: ReturnType<typeof setInterval> | undefined
+    let dmTimer: ReturnType<typeof setInterval> | undefined
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearInterval(timer)
+        clearInterval(dmTimer)
+        // 用户库关闭时可能没有请求上下文，启动时记录所属目录。
+        if (svc.signal !== signal) return
+        closeUserBrowsers(root)
+      },
+      { once: true },
+    )
     svc.channel = undefined
     svc.channelHandle = undefined
     svc.registerChannel()
@@ -981,8 +1132,6 @@ const extension: Extension = {
       const p = svc.ports(app)
       p.kv.set('live', { ...liveOf(p), seeded: false, nextAt: 0 })
     }
-    let timer: ReturnType<typeof setInterval> | undefined
-    let dmTimer: ReturnType<typeof setInterval> | undefined
     const tick = () => {
       service(ctx)
       void svc.tick().catch(svc.log)
@@ -1023,30 +1172,16 @@ const extension: Extension = {
       }, 15000)
       dmTimer.unref()
     }
-    signal.addEventListener(
-      'abort',
-      () => {
-        clearInterval(timer)
-        clearInterval(dmTimer)
-        const chrome = chromeSessions.get(userRoot())
-        chrome?.bridge.close()
-        if (chrome) void chrome.browser.close()
-        chromeSessions.delete(userRoot())
-      },
-      { once: true },
-    )
-    if (!ctx.tasks?.register) tick()
+    if (!ctx.tasks?.register) {
+      tick()
+      void svc.pollDm().catch(svc.log)
+    }
   },
-  dispose() {
+  async dispose() {
     for (const svc of services.values()) svc.signal = AbortSignal.abort()
     services.clear()
-    for (const { browser } of browsers.values()) void browser.close()
-    browsers.clear()
-    for (const { bridge, browser } of chromeSessions.values()) {
-      bridge.close()
-      void browser.close()
-    }
-    chromeSessions.clear()
+    for (const root of new Set([...browsers.keys(), ...chromeSessions.keys()])) closeUserBrowsers(root)
+    await Promise.all(browserClosures.values())
   },
   hooks: {
     beforePrompt(input, ctx) {
@@ -1082,10 +1217,13 @@ const extension: Extension = {
       const latestUser = svc.pending()
         ? ctx.host.getChatInfo(home.chatId, 1000).messages.findLast((message) => message.role === 'user')
         : undefined
-      const dmPrompt =
-        latestUser?.meta.noRelay === true
-          ? "The owner's latest message came from a Douyin direct message. Your reply will be sent back there as plain text only: don't send stickers or use chat-channel-only tools, and keep it like a short DM. Write in the same language as the conversation."
-          : ''
+      const dmApp =
+        latestUser?.meta.noRelay === true && latestUser.id
+          ? enabledApps(svc.s).find((app) => svc.pendingDm(app, latestUser.id))
+          : undefined
+      const dmPrompt = dmApp
+        ? `The owner's latest message came from a ${dmApp === 'douyin' ? 'Douyin' : 'Bilibili'} direct message. Your reply will be sent back there as plain text only: don't send stickers or use chat-channel-only tools, and keep it like a short DM. Write in the same language as the conversation.`
+        : ''
       const content = [memory, input.preset.samplers.functionCalling ? homeToolPrompt(svc) : '', dmPrompt]
         .filter(Boolean)
         .join('\n')
@@ -1122,16 +1260,25 @@ const extension: Extension = {
           svc.log(e)
         }
       }
-      if (event.message.role === 'assistant' && event.message.status !== 'error' && svc.pending() && !svc.replying) {
+      if (
+        event.message.role === 'assistant' &&
+        event.message.status === 'done' &&
+        !event.message.meta.error &&
+        svc.pending() &&
+        !svc.replying
+      ) {
+        const signal = svc.signal
+        if (signal?.aborted) return
         svc.replying = true
         try {
           // 回复只回到来源：只有在回那条等待中的私信时才发回私信。
           const replyTo = nearestUserMessage(ctx, event.message)
+          if (!replyTo) return
           for (const app of enabledApps(svc.s)) {
-            if (app === 'douyin' && svc.ownerViaChannel) continue
-            if (dmOf(scopedKv(svc.kv, app)).pendingReplies.length) {
+            if (svc.pendingDm(app, replyTo)) {
               if (app === 'douyin') await svc.ensureDouyinOwner()
-              await replyOwnerDm(svc.dmPorts(app), event.message.content, svc.rt.now(), svc.signal, replyTo)
+              if (signal?.aborted) return
+              await replyOwnerDm(svc.dmPorts(app), event.message.content, svc.rt.now(), signal, replyTo)
             }
           }
         } finally {
@@ -1144,7 +1291,9 @@ const extension: Extension = {
     const stickers = stickerTools(ctx, service(ctx))
     if (visitorTurn(ctx))
       return [
-        ...homeTools(service(ctx)).filter((tool) => ['douyin_watch', 'douyin_search'].includes(tool.name)),
+        ...homeTools(service(ctx), { recordWatch: false }).filter((tool) =>
+          ['douyin_watch', 'douyin_search'].includes(tool.name),
+        ),
         ...stickers,
       ]
     const svc = service(ctx),
@@ -1180,7 +1329,7 @@ const extension: Extension = {
           svc.skip()
           return t('今天已手动休息')
         }
-        await svc.ensureDouyinOwner()
+        if (svc.s.douyinEnabled) await svc.ensureDouyinOwner()
         const status = svc.status()
         return t('应用生活：{app}，今日分享 {shares}/{cap}，待审草稿 {drafts}，直播 {live}', {
           app: status.apps
@@ -1286,19 +1435,12 @@ const extension: Extension = {
     })
     app.post('/chrome/focus', async (c) => c.json(await chromeSession(ctx).browser.focus()))
     app.post('/browser/install', (c) => {
-      const { installer, browser } = browserSession(ctx)
-      void installer
-        .start(c.req.query('fonts') === '1')
-        .then(async (success) => {
-          if (success) await browser.close()
-        })
-        .catch(() => {})
+      const { installer } = browserSession(ctx)
+      void installer.start(c.req.query('fonts') === '1')
       return c.json({ ok: true })
     })
     app.delete('/browser', async (c) => {
-      const { browser, installer } = browserSession(ctx)
-      await browser.close()
-      installer.remove()
+      await browserSession(ctx).installer.remove()
       return c.json({ ok: true })
     })
     app.get('/browser/screenshot', async (c) => {
@@ -1320,50 +1462,68 @@ const extension: Extension = {
     })
     app.get('/status', async (c) => {
       const s = svc()
-      await s.ensureDouyinOwner()
+      if (s.s.douyinEnabled) await s.ensureDouyinOwner()
       return c.json(s.status())
     })
     app.post('/login/:app/qr', async (c) => {
       const s = svc(),
-        qr = await s.platform(c.req.param('app')).adapter.login.startQr()
+        app = c.req.param('app')
+      const qr = await s.loginOperation(app, () => s.platform(app).adapter.login.startQr())
       return c.json({ token: qr.token, svg: qrSvg(qr.url), expiresAt: qr.expiresAt })
     })
     app.get('/login/:app/qr/:token', async (c) => {
       const s = svc(),
-        result = await s.platform(c.req.param('app')).adapter.login.pollQr(c.req.param('token'))
+        app = c.req.param('app')
+      const result = await s.loginOperation(app, async () => {
+        const result = await s.platform(app).adapter.login.pollQr(c.req.param('token'))
+        if (result.status === 'confirmed') s.storeLogin(app, result.credentials, result.account)
+        return result
+      })
       if (result.status === 'confirmed') {
-        s.storeLogin(c.req.param('app'), result.credentials, result.account)
         return c.json({ status: result.status, account: { id: result.account.id, name: result.account.name } })
       }
       return c.json(result.status === 'verify' ? result : { status: result.status })
     })
     app.post('/login/:app/sms/send', async (c) => {
-      const login = svc().platform(c.req.param('app')).adapter.login
+      const s = svc(),
+        app = c.req.param('app'),
+        login = s.platform(app).adapter.login
       if (!login.sms) throw new RouteError('UNSUPPORTED', t('此平台不支持短信验证'))
-      return c.json(await login.sms.send())
+      const sms = login.sms
+      return c.json(await s.loginOperation(app, () => sms.send()))
     })
     app.post('/login/:app/sms', async (c) => {
       const s = svc(),
-        login = s.platform(c.req.param('app')).adapter.login
-      if (!login.sms) throw new RouteError('UNSUPPORTED', t('此平台不支持短信验证'))
+        app = c.req.param('app'),
+        sms = s.platform(app).adapter.login.sms
+      if (!sms) throw new RouteError('UNSUPPORTED', t('此平台不支持短信验证'))
       const body: unknown = await c.req.json()
       if (!body || typeof body !== 'object' || !('code' in body) || typeof body.code !== 'string')
         throw new RouteError('INVALID', t('验证码必须是 4–8 位数字'))
-      const { credentials, account } = await login.sms.submit(body.code)
-      s.storeLogin(c.req.param('app'), credentials, account)
+      const code = body.code
+      const account = await s.loginOperation(app, async () => {
+        const result = await sms.submit(code)
+        s.storeLogin(app, result.credentials, result.account)
+        return result.account
+      })
       return c.json({ account: { id: account.id, name: account.name }, loggedIn: true })
     })
     app.post('/login/:app/browser', async (c) => {
       const s = svc(),
-        login = s.platform(c.req.param('app')).adapter.login
+        app = c.req.param('app'),
+        login = s.platform(app).adapter.login
       if (!login.fromBrowser) throw new RouteError('UNSUPPORTED', t('此平台不支持读取浏览器登录态'))
-      const { credentials, account } = await login.fromBrowser()
-      s.storeLogin(c.req.param('app'), credentials, account)
+      const account = await s.loginOperation(app, async () => {
+        const result = await login.fromBrowser!()
+        s.storeLogin(app, result.credentials, result.account)
+        return result.account
+      })
       return c.json({ account: { id: account.id, name: account.name }, loggedIn: true })
     })
     app.post('/login/:app/manual', async (c) => {
       const s = svc(),
-        adapter = s.platform(c.req.param('app')).adapter,
+        app = c.req.param('app'),
+        adapter = s.platform(app).adapter,
         body = await c.req.json<{ fields: Record<string, string> }>()
       if (
         !body.fields ||
@@ -1371,9 +1531,12 @@ const extension: Extension = {
         !Object.values(body.fields).every((v) => typeof v === 'string')
       )
         throw new RouteError('INVALID', t('登录字段格式无效'))
-      const credentials = adapter.login.fromManual(body.fields),
-        account = await adapter.login.check(credentials)
-      s.storeLogin(c.req.param('app'), credentials, account)
+      const account = await s.loginOperation(app, async () => {
+        const credentials = adapter.login.fromManual(body.fields)
+        const account = await adapter.login.check(credentials)
+        s.storeLogin(app, credentials, account)
+        return account
+      })
       return c.json({ account: { id: account.id, name: account.name }, loggedIn: true })
     })
     app.post('/logout/:app', async (c) => {
@@ -1390,11 +1553,8 @@ const extension: Extension = {
     })
     app.post('/traffic/:app/resume', (c) => {
       const s = svc(),
-        id = c.req.param('app'),
-        cred = s.kv.get<Record<string, string>>(`cred:${id}`)
-      s.platform(id).guard.resume({
-        cookie: id === 'douyin' ? `sessionid=${cred?.sessionid ?? ''}` : `SESSDATA=${cred?.SESSDATA ?? ''}`,
-      })
+        id = c.req.param('app')
+      s.platform(id).guard.resume(trafficHeaders(s.kv, id))
       return c.json({ ok: true })
     })
     app.post('/traffic/:app/resolve', async (c) => {

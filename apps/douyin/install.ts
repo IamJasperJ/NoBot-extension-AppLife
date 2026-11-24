@@ -4,13 +4,23 @@
  * 容器里是普通用户（没有 root），所以不走 apt install，而是：
  *   ① 用一套放在数据目录里的 apt 状态目录做 update（不碰系统的 /var/lib/apt）
  *   ② 模拟安装 chromium，拿到「系统里还缺的包」清单
- *   ③ apt-get download 下载这些 .deb，dpkg-deb -x 解压到 <数据目录>/app-life/browser/root
- *   ④ 用 ldd 检查没有缺失的动态库，写 ready.json
+ *   ③ apt-get download 下载这些 .deb，dpkg-deb -x 解压到组件目录旁的临时目录
+ *   ④ 验证依赖和可执行文件，写 ready.json 后替换正式组件
  * 启动时用 LD_LIBRARY_PATH 指向解压目录。装在数据卷里，重建容器不会丢。
  * 不是 Debian 系（比如本机 macOS 开发）时，直接找系统里已装的 Chrome / Chromium。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
 import { t } from '../../i18n'
 
 /** 依赖链会带进来、但无头浏览器用不到的大包：先不下载，ldd 发现缺库再全量重来。 */
@@ -90,72 +100,153 @@ const TRIPLET: Record<string, string> = {
   amd64: 'x86_64-linux-gnu',
 }
 
-type Shell = (cmd: string[], cwd: string, timeoutMs: number, env?: Record<string, string>) => Promise<string>
+type Shell = (
+  cmd: string[],
+  cwd: string,
+  timeoutMs: number,
+  env: Record<string, string>,
+  signal: AbortSignal,
+) => Promise<string>
+
+function replaceDirectory(from: string, to: string, backup: string) {
+  const previous = existsSync(to)
+  if (previous) renameSync(to, backup)
+  try {
+    renameSync(from, to)
+  } catch (error) {
+    if (previous) renameSync(backup, to)
+    throw error
+  }
+}
+
+interface Ready {
+  triplet: string
+  version: string
+  fonts?: boolean
+}
+
+function installedEnv(base: string, triplet: string): Record<string, string> {
+  const root = join(base, 'root')
+  return {
+    FONTCONFIG_FILE: join(base, 'fonts.conf'),
+    LD_LIBRARY_PATH: [`${root}/usr/lib/${triplet}`, `${root}/lib/${triplet}`, `${root}/usr/lib/chromium`].join(':'),
+  }
+}
+
+const binaryAt = (base: string) => join(base, 'root/usr/lib/chromium/chromium')
+const markerAt = (base: string) => join(base, 'ready.json')
 
 export function createInstaller(
   dir: () => string,
-  overrides: { sh?: Shell; which?: typeof Bun.which; sources?: () => string[] } = {},
+  options: {
+    sh?: Shell
+    which?: typeof Bun.which
+    sources?: () => string[]
+    beforeStart?: () => Promise<void> | undefined
+    stopBrowser?: () => Promise<void>
+  } = {},
 ) {
   let progress: InstallState = { state: 'idle', step: '', at: 0 }
-  const root = () => join(dir(), 'root')
-  const marker = () => join(dir(), 'ready.json')
-  function installedEnv(): Record<string, string> {
-    let triplet = 'x86_64-linux-gnu'
+  let componentChange: Promise<void> | undefined
+  function ready(base: string): Ready | null {
     try {
-      triplet = String(JSON.parse(readFileSync(marker(), 'utf8')).triplet || triplet)
-    } catch {}
-    const r = root()
-    return {
-      FONTCONFIG_FILE: join(dir(), 'fonts.conf'),
-      LD_LIBRARY_PATH: [`${r}/usr/lib/${triplet}`, `${r}/lib/${triplet}`, `${r}/usr/lib/chromium`].join(':'),
+      const installed: unknown = JSON.parse(readFileSync(markerAt(base), 'utf8'))
+      if (
+        !installed ||
+        typeof installed !== 'object' ||
+        !('version' in installed) ||
+        typeof installed.version !== 'string' ||
+        !installed.version.trim() ||
+        !('triplet' in installed) ||
+        typeof installed.triplet !== 'string' ||
+        !Object.values(TRIPLET).includes(installed.triplet) ||
+        !existsSync(binaryAt(base))
+      )
+        return null
+      return {
+        ...installed,
+        triplet: installed.triplet,
+        version: installed.version,
+        fonts: 'fonts' in installed && installed.fonts === true,
+      }
+    } catch {
+      return null
     }
   }
   /** 找可用的浏览器：环境变量 > 已安装的 > 系统自带的；都没有返回 null。 */
   function find(): BrowserBinary | null {
     const env = process.env.CHROMIUM_PATH
     if (env && existsSync(env)) return { path: env, env: {}, source: 'env' }
-    const installed = join(root(), 'usr/lib/chromium/chromium')
-    if (existsSync(marker()) && existsSync(installed))
-      return { path: installed, env: installedEnv(), source: 'installed' }
+    const base = dir()
+    const installed = ready(base)
+    if (installed) return { path: binaryAt(base), env: installedEnv(base, installed.triplet), source: 'installed' }
     for (const path of SYSTEM_BROWSERS) if (existsSync(path)) return { path, env: {}, source: 'system' }
     return null
   }
-  async function defaultSh(cmd: string[], cwd: string, timeoutMs: number, env: Record<string, string> = {}) {
-    const proc = Bun.spawn(cmd, { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ...env } })
-    const timer = setTimeout(() => proc.kill(), timeoutMs)
+  const defaultSh: Shell = async (cmd, cwd, timeoutMs, env, signal) => {
+    signal.throwIfAborted()
+    const detached = process.platform !== 'win32'
+    const proc = Bun.spawn(cmd, { cwd, stdout: 'pipe', stderr: 'pipe', detached, env: { ...process.env, ...env } })
+    const stop = () => {
+      if (detached) {
+        try {
+          // apt 的下载子进程也不能在停用或超时后继续写临时目录。
+          process.kill(-proc.pid, 'SIGKILL')
+          return
+        } catch {}
+      }
+      proc.kill('SIGKILL')
+    }
+    const timer = setTimeout(stop, timeoutMs)
+    signal.addEventListener('abort', stop, { once: true })
     try {
       const [out, err, code] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
         proc.exited,
       ])
+      signal.throwIfAborted()
       if (code !== 0) throw new Error(`${cmd[0]}: ${(err || out).trim().split('\n').slice(-3).join(' ')}`)
       return out
     } finally {
       clearTimeout(timer)
+      signal.removeEventListener('abort', stop)
     }
   }
-  const sh = overrides.sh ?? defaultSh
-  let task: Promise<boolean> | null = null
-  function fontsMissing() {
+  let task: { controller: AbortController; done: Promise<boolean> } | null = null
+  let removal: Promise<void> | undefined
+  async function withBrowserStopped(write: () => void | Promise<void>, signal?: AbortSignal) {
+    signal?.throwIfAborted()
+    const finish = Promise.withResolvers<void>()
+    componentChange = finish.promise
     try {
-      return JSON.parse(readFileSync(marker(), 'utf8')).fonts !== true
-    } catch {
-      return true
+      await options.stopBrowser?.()
+      signal?.throwIfAborted()
+      await write()
+    } finally {
+      componentChange = undefined
+      finish.resolve()
     }
   }
-  async function run(fontsOnly: boolean) {
-    const base = dir()
+  async function run(base: string, destination: string, backup: string, fontsOnly: boolean, signal: AbortSignal) {
+    const previous = fontsOnly ? ready(destination) : null
+    if (fontsOnly && !previous) throw new Error(t('请先安装浏览器组件'))
+    const root = join(base, 'root')
+    const sh = async (cmd: string[], cwd: string, timeoutMs: number, env: Record<string, string> = {}) => {
+      signal.throwIfAborted()
+      const result = await (options.sh ?? defaultSh)(cmd, cwd, timeoutMs, env, signal)
+      signal.throwIfAborted()
+      return result
+    }
     const step = (text: string) => {
+      signal.throwIfAborted()
       progress = { state: 'running', step: text, at: Date.now() }
     }
-    if (!(overrides.which ?? Bun.which)('apt-get') || !(overrides.which ?? Bun.which)('dpkg-deb'))
+    if (!(options.which ?? Bun.which)('apt-get') || !(options.which ?? Bun.which)('dpkg-deb'))
       throw new Error(t('当前系统不是 Debian / Ubuntu，无法自动安装；请自行安装 Chrome 或 Chromium'))
     const arch = (await sh(['dpkg', '--print-architecture'], '/', 10000)).trim()
     const triplet = TRIPLET[arch]
     if (!triplet) throw new Error(t('不支持的 CPU 架构：{arch}', { arch }))
-    // 每次从干净目录开始，避免上次中断留下的半截文件
-    if (!fontsOnly) rmSync(base, { recursive: true, force: true })
     for (const sub of ['apt/lists/partial', 'apt/cache/archives/partial', 'debs', 'root'])
       mkdirSync(join(base, sub), { recursive: true })
     const apt = [
@@ -176,7 +267,8 @@ export function createInstaller(
     try {
       await sh(['apt-get', ...apt, 'update'], base, 300000)
     } catch (error) {
-      const hosts = sourceHosts((overrides.sources ?? readSources)())
+      signal.throwIfAborted()
+      const hosts = sourceHosts((options.sources ?? readSources)())
       if (!(process.env.http_proxy || process.env.HTTP_PROXY) || !hosts.length) throw error
       step(t('经代理更新失败，改为直连软件源'))
       aptEnv = directEnv(process.env, hosts)
@@ -184,27 +276,35 @@ export function createInstaller(
     }
     let fonts = false
     let warning = ''
+    const fontsAt = (dir: string) => join(dir, 'root/usr/share/fonts')
     const installFonts = async () => {
       step(t('安装中文字体'))
       const debs = join(base, 'font-debs')
       mkdirSync(debs, { recursive: true })
       try {
         for (const name of ['fonts-wqy-microhei', 'fonts-noto-cjk']) {
+          // 回退到另一字体包时，不能把上一次失败留下的文件也拿去解包。
+          const downloads = join(debs, name)
+          mkdirSync(downloads, { recursive: true })
+          const download = () => sh(['apt-get', ...apt, 'download', name], downloads, 300000, aptEnv)
           try {
-            await sh(['apt-get', ...apt, 'download', name], debs, 300000, aptEnv)
+            await download()
           } catch {
-            const hosts = sourceHosts((overrides.sources ?? readSources)())
+            signal.throwIfAborted()
+            const hosts = sourceHosts((options.sources ?? readSources)())
             if ((process.env.http_proxy || process.env.HTTP_PROXY) && hosts.length) {
               aptEnv = directEnv(process.env, hosts)
               try {
-                await sh(['apt-get', ...apt, 'download', name], debs, 300000, aptEnv)
+                await download()
               } catch {
+                signal.throwIfAborted()
                 continue
               }
             } else continue
           }
-          for (const file of readdirSync(debs).filter((f) => f.endsWith('.deb')))
-            await sh(['dpkg-deb', '-x', join(debs, file), root()], base, 300000)
+          const packages = readdirSync(downloads).filter((file) => file.endsWith('.deb'))
+          if (!packages.length) continue
+          for (const file of packages) await sh(['dpkg-deb', '-x', join(downloads, file), root], base, 300000)
           fonts = true
           break
         }
@@ -215,9 +315,9 @@ export function createInstaller(
           `<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
-  <dir>${xml(join(root(), 'usr/share/fonts'))}</dir>
+  <dir>${xml(fontsAt(destination))}</dir>
   ${existsSync('/etc/fonts/fonts.conf') ? '<include ignore_missing="yes">/etc/fonts/fonts.conf</include>' : ''}
-  <cachedir>${xml(join(base, 'font-cache'))}</cachedir>
+  <cachedir>${xml(join(destination, 'font-cache'))}</cachedir>
 </fontconfig>
 `,
         )
@@ -226,12 +326,20 @@ export function createInstaller(
         rmSync(debs, { recursive: true, force: true })
       }
     }
-    if (fontsOnly) {
+    if (previous) {
+      if (existsSync(fontsAt(destination))) cpSync(fontsAt(destination), fontsAt(base), { recursive: true })
       await installFonts()
-      const previous = JSON.parse(readFileSync(marker(), 'utf8'))
-      writeFileSync(marker(), JSON.stringify({ ...previous, fonts }))
-      rmSync(join(base, 'apt'), { recursive: true, force: true })
-      rmSync(join(base, 'debs'), { recursive: true, force: true })
+      signal.throwIfAborted()
+      if (fonts) {
+        writeFileSync(markerAt(base), JSON.stringify({ ...previous, fonts: true }))
+        await withBrowserStopped(() => {
+          mkdirSync(dirname(fontsAt(destination)), { recursive: true })
+          mkdirSync(join(destination, 'font-cache'), { recursive: true })
+          replaceDirectory(fontsAt(base), fontsAt(destination), backup)
+          renameSync(join(base, 'fonts.conf'), join(destination, 'fonts.conf'))
+          renameSync(markerAt(base), markerAt(destination))
+        }, signal)
+      }
       return warning
     }
     step(t('计算需要的组件'))
@@ -248,46 +356,67 @@ export function createInstaller(
       await sh(['apt-get', ...apt, 'download', ...packages], join(base, 'debs'), 1800000, aptEnv)
       step(t('解压浏览器组件'))
       for (const file of readdirSync(join(base, 'debs')).filter((f) => f.endsWith('.deb')))
-        await sh(['dpkg-deb', '-x', join(base, 'debs', file), root()], base, 300000)
+        await sh(['dpkg-deb', '-x', join(base, 'debs', file), root], base, 300000)
     }
     await extract(all.filter((name) => !SKIP.has(name)))
-    writeFileSync(marker(), JSON.stringify({ triplet, at: Date.now() }))
-    const binary = join(root(), 'usr/lib/chromium/chromium')
+    const binary = binaryAt(base)
+    const env = installedEnv(base, triplet)
     step(t('检查浏览器能否运行'))
-    let missing = (await sh(['ldd', binary], base, 60000, installedEnv())).includes('not found')
-    if (missing) {
+    let missing = (await sh(['ldd', binary], base, 60000, env)).includes('not found')
+    const skipped = all.filter((name) => SKIP.has(name))
+    if (missing && skipped.length) {
       // 跳过的包里其实有需要的库：把剩下的也装上
-      await extract(all.filter((name) => SKIP.has(name)))
-      missing = (await sh(['ldd', binary], base, 60000, installedEnv())).includes('not found')
+      await extract(skipped)
+      missing = (await sh(['ldd', binary], base, 60000, env)).includes('not found')
     }
     if (missing) throw new Error(t('浏览器缺少系统库，无法运行'))
-    const version = (await sh([binary, '--version'], base, 60000, installedEnv())).trim()
+    const version = (await sh([binary, '--version'], base, 60000, env)).trim()
+    if (!version) throw new Error(t('浏览器没有返回版本信息'))
     await installFonts()
+    signal.throwIfAborted()
     rmSync(join(base, 'debs'), { recursive: true, force: true })
     rmSync(join(base, 'apt'), { recursive: true, force: true })
-    writeFileSync(marker(), JSON.stringify({ triplet, version, fonts, at: Date.now() }))
+    writeFileSync(markerAt(base), JSON.stringify({ triplet, version, fonts, at: Date.now() }))
+    await withBrowserStopped(() => replaceDirectory(base, destination, backup), signal)
     return warning
   }
   return {
     find,
+    waitForComponentChange: () => componentChange,
     status(): InstallState & { browser: BrowserBinary | null; fontsMissing: boolean } {
       const browser = find()
-      return { ...progress, browser, fontsMissing: browser?.source === 'installed' && fontsMissing() }
+      return { ...progress, browser, fontsMissing: browser?.source === 'installed' && ready(dir())?.fonts !== true }
     },
     /** 后台安装；旧安装只补字体，重复调用共享同一个任务。 */
     start(fontsOnly = false): Promise<boolean> {
-      if (task) return task
-      const only = fontsOnly || (find()?.source === 'installed' && fontsMissing())
+      if (task) return task.done
+      if (removal) throw new Error(t('正在卸载浏览器组件，请稍后'))
+      const controller = new AbortController()
       progress = { state: 'running', step: t('准备安装'), at: Date.now() }
-      task = run(only)
+      const done = (async () => {
+        await options.beforeStart?.()
+        controller.signal.throwIfAborted()
+        const destination = dir()
+        const only = fontsOnly || (find()?.source === 'installed' && ready(destination)?.fonts !== true)
+        mkdirSync(dirname(destination), { recursive: true })
+        const workspace = mkdtempSync(`${destination}.install-`)
+        const backup = join(workspace, 'previous')
+        let published = false
+        try {
+          const warning = await run(join(workspace, 'next'), destination, backup, only, controller.signal)
+          published = true
+          return warning
+        } finally {
+          // 回滚也失败时保留旧文件，避免丢掉仍可恢复的安装。
+          if (published || !existsSync(backup)) rmSync(workspace, { recursive: true, force: true })
+        }
+      })()
         .then(
           (warning) => {
             progress = { state: 'done', step: warning, at: Date.now() }
             return true
           },
           (error: unknown) => {
-            // 补字体失败不能破坏仍然可用的浏览器。
-            if (!only) rmSync(marker(), { force: true })
             progress = {
               state: 'failed',
               step: progress.step,
@@ -300,12 +429,26 @@ export function createInstaller(
         .finally(() => {
           task = null
         })
-      return task
+      task = { controller, done }
+      return done
     },
-    remove() {
-      if (progress.state === 'running') throw new Error(t('正在安装，请稍后'))
-      rmSync(dir(), { recursive: true, force: true })
-      progress = { state: 'idle', step: '', at: Date.now() }
+    /** 停用时取消安装，并等待用户已经发起的卸载完成。 */
+    cancel() {
+      task?.controller.abort(new Error(t('浏览器安装已取消')))
+      return task?.done ?? removal
+    },
+    remove(): Promise<void> {
+      if (task) throw new Error(t('正在安装，请稍后'))
+      if (removal) return removal
+      const previousCleanup = options.beforeStart?.()
+      removal = withBrowserStopped(async () => {
+        await previousCleanup
+        rmSync(dir(), { recursive: true, force: true })
+        progress = { state: 'idle', step: '', at: Date.now() }
+      }).finally(() => {
+        removal = undefined
+      })
+      return removal
     },
   }
 }

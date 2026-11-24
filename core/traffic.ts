@@ -368,13 +368,16 @@ export function createTrafficGuard({
       }
       return flight.then((response) => response.clone())
     },
-    status() {
+    status(headers) {
       const s = read()
+      const account = headers === undefined ? undefined : identity(headers)
       return {
         pausedUntil: s.until,
         pauseReason: s.reason,
         streak: s.streak,
-        manual: Object.entries(s.manual).map(([account, v]) => ({ account, ...v })),
+        manual: Object.entries(s.manual)
+          .filter(([id]) => account === undefined || id === account)
+          .map(([account, v]) => ({ account, ...v })),
         accounts: s.accounts,
         unknownOperations: Object.values(s.operations).filter(
           (op) => op.status === 'unknown' || (op.status === 'pending' && runtime.now() - op.at > 60_000),

@@ -79,6 +79,7 @@ const en: Record<string, string> = {
   抖音需要验证: 'Douyin needs verification',
   '抖音需要验证，请在这个标签页里完成': 'Douyin needs verification. Please complete it in this tab.',
   '请在 Chrome 里登录抖音后点接回登录': 'Log in to Douyin in Chrome, then click Reconnect login.',
+  '抖音浏览器登录态已变化，请重新确认登录': 'The Douyin browser login changed. Confirm the login again.',
   'Chrome 里的抖音登录不受影响': 'Your Douyin login in Chrome is unaffected.',
 
   '抖音弹出了验证码，请在应用生活里「看一眼页面」处理，处理好后点「已处理」':
@@ -183,7 +184,11 @@ const en: Record<string, string> = {
   检查浏览器能否运行: 'Checking browser compatibility',
   '浏览器缺少系统库，无法运行': 'The browser cannot run because system libraries are missing',
   准备安装: 'Preparing installation',
+  请先安装浏览器组件: 'Install the browser components first',
+  浏览器没有返回版本信息: 'The browser did not report a version',
+  浏览器安装已取消: 'Browser installation was cancelled',
   '正在安装，请稍后': 'Installation in progress; please wait',
+  '正在卸载浏览器组件，请稍后': 'Browser component removal is in progress; please wait',
   '作品信息缺少有效 id': 'Work information has no valid id',
   '抖音作品 {id}': 'Douyin work {id}',
   '正在扫码登录抖音，请稍后': 'Douyin QR login in progress; please wait',
@@ -308,6 +313,8 @@ Object.assign(en, {
     "Couldn't find the owner's Douyin account; check the owner's Douyin sec_uid",
   '没有填主人账号，无法在评论区 @ 主人': 'Owner account is not set, so the comment cannot mention the owner',
   二维码内容超过版本十五的容量: 'QR content exceeds version 15 capacity',
+  今天休息: 'Resting today',
+  '部分私信已发送，请核查剩余内容：{reason}': 'Some direct messages were sent. Check the remaining content: {reason}',
   '今天休息，已写日记': 'Resting today; diary saved',
   今天可用窗口已结束或已经处理: 'All available windows today have ended or been used',
   今天可用窗口里已经排不下下一次: 'No window today has room for another wake with the required gap',
@@ -344,6 +351,9 @@ Object.assign(en, {
   日记: 'Diary',
   '最小醒来间隔（分钟）': 'Minimum wake gap (minutes)',
   未找到本轮角色回复: 'No character reply was found for this generation',
+  '当前 NoBot 版本无法确认本轮角色回复，请升级后重试':
+    'This NoBot version cannot identify the reply for this generation. Upgrade and try again.',
+  等待本轮角色回复超时: 'Timed out waiting for the reply from this generation',
   未登录: 'Not logged in',
   未知错误: 'Unknown error',
   未配置: 'Not configured',
@@ -362,6 +372,7 @@ Object.assign(en, {
   '信、日记和近 3 天的观看记录共用这个上限':
     'The latest letter, private diary, and viewing history from the last 3 days share this limit',
   活动窗口: 'Activity windows',
+  '浏览完成，已写信': 'Browsing finished; letter saved',
   '浏览完成，已写信和日记': 'Browsing finished; letter and diary saved',
   深读视频数: 'Videos to read deeply',
   登录字段格式无效: 'Invalid login fields',

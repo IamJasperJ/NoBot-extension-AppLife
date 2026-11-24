@@ -21,6 +21,7 @@ function setup(
   let controls = true
   let showHint = true
   let watch: Parameters<BrowserPage['on']>[1] = () => {}
+  const listeners = new Set<Parameters<BrowserPage['on']>[1]>()
   const actions: string[] = []
   let fallbackCalls = 0
   const hint = '短信已发送至 190******40'
@@ -60,8 +61,11 @@ function setup(
     },
     on: (_, fn) => {
       watch = fn
+      listeners.add(fn)
     },
-    off: () => {},
+    off: (_, fn) => {
+      listeners.delete(fn)
+    },
     keyboard: {
       insertText: async (text) => {
         actions.push(`insert:${text}`)
@@ -83,10 +87,12 @@ function setup(
     close: async () => {},
   }
   let checked = 0
+  let checkError: Error | undefined
   const api = {
     get: async () => {
       expect(login.active()).toBe(false)
       checked++
+      if (checkError) throw checkError
       return { user: { sec_uid: 'user', nickname: '昵称' } }
     },
   } as unknown as DouyinApi
@@ -97,6 +103,11 @@ function setup(
     actions,
     hint,
     checked: () => checked,
+    listeners,
+    cookies: browser.cookies,
+    rejectCheck: (error: Error) => {
+      checkError = error
+    },
     fallbackCalls: () => fallbackCalls,
     hideHint: () => {
       showHint = false
@@ -130,6 +141,32 @@ test('手动填写也接受插件导出的 Cookie JSON，只收抖音域名', ()
   expect(fromManual({ cookie: json })).toEqual({ sessionid: 'abc', ttwid: '1%7Cx' })
   expect(() => fromManual({ cookie: '[{"domain":".douyin.com","name":"x","value":"1"}]' })).toThrow('sessionid')
   expect(() => fromManual({ cookie: '[broken' })).toThrow('sessionid')
+})
+
+test('手动登录验证失败恢复原账号，Chrome 始终沿用浏览器里已登录的账号', async () => {
+  const failure = new Error('检查失败')
+  const f = setup()
+  f.cookie()
+  f.rejectCheck(failure)
+  await expect(f.login.check({ sessionid: 'bad' })).rejects.toBe(failure)
+  expect(await f.cookies()).toMatchObject([{ name: 'sessionid', value: 'secret' }])
+  const chrome = setup({ backend: 'chrome' })
+  chrome.cookie()
+  await expect(chrome.login.check({ sessionid: 'other' })).rejects.toThrow('请在 Chrome 里登录')
+  expect(chrome.checked()).toBe(0)
+  expect(await chrome.cookies()).toMatchObject([{ name: 'sessionid', value: 'secret' }])
+})
+
+test('重复生成二维码会移除旧监听，旧令牌不能确认当前二维码', async () => {
+  const f = setup()
+  await f.login.startQr()
+  await f.login.startQr()
+  expect(f.listeners.size).toBe(1)
+  f.cookie()
+  expect(await f.login.pollQr('old')).toEqual({ status: 'expired' })
+  expect(f.checked()).toBe(0)
+  expect(await f.login.pollQr('qr')).toMatchObject({ status: 'confirmed' })
+  expect(f.listeners.size).toBe(0)
 })
 
 test('截获二维码响应时明确报告风控原因，错误码与 error 消息均优先于二维码', async () => {

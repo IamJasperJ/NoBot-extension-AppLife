@@ -9,7 +9,7 @@ test('跨午夜窗口、已存计划不重抽、skip 只消耗一次', () => {
   expect(plan.action).toBe('skip')
   expect(inWindow(cfg, time('2026-10-30T01:00:00'))).toBe(true)
   expect(
-    makePlan(cfg, plan, time('2026-10-30T00:30:00'), () => {
+    makePlan(cfg, plan, time('2026-10-30T00:29:59'), () => {
       throw Error('重抽')
     }),
   ).toBe(plan)
@@ -30,6 +30,30 @@ test('硬间隔、无窗口与每日次数完成理由', () => {
   expect(makePlan(c, {}, time('2026-10-29T22:00:00'), () => 0).reason).toContain('窗口')
   expect(makePlan(c, { date: '2026-10-29', wakes: 3 }, now, () => 0).reason).toContain('用完')
   expect(maxWakes({ ...cfg, windows: [{ start: '0:00', end: '24:00', wakes: 99 }] })).toBe(12)
+})
+
+test('错过已保存时段后从下一时段排起，已删除的窗口也不执行', () => {
+  const before = time('2026-10-29T23:30:00')
+  const boundary = time('2026-10-30T00:30:00')
+  const plan = makePlan(cfg, {}, before, () => 0)
+  expect(plan.slotEndsAt).toBe(boundary)
+  for (const stored of [plan, { ...plan, slotEndsAt: undefined }]) {
+    expect(makePlan(cfg, stored, boundary, () => 0)).toMatchObject({ atMs: boundary, usedCount: {} })
+  }
+  expect(makePlan({ ...cfg, windows: [] }, plan, before, () => 0).action).toBe('done')
+})
+
+test('手动休息保留真实醒来次数，修改窗口不恢复当日计划，次日正常排程', () => {
+  const now = time('2026-10-29T23:30:00')
+  const rested = {
+    ...completePlan(
+      makePlan(cfg, {}, now, () => 0),
+      now,
+    ),
+    manualRestDate: '2026-10-29',
+  }
+  expect(makePlan(cfg, rested, now, () => 0)).toMatchObject({ action: 'done', wakes: 1, reason: '今天已手动休息' })
+  expect(makePlan(cfg, rested, time('2026-10-30T23:00:00'), () => 0).action).toBe('skip')
 })
 
 const allDay = { windows: [{ start: '00:00', end: '24:00', wakes: 12 }], minGapMin: 10, skipChance: 0 }

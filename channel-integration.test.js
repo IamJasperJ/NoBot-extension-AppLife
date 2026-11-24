@@ -338,6 +338,31 @@ test('抖音渠道真宿主：外置安装、批准、访客隔离、主人专�
       await captchaSend
       expect(sends.at(-1)).toEqual({ id: visitor, text: '验证码恢复后发送' })
       expect((await json('channels', '/accounts'))[0].status).toBe('online')
+      if (ownerBindingCount) {
+        const originalSettings = settings
+        settings = { ...settings, douyinChannel: false, dmListen: true }
+        await registry.configureExtension('app-life', { settings })
+        messages.get(owner).push(message(owner, '21', '切回专线后的新私信'))
+        await poll()
+        const history = host.getChatInfo(home.chatId, 100).messages
+        expect(history.filter((m) => m.role === 'user' && m.content === '家里见')).toHaveLength(1)
+        expect(history.find((m) => m.content === '切回专线后的新私信')?.meta.noRelay).toBe(true)
+        await host.waitIdle(home.chatId, 5000)
+        await settle(() => getSetting('extdata:app-life:douyin:dm').pendingReplies.length === 0)
+        settings = originalSettings
+        await registry.configureExtension('app-life', { settings })
+        await poll()
+        await settle(async () => (await json('channels', '/accounts'))[0].status === 'online')
+        settings = { ...originalSettings, douyinOwnerId: '' }
+        await registry.configureExtension('app-life', { settings })
+        await poll()
+        expect(listBindings(accountId).find((b) => b.chat === owner)?.state).toBe('disabled')
+        expect(accountRow(accountId).providerState.ownerExternalId).toBeNull()
+        settings = originalSettings
+        await registry.configureExtension('app-life', { settings })
+        await poll()
+        expect(listBindings(accountId).find((b) => b.chat === owner)?.state).toBe('active')
+      }
       // 只观察真实 ensureAccount 返回值，角色跟随仍由宿主完成。
       const nextCharacter = createCharacter({ name: 'Bob' })
       settings = { ...settings, characterId: nextCharacter.id }

@@ -470,7 +470,15 @@ test('排队的操作在前一任务关闭连接后拒绝执行，不会调用 r
 
 // 替换进程、HTTP 和 WebSocket 边界，启动参数和重启仍由真实会话代码处理。
 function launchFixture(
-  options: { count?: number; probeError?: boolean; probeHang?: boolean; captcha?: boolean; failCreate?: boolean } = {},
+  options: {
+    count?: number
+    probeError?: boolean
+    probeHang?: boolean
+    captcha?: boolean
+    failCreate?: boolean
+    beforeTargets?: () => Promise<void>
+    holdFirstStderr?: () => void
+  } = {},
 ) {
   const calls: { socket: string; method: string; params: Record<string, unknown> }[] = []
   const waits = spyOn(CdpPage.prototype, 'waitForTimeout').mockResolvedValue()
@@ -482,6 +490,7 @@ function launchFixture(
   const originalSocket = globalThis.WebSocket
   let resolveExit = (_code: number) => {}
   let kills = 0
+  let stderrCancels = 0
   const spawn = spyOn(Bun, 'spawn').mockImplementation((...args: unknown[]) => {
     commands.push(args[0] as string[])
     environments.push((args[1] as { env?: Record<string, string | undefined> }).env)
@@ -491,10 +500,17 @@ function launchFixture(
     return {
       stderr: new ReadableStream<Uint8Array>({
         start(controller) {
+          if (commands.length === 1 && options.holdFirstStderr) {
+            options.holdFirstStderr()
+            return
+          }
           controller.enqueue(
             new TextEncoder().encode('DevTools listening on ws://127.0.0.1:9222/devtools/browser/test'),
           )
           controller.close()
+        },
+        cancel() {
+          stderrCancels++
         },
       }),
       exited,
@@ -504,10 +520,12 @@ function launchFixture(
       },
     } as ReturnType<typeof Bun.spawn>
   })
-  globalThis.fetch = (async () =>
-    Response.json(
+  globalThis.fetch = (async () => {
+    await options.beforeTargets?.()
+    return Response.json(
       ['old', 'new'].map((id) => ({ id, type: 'page', webSocketDebuggerUrl: `ws://127.0.0.1:9222/${id}` })),
-    )) as unknown as typeof fetch
+    )
+  }) as unknown as typeof fetch
   class FakeSocket extends EventTarget {
     constructor(private url: string) {
       super()
@@ -563,6 +581,7 @@ function launchFixture(
       proxy = value
     },
     kills: () => kills,
+    stderrCancels: () => stderrCancels,
     async close() {
       await session.close()
       waits.mockRestore()
@@ -625,6 +644,57 @@ test('代理不变复用进程，变更和清空只在下次 ready 时关闭旧�
     expect(f.commands).toHaveLength(3)
     expect(f.kills()).toBe(2)
     expect(f.commands[2]!.some((arg) => arg.startsWith('--proxy-'))).toBe(false)
+  } finally {
+    await f.close()
+  }
+})
+
+test('启动中关闭会拒绝旧请求，迟到的调试目标不能接管新会话', async () => {
+  const targetsRequested = Promise.withResolvers<void>()
+  const targets = Promise.withResolvers<void>()
+  let first = true
+  const f = launchFixture({
+    beforeTargets: async () => {
+      if (!first) return
+      first = false
+      targetsRequested.resolve()
+      await targets.promise
+    },
+  })
+  try {
+    let executed = 0
+    const work = async () => ++executed
+    const stillStarting = f.session.run(work).catch((error: unknown) => error)
+    const formerlyQueued = f.session.run(work).catch((error: unknown) => error)
+    await targetsRequested.promise
+    await f.session.close()
+    expect(f.session.running()).toBe(false)
+    expect(f.kills()).toBe(1)
+    const fresh = f.session.run(work)
+    targets.resolve()
+    expect(await stillStarting).toMatchObject({ message: '浏览器连接已断开' })
+    expect(await formerlyQueued).toMatchObject({ message: '浏览器连接已断开' })
+    expect(await fresh).toBe(1)
+    expect(f.commands).toHaveLength(2)
+    expect(f.calls.filter((call) => call.method === 'Page.enable')).toHaveLength(1)
+    expect(f.session.running()).toBe(true)
+  } finally {
+    targets.resolve()
+    await f.close()
+  }
+})
+
+test('迟迟没有调试端口时关闭立即取消启动读取，后续请求可以重新启动', async () => {
+  const started = Promise.withResolvers<void>()
+  const f = launchFixture({ holdFirstStderr: started.resolve })
+  try {
+    const starting = f.session.run(async () => 'old').catch((error: unknown) => error)
+    await started.promise
+    await f.session.close()
+    expect(await starting).toMatchObject({ message: '浏览器连接已断开' })
+    expect(f.stderrCancels()).toBe(1)
+    expect(await f.session.run(async () => 'new')).toBe('new')
+    expect(f.commands).toHaveLength(2)
   } finally {
     await f.close()
   }
@@ -708,7 +778,7 @@ test('真实传输和 guard 将超时验证码记成人工暂停，解除后仍�
     available: () => ({ ok: true, detail: '' }),
     close: async () => {},
     run: async (fn) => fn(cdp.page),
-    cookies: async () => [],
+    cookies: async () => [{ name: 'sessionid', value: 'test', domain: '.douyin.com' }],
     setCookies: async () => {},
     clearCookies: async () => {},
   }
@@ -750,7 +820,7 @@ test('ready 阶段验证码即使携带 uncertain 也释放尚未提交的操作
     run: async () => {
       throw error
     },
-    cookies: async () => [],
+    cookies: async () => [{ name: 'sessionid', value: 'test', domain: '.douyin.com' }],
     setCookies: async () => {},
     clearCookies: async () => {},
   }

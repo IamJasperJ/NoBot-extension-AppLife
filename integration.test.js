@@ -289,7 +289,10 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
       await expect(command.run({ ...commandContext, settings: {} }, {}, 'wake')).rejects.toMatchObject({
         code: 'CHARACTER',
       })
+      await expect(command.run(commandContext, {}, 'wake')).rejects.toMatchObject({ code: 'INVALID' })
+      values.set('cred:bilibili', { SESSDATA: 'test' })
       await expect(command.run(commandContext, {}, 'wake')).rejects.toMatchObject({ code: 'HOME' })
+      values.delete('cred:bilibili')
       // 记忆只进入绑定会话；关闭开关不影响工具提示的原有条件。
       values.set('home', { chatId: 'memory-home', characterId: character.id })
       values.set('diary', [
@@ -307,7 +310,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
         role: 'system',
         depth: 0,
       })
-      expect(injected.injections[0].content).toContain('you may bring it up naturally')
+      expect(injected.injections[0].content).toContain('without assuming they read it')
       expect(injected.injections[0].content).toContain('never quote it')
       expect(
         entry.default.hooks.beforePrompt(prompt, {
@@ -325,6 +328,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
       // 只有最新用户消息来自私信且仍在等回复时才注入纯文字私信约束。
       const dmContext = {
         ...memoryContext,
+        settings: { ...memoryContext.settings, douyinEnabled: true },
         host: {
           ...memoryContext.host,
           getChatInfo: () => ({
@@ -356,6 +360,11 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
         }).injections[0].content,
       ).not.toContain('Douyin direct message')
       values.delete('douyin:dm')
+      values.set('bilibili:dm', { pendingReplies: [{ userMessageId: 'dm-user', peerId: 'owner', at: clock }] })
+      expect(entry.default.hooks.beforePrompt(prompt, dmContext).injections[0].content).toContain(
+        'Bilibili direct message',
+      )
+      values.delete('bilibili:dm')
       expect(entry.default.hooks.beforePrompt(prompt, dmContext).injections[0].content).not.toContain(
         'Douyin direct message',
       )
@@ -662,7 +671,7 @@ test('AL2 外置安装：后台、登录、绑定会话、主动分享和信件�
         failures: 0,
         nextAt: 0,
         lastPollAt: null,
-        pendingReplies: [{ userMessageId: 'pending', peerId: 'owner' }],
+        pendingReplies: [{ userMessageId: 'pending', peerId: 'owner', at: clock }],
       })
       navId = 456
       const blocked = await request('/login/bilibili/manual', {

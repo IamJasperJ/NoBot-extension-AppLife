@@ -1,7 +1,7 @@
 import { type OwnerCache, parseOwnerInput } from '../apps/douyin/owner'
 import { browserBackend } from '../browser/select'
 import { RISK_DEFAULTS } from './limits'
-import type { Plan, PlanConfig } from './plan'
+import { normalizeWindows, type Plan, type PlanConfig } from './plan'
 import type { Preferences } from './prefs'
 import type { Feedback, ShareSettings, Shares } from './share'
 import type { AppCredentials, ContentItem, KV, RiskLimits } from './types'
@@ -205,7 +205,7 @@ export function settingsOf(raw: Record<string, unknown>): Settings {
   s.commentPollSeconds = s.app === 'douyin' ? s.douyinCommentPollSeconds : s.bilibiliCommentPollSeconds
   s.exploreRatio = Math.min(0.5, Math.max(0, s.exploreRatio))
   s.quietAfterIgnored = Math.min(20, Math.max(0, Math.floor(s.quietAfterIgnored)))
-  s.windows = Array.isArray(raw.windows) ? (raw.windows as Settings['windows']) : defaults.windows
+  s.windows = Array.isArray(raw.windows) ? normalizeWindows(raw.windows) : defaults.windows
   s.shareThreshold = Math.min(100, Math.max(0, Math.round(s.shareThreshold)))
   s.risk =
     raw.risk && typeof raw.risk === 'object'
@@ -241,6 +241,7 @@ export interface DiaryEntry {
 }
 export interface DmState {
   cursor: string | null
+  cursorPeer?: string
   lockedDate: string | null
   lockedPeer: string | null
   failures: number
@@ -285,7 +286,21 @@ export const dmOf = (kv: KV): DmState => {
     pendingReplies: [],
   }
   // 旧队列没有入队时间，按已过期处理，避免升级后继续阻塞。
-  return { ...d, pendingReplies: d.pendingReplies.map((reply) => ({ ...reply, at: reply.at ?? 0 })) }
+  return { ...d, pendingReplies: (d.pendingReplies ?? []).map((reply) => ({ ...reply, at: reply.at ?? 0 })) }
+}
+
+export function dmCursorFor(state: DmState, peer: string): string | null {
+  const cursorPeer = state.cursorPeer ?? state.pendingReplies.at(-1)?.peerId ?? state.mutual?.peerId ?? state.lockedPeer
+  return (!cursorPeer || cursorPeer === peer) && /^\d+$/.test(state.cursor ?? '') ? state.cursor : null
+}
+
+/** 渠道接收的主人消息也推进专线游标，切回专线时不会再次触发回复。 */
+export function advanceDmCursor(kv: KV, peer: string, seq: string) {
+  if (!/^\d+$/.test(seq)) return
+  const dm = dmOf(kv)
+  const prior = dmCursorFor(dm, peer)
+  if (prior !== null && BigInt(prior) >= BigInt(seq)) return
+  kv.set('dm', { ...dm, cursor: seq, cursorPeer: peer })
 }
 export function addDiary(kv: KV, entry: DiaryEntry) {
   kv.set('diary', [...(kv.get<DiaryEntry[]>('diary') ?? []), entry].slice(-365))
@@ -297,19 +312,25 @@ export function remember(kv: KV, item: HistoryItem) {
 
 export function watchedHistory(kv: KV): HistoryItem[] {
   const raw = kv.get<unknown>('history')
-  if (
-    !Array.isArray(raw) ||
-    !raw.every(
-      (e) =>
-        e &&
-        typeof e === 'object' &&
-        ['heart', 'enjoy', 'forOwner', 'urge'].every((k) => typeof e[k] === 'number' && Number.isFinite(e[k])) &&
-        typeof e.explore === 'boolean' &&
-        Array.isArray(e.topics),
+  if (!Array.isArray(raw)) return []
+  // 混合版本的历史按条读取，坏行不能让其他有效记录消失。
+  return raw.filter((value: unknown): value is HistoryItem => {
+    if (!value || typeof value !== 'object') return false
+    const row = value as Partial<HistoryItem>
+    return (
+      [row.id, row.title, row.reason, row.notes, row.url, row.author?.id, row.author?.name].every(
+        (field) => typeof field === 'string',
+      ) &&
+      [row.heart, row.enjoy, row.forOwner, row.urge, row.watchedAt].every(
+        (field) => typeof field === 'number' && Number.isFinite(field),
+      ) &&
+      typeof row.explore === 'boolean' &&
+      Array.isArray(row.tags) &&
+      row.tags.every((tag) => typeof tag === 'string') &&
+      Array.isArray(row.topics) &&
+      row.topics.every((topic) => typeof topic === 'string')
     )
-  )
-    return []
-  return raw as HistoryItem[]
+  })
 }
 
 export const APP_IDS = ['bilibili', 'douyin'] as const

@@ -1,13 +1,13 @@
 import { t } from '../i18n'
 import type { DayPorts } from './day'
-import { sendOwnerDm, shareOwnerVideo } from './dm'
+import { PartialDmError, sendOwnerDm, shareOwnerVideo } from './dm'
 import { GATE_TTL, gateKey, runGate } from './gate'
 import { COMMENT_SHARE_PROMPT } from './prompts'
 import { activity, errorText, publicText } from './social'
 import type { HistoryItem } from './state'
 import { DmNotSentError, TrafficError } from './types'
 
-export type DeliveryResult = { status: 'sent'; text: string } | { status: 'failed' | 'uncertain' }
+export type DeliveryResult = { status: 'sent' | 'partial'; text: string } | { status: 'failed' | 'uncertain' }
 /** 私信正文延迟到投递时生成，评论渠道完全不调用私信生成器，生成失败也返回明确状态。 */
 export async function deliver(
   p: DayPorts,
@@ -26,52 +26,50 @@ export async function deliver(
       const dmPorts = {
         ...p,
         paused: () => {
-          const traffic = p.guard.status()
+          const traffic = p.guard.status(p.trafficHeaders?.())
           return !!(traffic.manual.length || (traffic.pausedUntil && traffic.pausedUntil > now))
         },
         displayText: p.displayText,
       }
       let card = false
-      let uncertain = false
       if (p.adapter.directMessages.shareVideo) {
         try {
           await shareOwnerVideo(dmPorts, s.ownerId, item.id, now, signal)
           card = true
         } catch (error) {
-          if (error instanceof TrafficError && error.code === 'UNCERTAIN') {
-            card = true
-            uncertain = true
-          } else if (!(error instanceof DmNotSentError)) throw error
-          p.log(error)
-          activity(p, {
-            at: now,
-            kind: 'dm-share',
-            ok: card,
-            title: item.title,
-            text: '',
-            url: item.url,
-            error: card
-              ? t('视频卡片结果不确定，已停止补发：{reason}', { reason: errorText(error) })
-              : t('视频卡片未发送，回退文字链接：{reason}', { reason: errorText(error) }),
-          })
-        }
-      }
-      if (!uncertain) {
-        try {
-          await sendOwnerDm(dmPorts, s.ownerId, card ? text : `${text}\n${item.url}`, now, signal)
-        } catch (error) {
-          if (!card) throw error
+          if (!(error instanceof DmNotSentError)) throw error
           p.log(error)
           activity(p, {
             at: now,
             kind: 'dm-share',
             ok: false,
             title: item.title,
-            text,
+            text: '',
             url: item.url,
-            error: t('视频卡片已分享，补充文字发送失败：{reason}', { reason: errorText(error) }),
+            error: t('视频卡片未发送，回退文字链接：{reason}', { reason: errorText(error) }),
           })
         }
+      }
+      try {
+        text = await sendOwnerDm(dmPorts, s.ownerId, card ? text : `${text}\n${item.url}`, now, signal)
+      } catch (error) {
+        if (!card && !(error instanceof PartialDmError)) throw error
+        p.log(error)
+        const sent = error instanceof PartialDmError ? error.sentText : ''
+        const message = card
+          ? t('视频卡片已分享，补充文字发送失败：{reason}', { reason: errorText(error) })
+          : t('部分私信已发送，请核查剩余内容：{reason}', { reason: errorText(error) })
+        item.delivered?.push({ via, ok: false, at: now, error: message })
+        activity(p, {
+          at: now,
+          kind: 'dm-share',
+          ok: false,
+          title: item.title,
+          text: sent,
+          url: item.url,
+          error: message,
+        })
+        return { status: 'partial', text: sent }
       }
     } else {
       if (s.aiCommentGuard) {
@@ -140,7 +138,11 @@ export async function deliver(
       url: item.url,
       error: message,
     })
-    p.note(await p.home(), t('分享投递失败：{title}\n{reason}', { title: item.title, reason: message }))
+    try {
+      p.note(await p.home(), t('分享投递失败：{title}\n{reason}', { title: item.title, reason: message }))
+    } catch (noticeError) {
+      p.log(noticeError)
+    }
     return { status: error instanceof TrafficError && error.code === 'UNCERTAIN' ? 'uncertain' : 'failed' }
   }
 }

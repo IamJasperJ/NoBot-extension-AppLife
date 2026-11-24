@@ -30,6 +30,7 @@ export interface DayPorts {
   displayText?: (text: string) => string
   adapter: AppAdapter
   guard: TrafficGuard
+  trafficHeaders?: () => HeadersInit
   kv: KV
   settings: Settings
   loggedIn: () => boolean
@@ -140,7 +141,7 @@ export function quotas(total: number, count: number): number[] {
   return Array.from({ length: count }, (_, i) => Math.floor(total / count) + (i < total % count ? 1 : 0))
 }
 const blocked = (p: DayPorts, now: number) => {
-  const traffic = p.guard.status()
+  const traffic = p.guard.status(p.trafficHeaders?.())
   return !!(traffic.manual.length || (traffic.pausedUntil && traffic.pausedUntil > now))
 }
 export async function runDay(
@@ -149,6 +150,7 @@ export async function runDay(
   random: () => number,
   signal?: AbortSignal,
   action: 'wake' | 'skip' = 'wake',
+  propagateError = false,
 ) {
   const { kv, settings: s } = p
   let home = '',
@@ -174,6 +176,24 @@ export async function runDay(
     home = await p.home()
     if (p.isGenerating(home)) await p.waitIdle(home, 120000)
     signal?.throwIfAborted()
+    if (action === 'skip') {
+      await p.trigger(home, SKIP_PROMPT)
+      if (s.privateDiary) {
+        const text = await p.quietPrompt({
+          chatId: home,
+          instruction: `${PRIVATE_DIARY_PROMPT}\nToday you chose not to watch any videos.`,
+          includeHistory: true,
+          connectionId: s.connectionId || undefined,
+          model: s.model || undefined,
+          signal,
+        })
+        signal?.throwIfAborted()
+        addDiary(kv, { id: `${now}-private`, kind: 'private', date: dayOf(now), text, at: now })
+      }
+      ok = true
+      summary = s.privateDiary ? t('今天休息，已写日记') : t('今天休息')
+      return
+    }
     const all = p.platforms?.() ?? [{ id: p.adapter.id, ports: p }]
     const loggedIn = all.filter((x) => x.ports.loggedIn())
     if (!loggedIn.length) {
@@ -189,23 +209,6 @@ export async function runDay(
     }
     const byId = new Map(platforms.map((x) => [x.id, x.ports]))
     const portsOf = (entry: { app?: string }) => byId.get(entry.app ?? '') ?? platforms[0]!.ports
-    if (action === 'skip') {
-      await p.trigger(home, SKIP_PROMPT)
-      if (s.privateDiary) {
-        const text = await p.quietPrompt({
-          chatId: home,
-          instruction: `${PRIVATE_DIARY_PROMPT}\nToday you chose not to watch any videos.`,
-          includeHistory: true,
-          connectionId: s.connectionId || undefined,
-          model: s.model || undefined,
-          signal,
-        })
-        addDiary(kv, { id: `${now}-private`, kind: 'private', date: dayOf(now), text, at: now })
-      }
-      ok = true
-      summary = t('今天休息，已写日记')
-      return
-    }
     const prefs = kv.get<import('./prefs').Preferences>('prefs') ?? { likes: [], dislikes: [] },
       interests = keywords(s.interests)
     const words = [
@@ -305,6 +308,7 @@ export async function runDay(
           }),
           item,
         )
+        signal?.throwIfAborted()
         const entry: HistoryItem = {
           ...item,
           ...result,
@@ -346,6 +350,8 @@ export async function runDay(
           }),
           entry,
         )
+        signal?.throwIfAborted()
+        if (!result.reason) continue
         Object.assign(entry, result, {
           heart: result.reason ? heart(result, affinity(entry, prefs, interests).taste) : 0,
           depth: s.frames ? 'full' : 'text',
@@ -430,7 +436,7 @@ export async function runDay(
       }
       entry.shared = result.status !== 'failed'
       if (result.status === 'failed') unrecordShare(kv, entry.id, now)
-      if (result.status === 'sent') attachSaid(kv, entry.id, result.text)
+      if ('text' in result && result.text) attachSaid(kv, entry.id, result.text)
       remember(kv, entry)
       if (result.status === 'failed') break
       current = shareState(kv, s, now)
@@ -464,6 +470,7 @@ export async function runDay(
       model: s.model || undefined,
       signal,
     })
+    signal?.throwIfAborted()
     addDiary(kv, { id: `${now}-letter`, kind: 'letter', date: dayOf(now), text: letter, at: now })
     if (s.privateDiary) {
       const text = await p.quietPrompt({
@@ -474,6 +481,7 @@ export async function runDay(
         model: s.model || undefined,
         signal,
       })
+      signal?.throwIfAborted()
       addDiary(kv, { id: `${now}-private`, kind: 'private', date: dayOf(now), text, at: now })
     }
     ok = errorText === undefined
@@ -481,7 +489,9 @@ export async function runDay(
       ? t('分享账本损坏，请手动重置')
       : skipped.size
         ? t('浏览完成，已写信和日记（{apps} 因请求保护跳过）', { apps: [...skipped].join(' / ') })
-        : t('浏览完成，已写信和日记')
+        : s.privateDiary
+          ? t('浏览完成，已写信和日记')
+          : t('浏览完成，已写信')
   } catch (error) {
     errorText = error instanceof Error ? error.message : String(error)
     summary = t('今日流程未完成')
@@ -491,6 +501,7 @@ export async function runDay(
         if (!p.isGenerating(home)) noteOnce(t('请求保护已停止今日流程'))
       } catch {}
     }
+    if (propagateError) throw error
   } finally {
     kv.set('lastRun', { at: now, ok, summary, ...(errorText ? { error: errorText } : {}) })
   }

@@ -5,6 +5,7 @@ import { socialFixture } from './social-test-utils'
 import { defaults, scopedKv, settingsOf, toolsFor, watchedHistory } from './state'
 import { commentTarget, commentTool, homeToolPrompt, homeTools, prefer, shareTool, type ToolService } from './tools'
 import { type ContentItem, TrafficError } from './types'
+import { manualItem, watchWork } from './watch'
 
 const item: ContentItem = {
   id: 'BV1',
@@ -30,6 +31,26 @@ function setup() {
   }
   return { ...x, svc }
 }
+
+test('重看保留已有评分与反馈，只读观看不会写入共享历史', async () => {
+  const x = setup()
+  const previous = { ...manualItem(item, 'bilibili', 10), heart: 84, verdict: 'like' as const, shared: true }
+  x.p.kv.set('history', [previous])
+  x.p.adapter.read = async (item) => ({
+    item,
+    description: '',
+    subtitle: null,
+    frames: null,
+    hotComments: [],
+    danmakuHotspots: [],
+    missing: [],
+  })
+  await watchWork(x.p, item.id, 'full', 100)
+  expect(watchedHistory(x.p.kv)).toEqual([{ ...previous, depth: 'full' }])
+  x.p.adapter.lookup = async () => ({ ...item, id: 'another' })
+  await watchWork(x.p, 'another', 'text', 101, { record: false })
+  expect(watchedHistory(x.p.kv)).toEqual([{ ...previous, depth: 'full' }])
+})
 test('平台工具默认值、非法值规范化与未知平台关闭', () => {
   for (const app of ['bilibili', 'douyin']) {
     expect(toolsFor(defaults, app)).toEqual({

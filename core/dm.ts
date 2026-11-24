@@ -6,7 +6,7 @@ import { dayOf, inWindow } from './plan'
 import { pollDelay } from './poll'
 import { digestMaterial } from './prompts'
 import { ownerSpoke } from './share'
-import { dmOf, feedbackOf, type Settings } from './state'
+import { dmCursorFor, dmOf, feedbackOf, type Settings } from './state'
 import { type AppAdapter, BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
 import { watchWork } from './watch'
 /** 附在主人分享素材之后，防止模型把分析和草稿当成私信正文发出去。 */
@@ -46,15 +46,18 @@ export function splitDm(text: string): string[] {
   const chars = Array.from(stripStage(text))
   return [0, 500, 1000].map((n) => chars.slice(n, n + 500).join('')).filter(Boolean)
 }
-export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal) {
-  const s = p.settings,
-    d = dmOf(p.kv)
-  // 即使暂停、窗口外或还没到轮询时间，也先释放超时等待，避免其他任务永久被阻塞。
-  const pending = d.pendingReplies.filter((reply) => now - reply.at < 10 * 60000)
+export function pruneDmReplies(kv: KV, now: number) {
+  const d = dmOf(kv)
+  const pending = d.pendingReplies.filter((reply) => reply.at > 0 && now - reply.at < 10 * 60000)
   if (pending.length !== d.pendingReplies.length) {
     d.pendingReplies = pending
-    p.kv.set('dm', d)
+    kv.set('dm', d)
   }
+  return d
+}
+export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal) {
+  const s = p.settings,
+    d = pruneDmReplies(p.kv, now)
   if (
     !s.dmListen ||
     !s.ownerId ||
@@ -65,15 +68,20 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
   )
     return
   try {
-    const messages = await p.adapter.directMessages.list(s.ownerId, { afterSeq: d.cursor, limit: 50, signal })
+    // 私信序号属于联系人，换主人后只建立新基线。
+    const cursor = dmCursorFor(d, s.ownerId)
+    const messages = await p.adapter.directMessages.list(s.ownerId, { afterSeq: cursor, limit: 50, signal })
+    if (signal?.aborted) return
     const owner = messages
       .filter((m) => m.senderId === s.ownerId && /^\d+$/.test(m.seq))
-      .sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : 1))
-    const first = d.cursor === null
+      .sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0))
+    const first = cursor === null
+    d.cursorPeer = s.ownerId
+    d.cursor = cursor
     if (owner.length) {
       const latest = owner.at(-1)!.seq
       if (!first) {
-        const fresh = owner.filter((m) => BigInt(m.seq) > BigInt(d.cursor!))
+        const fresh = owner.filter((m) => BigInt(m.seq) > BigInt(cursor))
         if (fresh.length) {
           const home = await p.home()
           await p.waitIdle(home, 120000)
@@ -137,8 +145,9 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
             ...(images.length ? { images } : {}),
           })
           d.cursor = latest
-          d.pendingReplies.push({ userMessageId, peerId: s.ownerId, at: now })
-          p.kv.set('dm', { ...d, cursor: latest })
+          const current = pruneDmReplies(p.kv, now)
+          current.pendingReplies.push({ userMessageId, peerId: s.ownerId, at: now })
+          p.kv.set('dm', { ...current, cursor: latest, cursorPeer: s.ownerId })
           p.kv.set('feedback', { ...feedbackOf(p.kv), last: now })
           try {
             for (const message of fresh) ownerSpoke(p.kv, now, message.text, 'dm')
@@ -148,7 +157,7 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
           p.trigger(home)
         }
       }
-      d.cursor = latest
+      if (first || BigInt(latest) > BigInt(cursor)) d.cursor = latest
     } else if (first) d.cursor = '0'
     d.failures = 0
   } catch (error) {
@@ -159,30 +168,35 @@ export async function pollOwnerDm(p: DmPorts, now: number, signal?: AbortSignal)
     d.lastPollAt = now
     d.nextAt = now + pollDelay(s.dmPollSeconds, d.failures)
     const latest = dmOf(p.kv)
-    p.kv.set('dm', { ...latest, cursor: d.cursor, failures: d.failures, lastPollAt: d.lastPollAt, nextAt: d.nextAt })
+    p.kv.set('dm', {
+      ...latest,
+      cursor: d.cursor,
+      cursorPeer: d.cursorPeer,
+      failures: d.failures,
+      lastPollAt: d.lastPollAt,
+      nextAt: d.nextAt,
+    })
   }
 }
 /**
  * replyTo 是这条角色回复沿父链最近的用户消息 id：不是等回复的那条私信（比如在回 QQ 上的话）就不发、也不消费队列。
- * undefined 表示查不到来源，沿用旧行为直接发。
  */
 export async function replyOwnerDm(
   p: DmPorts,
   text: string,
   now: number,
-  signal?: AbortSignal,
-  replyTo?: string | null,
+  signal: AbortSignal | undefined,
+  replyTo: string | null,
 ) {
-  const d = dmOf(p.kv),
-    pending = d.pendingReplies[0]
+  const d = pruneDmReplies(p.kv, now)
+  const pending = d.pendingReplies.find((reply) => reply.userMessageId === replyTo)
   if (!pending) return
-  if (replyTo !== undefined && replyTo !== pending.userMessageId) return
   const parts = splitDm(p.displayText ? p.displayText(text) : text)
   // 工具调用前的空段和纯舞台指令不消费队列，等待后续可见正文。
   if (!parts.length) return
   // 工具调用前后都有正文时只发送第一条，维持一条私信一次回复。
   // 先移出待发送队列，重启或未知写结果都不能自动重发。
-  d.pendingReplies = []
+  d.pendingReplies = d.pendingReplies.filter((reply) => reply.userMessageId !== replyTo)
   p.kv.set('dm', d)
   try {
     await sendDmParts(p, pending.peerId, parts, now, signal)
@@ -200,7 +214,17 @@ export async function sendOwnerDm(
   signal?: AbortSignal,
 ) {
   const parts = splitDm(p.displayText ? p.displayText(text) : text)
-  await sendDmParts(p, peerId, parts, now, signal, p.sleep)
+  if (!parts.length) throw new Error(t('模型未生成有效回复'))
+  return (await sendDmParts(p, peerId, parts, now, signal, p.sleep)).join('\n')
+}
+
+export class PartialDmError extends Error {
+  constructor(
+    readonly sentText: string,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
 }
 
 async function sendDmParts(
@@ -213,20 +237,28 @@ async function sendDmParts(
 ) {
   await prepareOwnerDm(p, peerId, now, signal)
   let retried = false
-  for (const part of parts) {
-    signal?.throwIfAborted()
-    try {
-      await p.adapter.directMessages.send(peerId, part, signal)
-    } catch (error) {
-      if (!(error instanceof DmNotSentError) || !sleep || retried || !p.loggedIn() || p.paused()) throw error
-      retried = true
-      await sleep(15000, signal)
+  const sent: string[] = []
+  try {
+    for (const part of parts) {
       signal?.throwIfAborted()
-      if (!p.loggedIn() || p.paused()) throw error
-      // 只补发失败的这一段，前面的成功分段不重发；仍由适配器经过配额和冷却保护。
-      await p.adapter.directMessages.send(peerId, part, signal)
+      try {
+        await p.adapter.directMessages.send(peerId, part, signal)
+      } catch (error) {
+        if (!(error instanceof DmNotSentError) || !sleep || retried || !p.loggedIn() || p.paused()) throw error
+        retried = true
+        await sleep(15000, signal)
+        signal?.throwIfAborted()
+        if (!p.loggedIn() || p.paused()) throw error
+        // 只补发失败的这一段，前面的成功分段不重发；仍由适配器经过配额和冷却保护。
+        await p.adapter.directMessages.send(peerId, part, signal)
+      }
+      sent.push(part)
     }
+  } catch (error) {
+    if (sent.length) throw new PartialDmError(sent.join('\n'), error)
+    throw error
   }
+  return sent
 }
 
 /** 卡片与文字共享主人校验和当日收件人锁，卡片本身不自动重试。 */
@@ -302,7 +334,10 @@ export async function sharedDmMaterial(
 ): Promise<string> {
   const tool = p.adapter.id === 'bilibili' ? 'bili' : p.adapter.id
   try {
-    const digest = await abortable(() => watchWork(p, id, 'full', now, signal), signal)
+    const digest = await abortable(
+      () => watchWork(p, id, 'full', now, { signal, record: sender === 'The owner' }),
+      signal,
+    )
     let frames = false
     if (digest.frames) {
       try {
@@ -314,10 +349,10 @@ export async function sharedDmMaterial(
     return `${digestMaterial(p.adapter.id, digest, 3000, 3000)}\n${
       frames
         ? `${sender} shared this work; you have already watched it (${digest.subtitle?.trim() ? 'frames and subtitles above' : 'frames above; it has no subtitles'}); react to its actual content; do not search for it again.`
-        : `${sender} shared this work. Visual frames are unavailable; do not claim to have seen them. To inspect it, call ${tool}_watch with id: ${id} and look: true.`
+        : `${sender} shared this work. Visual frames are unavailable; do not claim to have seen them. To inspect it, call ${tool}_watch with id_or_url: ${id} and look: true.`
     }`
   } catch (error) {
     p.log(error)
-    return `${sender} shared this work, but watching failed or timed out. Do not claim to have watched it. Call ${tool}_watch with id: ${id} and look: true before commenting on its content.`
+    return `${sender} shared this work, but watching failed or timed out. Do not claim to have watched it. Call ${tool}_watch with id_or_url: ${id} and look: true before commenting on its content.`
   }
 }

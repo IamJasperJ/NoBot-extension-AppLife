@@ -13,7 +13,16 @@ import { type DmPorts, OWNER_SHARE_REPLY_RULE, sharedDmMaterial, stripStage } fr
 import { imageMime } from './image-mime'
 import { inWindow } from './plan'
 import { activity, countAttempt, todayCount } from './social'
-import { dmOf, type HistoryItem, type Settings, scopedSettings, settingsOf, watchedHistory } from './state'
+import {
+  advanceDmCursor,
+  dmCursorFor,
+  dmOf,
+  type HistoryItem,
+  type Settings,
+  scopedSettings,
+  settingsOf,
+  watchedHistory,
+} from './state'
 import { BrowserSkippedError, DmNotSentError, type KV, TrafficError } from './types'
 
 interface TurnMessage {
@@ -29,7 +38,7 @@ export function visitorMessage(message: TurnMessage | undefined, bindings: reado
   if (/^\d+$/.test(secUid)) return true
   const binding = bindings.find((item) => item.provider === 'app-life.douyin' && item.external.chat === secUid)
   if (binding?.scope === 'group') return true
-  if (secUid === ownerId) return false
+  if (ownerId) return secUid !== ownerId
   return !binding?.ownerPresent
 }
 
@@ -84,6 +93,16 @@ interface Cursor {
   seq: string
   lastAt: number
 }
+
+/** 兼容尚未把渠道主人游标同步回专线的旧状态。 */
+export function releaseOwnerCursor(kv: KV, ownerId: string) {
+  const binding = kv.get<{ key: string }>('channel-owner')
+  if (ownerId && binding?.key.startsWith(`${ownerId}:`)) {
+    const cursor = kv.get<Record<string, Cursor>>('channel-cursors')?.[ownerId]
+    if (cursor) advanceDmCursor(kv, ownerId, cursor.seq)
+  }
+  kv.delete('channel-owner')
+}
 /** io 仅在账号 signal 有效期内保留；消息任务与出站共用服务的私信锁。 */
 export class DouyinChannel {
   readonly sessions = new Map<string, { io: ChannelIO; signal: AbortSignal }>()
@@ -110,30 +129,49 @@ export class DouyinChannel {
     }
   }
   private async bindOwnerNow() {
-    if (!this.ownerViaChannel) return
-    const home = this.p.ownerHome!()!
+    if (!this.enabled || !this.api.bind) return
+    const home = this.p.ownerHome?.()
     const p = this.p.dm()
     const owner = p.settings.ownerId
-    const key = `${owner}:${home.chatId}`
+    const key = owner && home ? `${owner}:${home.chatId}` : undefined
     const stored = p.kv.get<{ key: string; since: number }>('channel-owner')
+    // 已确认的宿主路由与收件游标分开保存，退出登录时仍能撤销旧路由。
+    const bound = p.kv.get<string>('channel-owner-route') ?? stored?.key
+    if (bound && bound !== key && this.api.releaseOwnerBinding) {
+      const split = bound.indexOf(':')
+      if (split > 0) {
+        try {
+          await this.api.releaseOwnerBinding('douyin', {
+            externalId: bound.slice(0, split),
+            chatId: bound.slice(split + 1),
+          })
+        } catch (error) {
+          this.p.log(error)
+          return
+        }
+      }
+      p.kv.delete('channel-owner-route')
+      this.ownerBindings.clear()
+    }
+    if (!home || !key) return
     // 接管先定时间和序号基线；绑定重试期间的新消息保留，已处理消息不再投递。
     if (stored?.key !== key) {
       const cursors = p.kv.get<Record<string, Cursor>>('channel-cursors') ?? {}
       // 旧专线游标不一定是纯数字序号；不是就只用渠道已有游标，避免 BigInt 抛错卡住接管。
       const numeric = (value: unknown) => (typeof value === 'string' && /^\d+$/.test(value) ? value : '0')
-      const processed = numeric(dmOf(p.kv).cursor)
+      const processed = dmCursorFor(dmOf(p.kv), owner) ?? '0'
       const previous = numeric(cursors[owner]?.seq)
       cursors[owner] = { seq: BigInt(processed) > BigInt(previous) ? processed : previous, lastAt: 0 }
       p.kv.set('channel-cursors', cursors)
       p.kv.set('channel-owner', { key, since: this.p.now() })
-      const dm = dmOf(p.kv)
-      p.kv.set('dm', { ...dm, pendingReplies: [] })
     }
     for (const { io, signal } of this.sessions.values()) {
       if (signal.aborted || this.ownerBindings.get(io) === key) continue
       try {
-        io.setOwner(owner)
         await this.api.bind!('douyin', { chat: { id: owner, title: home.title }, chatId: home.chatId })
+        signal.throwIfAborted()
+        io.setOwner(owner)
+        p.kv.set('channel-owner-route', key)
         this.ownerBindings.set(io, key)
       } catch (error) {
         this.p.log(error)
@@ -325,7 +363,8 @@ export class DouyinChannel {
         )
         .sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0))
       // 主人基线独立于访客渠道启用时间，并保留原专线已处理的序号。
-      if (!peer.isGroup && peer.peerId === s.ownerId && this.ownerViaChannel) {
+      const ownerPeer = !peer.isGroup && peer.peerId === s.ownerId && this.ownerViaChannel
+      if (ownerPeer) {
         const sinceOwner = p.kv.get<{ since: number }>('channel-owner')!.since
         const old = messages.filter((message) => message.at <= sinceOwner)
         if (old.length) {
@@ -415,6 +454,7 @@ export class DouyinChannel {
         }
         cursors[peer.peerId] = { seq: message.seq, lastAt: cursor.lastAt }
         p.kv.set('channel-cursors', cursors)
+        if (ownerPeer) advanceDmCursor(p.kv, peer.peerId, message.seq)
       }
       cursors[peer.peerId] = { seq: cursors[peer.peerId]!.seq, lastAt: peer.lastAt }
       p.kv.set('channel-cursors', cursors)
@@ -468,12 +508,13 @@ export class DouyinChannel {
       45000,
     )
   }
-  async sendSticker(chatId: string, name: string, signal: AbortSignal) {
+  async sendSticker(chatId: string, name: string, signal: AbortSignal, assertSource?: () => void) {
     if (chatId.startsWith('group:')) chatId = chatId.slice(6)
     return this.outbound(
       chatId,
       signal,
       async (p, now, group) => {
+        assertSource?.()
         if (!this.p.settings().douyinChannelStickers) throw new ChannelSendError('not-sent', 'stickers-disabled')
         const send = p.adapter.directMessages.sendSticker
         if (!send) throw new ChannelSendError('not-sent', 'unsupported')
@@ -510,12 +551,21 @@ export class DouyinChannel {
     maxMs?: number,
   ): Promise<T> {
     try {
+      const route = this.p.dm().kv.get<string>('channel-owner-route')
       return await this.p.exclusiveWait(
         async () => {
           signal.throwIfAborted()
           const p = this.p.dm(),
             now = this.p.now()
           if (!this.enabled || !p.loggedIn()) throw new ChannelSendError('not-sent', 'offline')
+          // 宿主已经调用发送，但浏览器锁尚未取得时，主人会话仍可能被换掉。
+          if (
+            route?.startsWith(`${chatId}:`) &&
+            (p.kv.get('channel-owner-route') !== route ||
+              p.settings.ownerId !== chatId ||
+              route !== `${chatId}:${this.p.ownerHome?.()?.chatId}`)
+          )
+            throw new ChannelSendError('not-sent', 'binding-changed')
           if (p.paused()) {
             this.sync()
             throw new ChannelSendError('not-sent', this.p.captcha?.() ? 'captcha' : 'paused')

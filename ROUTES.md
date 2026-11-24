@@ -348,8 +348,10 @@ type Activity = {
 | 方法及路径 | 请求 | 成功响应 |
 | --- | --- | --- |
 | `POST /browser/install` | `{}` | `{ ok: true }`，后台安装，进度见 apps[].browser.install |
-| `DELETE /browser` | — | `{ ok: true }`，先关闭会话，再删除安装目录 |
+| `DELETE /browser` | — | `{ ok: true }`，等待浏览器退出后删除组件目录，保留登录资料 |
 | `GET /browser/screenshot` | — | 当前页面 JPEG，`content-type: image/jpeg`；未运行时 HTTP 400 |
+
+安装期间请求卸载，或卸载期间请求安装，返回 HTTP 400。重复的卸载请求等待同一次卸载完成。
 
 `GET /drafts` 合并全部平台的草稿，每条带 app，按 at 倒序。
 `GET /activity` 合并全部平台互动，每条带 app，按 at 倒序后截取 limit 条。

@@ -14,6 +14,17 @@ const post = (
 ) => ({ method: 'POST', body, headers })
 
 describe('请求保护', () => {
+  test('切换账号后只显示当前账号的人工暂停，保留旧账号暂停状态', async () => {
+    const f = fixture()
+    const old = { cookie: 'SESSDATA=old' }
+    const current = { cookie: 'SESSDATA=current' }
+    f.handle(async () => json({}, -101))
+    await f.guard.fetch(read, { headers: old })
+    expect(f.guard.status(old).manual).toHaveLength(1)
+    expect(f.guard.status(current).manual).toEqual([])
+    f.guard.resume(current)
+    expect(f.guard.status(old).manual).toHaveLength(1)
+  })
   test('读预算、小时窗口、当地午夜重置和跨实例持久化', async () => {
     const f = fixture({ readHourly: 1, readDaily: 2 })
     await f.guard.fetch(read)

@@ -450,8 +450,9 @@ export class CdpSession implements BrowserSession {
   private browserWs = ''
   private targetId = ''
   private port = 0
-  private starting: Promise<CdpPage> | null = null
   private chain: Promise<unknown> = Promise.resolve()
+  private lifetime = new AbortController()
+  private closing: Promise<void> | null = null
   private idle: ReturnType<typeof setTimeout> | null = null
   constructor(
     private opts: {
@@ -460,6 +461,7 @@ export class CdpSession implements BrowserSession {
       idleMs?: number
       keepAlive?: () => boolean
       proxy?: () => string
+      beforeLaunch?: () => Promise<void> | undefined
     },
   ) {}
   available() {
@@ -468,7 +470,9 @@ export class CdpSession implements BrowserSession {
       ? { ok: true, detail: binary.path }
       : { ok: false, detail: t('没有可用的浏览器，请先在「今天」页安装浏览器组件') }
   }
-  private async launch(): Promise<CdpPage> {
+  private async launch(signal: AbortSignal): Promise<CdpPage> {
+    await this.opts.beforeLaunch?.()
+    signal.throwIfAborted()
     const binary = this.opts.binary()
     if (!binary) throw new Error(t('没有可用的浏览器，请先在「今天」页安装浏览器组件'))
     const profile = this.opts.profileDir()
@@ -503,46 +507,26 @@ export class CdpSession implements BrowserSession {
     )
     this.proc = proc
     // 端口从 stderr 的 "DevTools listening on ws://127.0.0.1:<port>/..." 里读
-    const port = await new Promise<number>((resolve, reject) => {
-      const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      const timer = setTimeout(() => reject(new Error(t('浏览器启动超时'))), 30000)
-      const pump = async () => {
-        for (;;) {
-          const { value, done } = await reader.read()
-          if (done) {
-            clearTimeout(timer)
-            reject(new Error(t('浏览器启动失败：{reason}', { reason: buffer.slice(-300) })))
-            return
-          }
-          buffer += decoder.decode(value)
-          const m = buffer.match(/DevTools listening on (ws:\/\/[^:]+:(\d+)\/\S+)/)
-          if (m) {
-            clearTimeout(timer)
-            this.browserWs = m[1]!
-            resolve(Number(m[2]))
-            // 继续读走 stderr，避免管道写满卡住浏览器
-            void (async () => {
-              for (;;) if ((await reader.read()).done) return
-            })().catch(() => {})
-            return
-          }
-        }
-      }
-      void pump().catch(reject)
-    })
+    const { port, browserWs } = await this.debugAddress(proc.stderr as ReadableStream<Uint8Array>, signal)
+    signal.throwIfAborted()
+    this.browserWs = browserWs
     this.port = port
-    const targets = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()) as {
+    const targets = (await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal })).json()) as {
       id: string
       type: string
       webSocketDebuggerUrl: string
     }[]
+    signal.throwIfAborted()
     const target = targets.find((x) => x.type === 'page')
     if (!target) throw new Error(t('浏览器没有可用页面'))
-    const conn = await this.connect(target.webSocketDebuggerUrl)
+    const conn = await this.connect(target.webSocketDebuggerUrl, signal)
+    if (signal.aborted) {
+      conn.close()
+      signal.throwIfAborted()
+    }
     this.conn = conn
     const page = await this.initializePage(conn)
+    signal.throwIfAborted()
     this.targetId = target.id
     this.page = page
     void proc.exited.then(() => {
@@ -550,32 +534,62 @@ export class CdpSession implements BrowserSession {
     })
     return page
   }
-  private async connect(url: string) {
+  private async debugAddress(stderr: ReadableStream<Uint8Array>, signal: AbortSignal) {
+    const address = Promise.withResolvers<{ port: number; browserWs: string }>()
+    const reader = stderr.getReader()
+    const decoder = new TextDecoder()
+    const abort = () => address.reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    const timer = setTimeout(() => address.reject(new Error(t('浏览器启动超时'))), 30000)
+    const pump = async () => {
+      let buffer = ''
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) throw new Error(t('浏览器启动失败：{reason}', { reason: buffer.slice(-300) }))
+        buffer += decoder.decode(value)
+        const match = buffer.match(/DevTools listening on (ws:\/\/[^:]+:(\d+)\/\S+)/)
+        if (match) {
+          address.resolve({ browserWs: match[1]!, port: Number(match[2]) })
+          // 继续读走 stderr，避免管道写满卡住浏览器。
+          for (;;) if ((await reader.read()).done) return
+        }
+      }
+    }
+    void pump().catch(address.reject)
+    try {
+      return await address.promise
+    } catch (error) {
+      void reader.cancel().catch(() => {})
+      throw error
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+    }
+  }
+  private async connect(url: string, signal: AbortSignal) {
+    signal.throwIfAborted()
     const ws = new WebSocket(url)
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        ws.close()
-        reject(new Error(t('连不上浏览器调试接口')))
-      }, 5000)
-      ws.addEventListener(
-        'open',
-        () => {
-          clearTimeout(timer)
-          resolve()
-        },
-        { once: true },
-      )
-      ws.addEventListener(
-        'error',
-        () => {
-          clearTimeout(timer)
-          ws.close()
-          reject(new Error(t('连不上浏览器调试接口')))
-        },
-        { once: true },
-      )
-    })
-    return new Connection(ws)
+    const connected = Promise.withResolvers<void>()
+    const abort = () => connected.reject(signal.reason)
+    const fail = () => connected.reject(new Error(t('连不上浏览器调试接口')))
+    const open = () => connected.resolve()
+    signal.addEventListener('abort', abort, { once: true })
+    ws.addEventListener('open', open, { once: true })
+    ws.addEventListener('error', fail, { once: true })
+    const timer = setTimeout(fail, 5000)
+    try {
+      await connected.promise
+      signal.throwIfAborted()
+      return new Connection(ws)
+    } catch (error) {
+      ws.close()
+      throw error
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      ws.removeEventListener('open', open)
+      ws.removeEventListener('error', fail)
+    }
   }
   private async initializePage(conn: Connection) {
     const page = new CdpPage(conn, { stealth: true })
@@ -616,39 +630,47 @@ export class CdpSession implements BrowserSession {
     this.browserWs = ''
     this.targetId = ''
     this.port = 0
-    this.starting = null
   }
-  private async ready(): Promise<CdpPage> {
-    // 设置读取不打断当前任务，排队任务使用浏览器前才按新的代理重启。
-    if (this.page && this.launchedProxy !== (this.opts.proxy?.() ?? '')) await this.close()
-    if (this.page && this.conn && !this.conn.closed) return this.page
-    this.starting ??= this.launch().catch((error) => {
-      this.proc?.kill()
-      this.reset()
+  private async ready(signal: AbortSignal): Promise<CdpPage> {
+    if (this.closing) await this.closing
+    signal.throwIfAborted()
+    // 浏览器断线或代理变更时，先等旧进程退出，再使用同一资料目录启动。
+    if (this.page && this.conn && !this.conn.closed && this.launchedProxy === (this.opts.proxy?.() ?? ''))
+      return this.page
+    if (this.proc || this.conn) await this.stopBrowser()
+    signal.throwIfAborted()
+    try {
+      return await this.launch(signal)
+    } catch (error) {
+      if (!signal.aborted) await this.stopBrowser()
       throw error
-    })
-    return this.starting
+    }
   }
   private touch() {
     if (this.idle) clearTimeout(this.idle)
     this.idle = setTimeout(() => {
       // 人工处理期间保留验证码现场；解除暂停后仍按原来的空闲周期释放浏览器。
       if (this.opts.keepAlive?.()) this.touch()
-      else void this.close()
+      else void this.close().catch(() => {})
     }, this.opts.idleMs ?? 300000)
     // 空闲计时不能让进程一直活着
     ;(this.idle as { unref?: () => void }).unref?.()
   }
   run<T>(fn: (page: BrowserPage) => Promise<T>, signal?: AbortSignal, requireRunning = false): Promise<T> {
+    const lifetime = this.lifetime.signal
     const job = this.chain.then(async () => {
+      lifetime.throwIfAborted()
       signal?.throwIfAborted()
       if (requireRunning && (!this.page || !this.conn || this.conn.closed))
         throw new Error(t('浏览器尚未运行，先看一眼页面'))
       if (this.idle) clearTimeout(this.idle)
       try {
-        return await fn(await this.ready())
+        const page = await this.ready(lifetime)
+        lifetime.throwIfAborted()
+        signal?.throwIfAborted()
+        return await fn(page)
       } finally {
-        this.touch()
+        if (!lifetime.aborted) this.touch()
       }
     })
     this.chain = job.catch(() => {})
@@ -730,40 +752,47 @@ export class CdpSession implements BrowserSession {
     }
   }
   private async replacePage(page: BrowserPage) {
+    const signal = this.lifetime.signal
     let browser: Connection | null = null
     let conn: Connection | null = null
     let targetId = ''
     let replaced = false
     try {
       const url = !page.url() || page.url() === 'about:blank' ? BASE : page.url()
-      browser = await this.connect(this.browserWs)
+      browser = await this.connect(this.browserWs, signal)
+      signal.throwIfAborted()
       // 先在空白页完成反检测初始化，再导航，避免首个文档抢在初始化之前加载。
       const created = await browser.send('Target.createTarget', { url: 'about:blank' })
       targetId = String(created.targetId ?? '')
       if (!targetId) throw new Error(t('浏览器没有可用页面'))
-      const targets = (await (await fetch(`http://127.0.0.1:${this.port}/json/list`)).json()) as {
+      signal.throwIfAborted()
+      const targets = (await (await fetch(`http://127.0.0.1:${this.port}/json/list`, { signal })).json()) as {
         id: string
         webSocketDebuggerUrl: string
       }[]
+      signal.throwIfAborted()
       const target = targets.find((item) => item.id === targetId)
       if (!target) throw new Error(t('浏览器没有可用页面'))
-      conn = await this.connect(target.webSocketDebuggerUrl)
+      conn = await this.connect(target.webSocketDebuggerUrl, signal)
+      signal.throwIfAborted()
       const next = await this.initializePage(conn)
+      signal.throwIfAborted()
       const closed = await browser.send('Target.closeTarget', { targetId: this.targetId })
       if (closed.success === false) throw new Error(t('浏览器连接已断开'))
+      signal.throwIfAborted()
       this.conn?.close()
       this.conn = conn
       this.page = next
       this.targetId = targetId
-      this.starting = null
       replaced = true
       // 原坐标来自旧截图，换页后不能重放，交给用户根据新截图重新操作。
       return await this.capture(next, true, url)
     } catch (error) {
       if (!replaced) {
         conn?.close()
-        if (targetId) await browser?.send('Target.closeTarget', { targetId }, 5000).catch(() => ({}))
+        if (targetId && !signal.aborted) await browser?.send('Target.closeTarget', { targetId }, 5000).catch(() => ({}))
       }
+      signal.throwIfAborted()
       throw new Error(
         t('浏览器页面没有响应，已尝试重开但失败：{reason}', {
           reason: error instanceof Error ? error.message : String(error),
@@ -795,21 +824,47 @@ export class CdpSession implements BrowserSession {
   running() {
     return !!this.proc
   }
-  async close() {
+  close() {
+    this.lifetime.abort(new Error(t('浏览器连接已断开')))
+    this.lifetime = new AbortController()
+    return this.stopBrowser()
+  }
+  private stopBrowser() {
     if (this.idle) clearTimeout(this.idle)
     this.idle = null
+    if (this.closing) return this.closing
     const proc = this.proc,
       conn = this.conn
     // 先摘掉引用但不断开连接，下面还要用它让浏览器正常退出
     this.conn = null
     this.reset()
-    // Cookie 是浏览器正常退出时才落盘的，直接 kill 会丢掉刚写入的登录态
-    if (proc && conn && !conn.closed) await conn.send('Browser.close', {}, 5000).catch(() => ({}))
-    if (proc) {
-      await Promise.race([proc.exited, new Promise((resolve) => setTimeout(resolve, 5000))])
-      proc.kill()
-      await proc.exited
-    }
-    conn?.close()
+    this.closing = (async () => {
+      try {
+        // Cookie 在正常退出时落盘；已有调试连接时先请求正常退出。
+        if (proc && conn && !conn.closed) {
+          await conn.send('Browser.close', {}, 5000).catch(() => ({}))
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              proc.exited,
+              new Promise((resolve) => {
+                timer = setTimeout(resolve, 5000)
+              }),
+            ])
+          } finally {
+            clearTimeout(timer)
+          }
+        }
+        if (proc) {
+          proc.kill()
+          await proc.exited
+        }
+      } finally {
+        if (conn && !conn.closed) conn.close()
+      }
+    })().finally(() => {
+      this.closing = null
+    })
+    return this.closing
   }
 }

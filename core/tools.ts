@@ -54,6 +54,7 @@ export async function shareTool(p: SocialPorts, input: unknown, value: unknown, 
   writable(p)
   const text = textArg(value, 300)
   const item = await p.adapter.lookup(textArg(input, 2000), signal)
+  signal?.throwIfAborted()
   // 账本检查与落账之间不等待，避免并发工具重复消耗同一名额。
   if (!p.settings.shareEnabled) return t('分享已关闭')
   if (shareState(p.kv, p.settings, now).shares >= p.settings.shareDaily) return t('今日分享已达上限')
@@ -75,7 +76,7 @@ export async function shareTool(p: SocialPorts, input: unknown, value: unknown, 
   const delivery = await deliver(p, entry, text, now, signal)
   entry.shared = delivery.status !== 'failed'
   if (delivery.status === 'failed') unrecordShare(p.kv, item.id, now)
-  if (delivery.status === 'sent') attachSaid(p.kv, item.id, delivery.text)
+  if ('text' in delivery && delivery.text) attachSaid(p.kv, item.id, delivery.text)
   remember(p.kv, entry)
   const result = entry.delivered.at(-1)
   return result?.ok ? t('分享投递成功') : t('分享投递失败：{reason}', { reason: result?.error ?? t('未知错误') })
@@ -164,7 +165,7 @@ export interface ToolService {
 type Tool = ReturnType<Extension['tools']>[number]
 const str = { type: 'string' }
 /** 所有外部能力和时钟由端口传入，核心不自行访问网络或读取时间。 */
-export function homeTools(svc: ToolService): Tool[] {
+export function homeTools(svc: ToolService, { recordWatch = true } = {}): Tool[] {
   const tools: Tool[] = []
   const add = (
     name: string,
@@ -227,7 +228,7 @@ export function homeTools(svc: ToolService): Tool[] {
             String(args.id_or_url ?? ''),
             args.look === true ? 'full' : 'text',
             svc.rt.now(),
-            signal,
+            { signal, record: recordWatch },
           )
           return {
             content: digestMaterial(app, digest, 3000),

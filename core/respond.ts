@@ -4,6 +4,7 @@ import { loadShares, ownerMessages, settleShares } from './share'
 import { watchedHistory } from './state'
 
 export async function judgeResponses(p: DayPorts, now: number, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   const messages = ownerMessages(p.kv)
   if (!messages.length) return
   if (now - Math.max(...messages.map((m) => m.at)) < 180000 && now - Math.min(...messages.map((m) => m.at)) < 900000)
@@ -50,8 +51,8 @@ export async function judgeResponses(p: DayPorts, now: number, signal?: AbortSig
   }
   try {
     const s = p.settings
-    const home = p.kv.get<{ chatId: string }>('home')
-    if (!home) return
+    const home = p.kv.get<{ chatId: string; characterId?: string }>('home')
+    if (!home || (home.characterId && home.characterId !== s.characterId)) return
     const value = modelObject(
       await p.quietPrompt({
         chatId: home.chatId,
@@ -65,6 +66,7 @@ export async function judgeResponses(p: DayPorts, now: number, signal?: AbortSig
         signal,
       }),
     )
+    signal?.throwIfAborted()
     if (
       !value ||
       typeof value !== 'object' ||
@@ -79,12 +81,11 @@ export async function judgeResponses(p: DayPorts, now: number, signal?: AbortSig
     })
     finish()
   } catch (error) {
+    signal?.throwIfAborted()
     p.log(error)
     if (messages.some((m) => m.tries + 1 >= 3)) {
       // 模型不可用时宁可高估回应，避免错误进入安静模式。
-      const ids = loadShares(p.kv)
-        .entries.filter((e) => e.outcome === 'pending' && messages.some((m) => m.at >= e.at))
-        .map((e) => e.itemId)
+      const ids = remaining.filter((e) => messages.some((m) => m.at >= e.at)).map((e) => e.itemId)
       settleShares(p.kv, now, { type: 'responded', ids })
       finish()
     } else finish(true)

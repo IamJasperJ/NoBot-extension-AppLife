@@ -118,28 +118,46 @@ export function createLogin(
   browser: BrowserSession,
 ): AppAdapter['login'] & { active: () => boolean; logout: () => Promise<void> } {
   let current: QrSession | null = null
+  let stopWatching: (() => void) | undefined
+  const clearQr = () => {
+    current = null
+    stopWatching?.()
+    stopWatching = undefined
+  }
   const active = () => !!current && current.status !== 'done' && deps.runtime.now() < current.expiresAt
   async function check(credentials: AppCredentials) {
     // 手动登录的凭据先写进浏览器，之后的请求才会以这个账号发出
     const existing = await browser.cookies()
-    if (!existing.some((c) => c.name === 'sessionid' && c.value === credentials.sessionid))
-      await browser.setCookies(
-        Object.entries(credentials).map(([name, value]) => ({ name, value, domain: '.douyin.com' })),
-      )
-    const data = await api.get('/aweme/v1/web/user/profile/self/', {}, undefined, credentials)
-    const user = obj(data.user)
-    if (!str(user.sec_uid)) throw new Error(t('登录验证失败，请重新登录'))
-    return {
-      id: str(user.sec_uid),
-      name: str(user.nickname),
-      avatarUrl: str(arr(obj(user.avatar_thumb).url_list)[0]) || undefined,
+    const changed = !existing.some((c) => c.name === 'sessionid' && c.value === credentials.sessionid)
+    if (changed && browser.backend === 'chrome') throw new Error(t('请在 Chrome 里登录抖音后点接回登录'))
+    try {
+      if (changed) {
+        await browser.clearCookies()
+        await browser.setCookies(
+          Object.entries(credentials).map(([name, value]) => ({ name, value, domain: '.douyin.com' })),
+        )
+      }
+      const data = await api.get('/aweme/v1/web/user/profile/self/', {}, undefined, credentials)
+      const user = obj(data.user)
+      if (!str(user.sec_uid)) throw new Error(t('登录验证失败，请重新登录'))
+      return {
+        id: str(user.sec_uid),
+        name: str(user.nickname),
+        avatarUrl: str(arr(obj(user.avatar_thumb).url_list)[0]) || undefined,
+      }
+    } catch (error) {
+      if (changed) {
+        await browser.clearCookies()
+        if (existing.length) await browser.setCookies(existing)
+      }
+      throw error
     }
   }
   async function complete(cookies: BrowserCookie[]) {
     const credentials: AppCredentials = {}
     for (const c of cookies) if (/^[\w.-]+$/.test(c.name) && c.value) credentials[c.name] = c.value
     // check 会通过浏览器发请求，必须先解除登录锁。
-    current = null
+    clearQr()
     const account = await check(credentials)
     return { credentials, account }
   }
@@ -157,97 +175,111 @@ export function createLogin(
     check,
     active,
     async logout() {
-      current = null
+      clearQr()
       await browser.clearCookies()
     },
     async startQr() {
       if (browser.backend === 'chrome') throw new Error(t('请在 Chrome 里登录抖音后点接回登录'))
-      current = null
+      clearQr()
       // 换号：先清掉旧登录态，首页才会弹登录框
       await browser.clearCookies()
-      const session = await browser.run(async (page) => {
-        const watch = (response: { url(): string; text(): Promise<string> }) => {
-          if (!/\/passport\/web\/check_qrconnect\//.test(response.url())) return
-          void response
-            .text()
-            .then((text) => {
-              const data = obj(obj(parseJson(text)).data)
-              if (current && str(data.status)) current.status = str(data.status)
-            })
-            .catch(() => {})
-        }
-        page.off('response', watch)
-        page.on('response', watch)
-        // 立即接住拒绝，避免页面加载期间超时导致未处理的 Promise 拒绝。
-        const qr = page
-          .waitForResponse((r) => /\/passport\/web\/get_qrcode\//.test(r.url()), { timeout: 30000 })
-          .then(
-            (response) => ({ response, error: null }),
-            (error: unknown) => ({ response: null, error }),
+      const session = await browser
+        .run(async (page) => {
+          let listening = true
+          const watch = (response: { url(): string; text(): Promise<string> }) => {
+            if (!/\/passport\/web\/check_qrconnect\//.test(response.url())) return
+            void response
+              .text()
+              .then((text) => {
+                const data = obj(obj(parseJson(text)).data)
+                if (listening && current && str(data.status)) current.status = str(data.status)
+              })
+              .catch(() => {})
+          }
+          page.on('response', watch)
+          stopWatching = () => {
+            listening = false
+            page.off('response', watch)
+          }
+          // 立即接住拒绝，避免页面加载期间超时导致未处理的 Promise 拒绝。
+          const qr = page
+            .waitForResponse((r) => /\/passport\/web\/get_qrcode\//.test(r.url()), { timeout: 30000 })
+            .then(
+              (response) => ({ response, error: null }),
+              (error: unknown) => ({ response: null, error }),
+            )
+          await page.goto(`${BASE}/`, { timeout: 30000 })
+          // 登录框没有自己弹出来时，点右上角「登录」
+          await page.waitForTimeout(3000)
+          await page.evaluate(() => {
+            const button = document.querySelector('[data-e2e="login-button"]') as HTMLElement | null
+            if (button && !/扫码登录/.test(document.body.innerText)) button.click()
+            return true
+          }, null)
+          const result = await qr
+          if (
+            !result.response &&
+            !(
+              result.error instanceof Error &&
+              (result.error.message === t('等待页面响应超时') || result.error.name === 'TimeoutError')
+            )
           )
-        await page.goto(`${BASE}/`, { timeout: 30000 })
-        // 登录框没有自己弹出来时，点右上角「登录」
-        await page.waitForTimeout(3000)
-        await page.evaluate(() => {
-          const button = document.querySelector('[data-e2e="login-button"]') as HTMLElement | null
-          if (button && !/扫码登录/.test(document.body.innerText)) button.click()
-          return true
-        }, null)
-        const result = await qr
-        if (
-          !result.response &&
-          !(
-            result.error instanceof Error &&
-            (result.error.message === t('等待页面响应超时') || result.error.name === 'TimeoutError')
-          )
-        )
-          throw result.error
-        const text = result.response
-          ? await result.response.text()
-          : await page.evaluate(qrScript, null, { readonly: true }).catch(() => '')
-        let response: Record<string, unknown>
-        try {
-          response = obj(parseJson(text))
-        } catch (error) {
-          if (result.response) throw error
-          // 校验页或空响应不是二维码，统一给出可操作的登录提示。
-          response = {}
-        }
-        const data = obj(response.data)
-        if ((data.error_code != null && data.error_code !== 0) || response.message === 'error')
-          throw new Error(
-            t('抖音拒绝了这台机器的扫码登录（{reason}）。可以改用「手动填写」粘贴 Cookie', {
-              reason: str(data.description) || `error_code ${data.error_code}`,
-            }),
-          )
-        const url = str(data.qrcode_index_url)
-        if (!/^https:\/\//.test(url))
-          throw new Error(
-            result.response
-              ? t('二维码响应无效，请重新生成')
-              : t('抖音登录框没有加载出二维码，请稍后重试或改用「手动填写」'),
-          )
-        const expire = Number(data.expire_time) * 1000
-        return {
-          token: str(data.token) || crypto.randomUUID(),
-          url,
-          expiresAt: Math.min(deps.runtime.now() + 180000, expire > 0 ? expire : Infinity),
-        }
-      })
+            throw result.error
+          const text = result.response
+            ? await result.response.text()
+            : await page.evaluate(qrScript, null, { readonly: true }).catch(() => '')
+          let response: Record<string, unknown>
+          try {
+            response = obj(parseJson(text))
+          } catch (error) {
+            if (result.response) throw error
+            // 校验页或空响应不是二维码，统一给出可操作的登录提示。
+            response = {}
+          }
+          const data = obj(response.data)
+          if ((data.error_code != null && data.error_code !== 0) || response.message === 'error')
+            throw new Error(
+              t('抖音拒绝了这台机器的扫码登录（{reason}）。可以改用「手动填写」粘贴 Cookie', {
+                reason: str(data.description) || `error_code ${data.error_code}`,
+              }),
+            )
+          const url = str(data.qrcode_index_url)
+          if (!/^https:\/\//.test(url))
+            throw new Error(
+              result.response
+                ? t('二维码响应无效，请重新生成')
+                : t('抖音登录框没有加载出二维码，请稍后重试或改用「手动填写」'),
+            )
+          const expire = Number(data.expire_time) * 1000
+          return {
+            token: str(data.token) || crypto.randomUUID(),
+            url,
+            expiresAt: Math.min(deps.runtime.now() + 180000, expire > 0 ? expire : Infinity),
+          }
+        })
+        .catch((error: unknown) => {
+          clearQr()
+          throw error
+        })
       current = { token: session.token, expiresAt: session.expiresAt, status: 'new' }
       return session
     },
     async pollQr(token) {
+      const session = current
+      if (session && session.token !== token) return { status: 'expired' }
       // Cookie 比扫码接口可靠；即使二维码已过期或最后只收到 scanned，也能接回登录态。
       let cookies = await browser.cookies()
       if (hasSession(cookies)) return { status: 'confirmed', ...(await complete(cookies)) }
-      const session = current
-      if (!session || session.token !== token) return { status: 'expired' }
+      if (!session) return { status: 'expired' }
       const state = await verification()
-      if (deps.runtime.now() >= session.expiresAt) return { status: 'expired' }
+      if (deps.runtime.now() >= session.expiresAt) {
+        stopWatching?.()
+        stopWatching = undefined
+        return { status: 'expired' }
+      }
       if (state.step) return { status: 'verify', step: state.step, hint: state.hint }
       if (session.status === 'expired' || session.status === 'refused') {
-        current = null
+        clearQr()
         return { status: 'expired' }
       }
       if (session.status === 'scanned') return { status: 'scanned' }
@@ -295,7 +327,7 @@ export function createLogin(
       },
     },
     async fromBrowser() {
-      current = null
+      clearQr()
       const cookies = await browser.cookies()
       if (!hasSession(cookies)) throw new Error(t('浏览器里没有抖音登录态'))
       return complete(cookies)

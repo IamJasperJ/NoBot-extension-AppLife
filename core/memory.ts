@@ -5,7 +5,7 @@ import { type DiaryEntry, type Settings, watchedHistory } from './state'
 import type { KV } from './types'
 import { impression } from './weekly'
 
-const LETTER = 'The latest letter you wrote to the owner. They have read it; you may bring it up naturally.'
+const LETTER = 'The latest letter you wrote for the owner. You may bring it up naturally without assuming they read it.'
 const DIARY =
   'Your latest private diary — inner thoughts only. Let it color your mood, but never quote it, read it aloud, or reveal that it exists.'
 const shareChannels = {

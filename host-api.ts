@@ -2,13 +2,24 @@
 
 import type { Hono } from '../../apps/server/node_modules/hono'
 import type { BuildInput } from '../../packages/core/src/prompt/build'
-import type { ApiPresetDTO, ChatDTO, ExtensionSettingField, MessageDTO, PersonaDTO } from '../../packages/shared/src'
+import type {
+  ApiPresetDTO,
+  ChatDTO,
+  ExtensionSettingField,
+  GenerateEvent,
+  MessageDTO,
+  PersonaDTO,
+} from '../../packages/shared/src'
 import type { KV } from './core/types'
 export interface Host {
   createChat(input: { characterId: string }): ChatDTO
   getChatInfo(id: string, limit?: number): { chat: ChatDTO; characters: { id: string }[]; messages: MessageDTO[] }
-  trigger(id: string, options?: { instruction?: string }): void
-  waitIdle(id: string, ms: number): Promise<void>
+  trigger(
+    id: string,
+    options?: { instruction?: string; onEvent?: (event: GenerateEvent) => void },
+    // biome-ignore lint/suspicious/noConfusingVoidType: 与会返回 void 的旧宿主接口兼容。
+  ): void | (() => void)
+  waitIdle(id: string, ms: number, signal?: AbortSignal): Promise<void>
   isGenerating(id: string): boolean
   appendMessage(id: string, input: { role: 'user' | 'system'; content: string }): MessageDTO
   quietPrompt(opts: {
@@ -48,7 +59,7 @@ export interface Extension {
   defaultSettings: Record<string, unknown>
   settingsSchema: ExtensionSettingField[]
   startBackground(ctx: Omit<ExtensionContext, 'chatId'>, signal: AbortSignal): void
-  dispose(): void
+  dispose(): void | Promise<void>
   hooks: {
     beforePrompt(input: BuildInput, ctx: ExtensionContext): BuildInput
     onEvent(event: { type: string; message?: MessageDTO }, ctx: ExtensionContext): Promise<void>
@@ -152,6 +163,7 @@ export interface ChannelAPI {
     providerId: string,
     options: { chat: { id: string; title: string; scope?: 'private' | 'group' }; chatId: string },
   ): Promise<{ bindingId: string }> | { bindingId: string }
+  releaseOwnerBinding?(providerId: string, options: { externalId: string; chatId: string }): void | Promise<void>
   lookupAll?(chatId: string): ChannelLookup[]
   lookup(chatId: string): ChannelLookup | null
 }

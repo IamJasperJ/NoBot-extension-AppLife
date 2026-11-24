@@ -58,9 +58,9 @@ test('三段结构、信可提起、日记保密，并按时间取最新正文',
     entry('private', 'inner thoughts'),
     entry('letter', 'old', now - 1),
   ])
-  kv.set('history', [item('video')])
+  kv.set('history', [{ ...item('broken'), notes: undefined }, item('video'), { id: 'legacy' }])
   const text = lifeMemory(kv, defaults, 'bilibili', now)
-  expect(text).toContain('They have read it; you may bring it up naturally.')
+  expect(text).toContain('without assuming they read it.')
   expect(text).toContain('never quote it, read it aloud, or reveal that it exists.')
   expect(text).toContain('What you did on bilibili in the last 3 days.')
   expect(text).toContain('owner = how the owner reacted')

@@ -149,11 +149,20 @@ test('私信只取对方消息，按大整数 afterSeq 过滤排序，不确定�
   await expect(f.adapter.directMessages.send('owner', '你好')).rejects.toMatchObject({ code: 'UNCERTAIN' })
 })
 
-function fakeBrowser() {
+function fakeBrowser({
+  backend,
+  stored,
+  current,
+}: {
+  backend?: BrowserSession['backend']
+  stored?: string
+  current?: string
+} = {}) {
   let url = 'about:blank'
   let verify = false
   let locked = false
   const visits: string[] = []
+  const setSessions: string[] = []
   const page: BrowserPage = {
     url: () => url,
     goto: async (next) => {
@@ -178,9 +187,12 @@ function fakeBrowser() {
     screenshot: async () => new Uint8Array(),
   }
   const browser: BrowserSession = {
+    backend,
     run: async (fn) => fn(page),
-    cookies: async () => [],
-    setCookies: async () => {},
+    cookies: async () => (current ? [{ name: 'sessionid', value: current, domain: '.douyin.com' }] : []),
+    setCookies: async (cookies) => {
+      setSessions.push(cookies.find((c) => c.name === 'sessionid')!.value)
+    },
     clearCookies: async () => {},
     available: () => ({ ok: true, detail: '' }),
     close: async () => {},
@@ -190,11 +202,15 @@ function fakeBrowser() {
     fallbackCalls.push(String(input))
     return Response.json({ fallback: true })
   }) as typeof fetch
-  const transport = createTransport(browser, fallback, { credentials: () => null, blocked: () => locked })
+  const transport = createTransport(browser, fallback, {
+    credentials: () => (stored ? { sessionid: stored } : null),
+    blocked: () => locked,
+  })
   return {
     visits,
     fallbackCalls,
     transport,
+    setSessions,
     verify: () => {
       verify = true
     },
@@ -203,6 +219,25 @@ function fakeBrowser() {
     },
   }
 }
+
+test('浏览器里换号后停止发请求，只有服务器浏览器缺失凭据时才恢复原账号', async () => {
+  const url = `${BASE}/aweme/v1/web/tab/feed/`
+  for (const options of [
+    { backend: 'chrome', stored: 'stored' },
+    { backend: 'headless', stored: 'stored', current: 'another' },
+  ] as const) {
+    const f = fakeBrowser(options)
+    await expect(f.transport(url)).rejects.toMatchObject({ beforeDispatch: true })
+    expect(f.visits).toEqual([])
+    expect(f.setSessions).toEqual([])
+  }
+  const headless = fakeBrowser({ backend: 'headless', stored: 'stored' })
+  expect((await headless.transport(url)).ok).toBe(true)
+  expect(headless.setSessions).toEqual(['stored'])
+  const login = fakeBrowser({ backend: 'chrome', stored: 'stored', current: 'another' })
+  expect((await login.transport(url, { headers: { cookie: 'sessionid=another' } })).ok).toBe(true)
+  expect(login.setSessions).toEqual([])
+})
 
 test('浏览器传输：其他主机走 fallback，评论先导航，验证码返回 VERIFY，登录锁禁止请求', async () => {
   const f = fakeBrowser()

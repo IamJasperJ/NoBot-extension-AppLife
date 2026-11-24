@@ -33,7 +33,7 @@ export function setup() {
   let failure = false
   const p: DayPorts = {
     kv: f.kv,
-    settings: { ...defaults },
+    settings: { ...defaults, characterId: 'character' },
     adapter: createBilibiliAdapter(f.deps),
     guard: f.guard,
     home: async () => 'home',

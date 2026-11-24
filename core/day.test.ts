@@ -79,6 +79,30 @@ test('跳过不浏览，只发休息消息和私人日记', async () => {
   expect(x.f.kv.get<DiaryEntry[]>('diary')?.map((e) => e.kind)).toEqual(['private'])
   expect(x.f.kv.get('lastRun')).toMatchObject({ ok: true })
 })
+test('休息计划在平台未登录时也能写日记，关闭私人日记时仅发休息消息', async () => {
+  for (const privateDiary of [true, false]) {
+    const x = setup()
+    x.p.loggedIn = () => false
+    x.p.settings.privateDiary = privateDiary
+    await runDay(x.p, now, () => 0, undefined, 'skip')
+    expect(x.triggers).toHaveLength(1)
+    expect(x.notes).toHaveLength(0)
+    expect(x.f.kv.get<DiaryEntry[]>('diary') ?? []).toHaveLength(privateDiary ? 1 : 0)
+  }
+})
+
+test('宿主任务收到日常流程失败，静默生成被取消后不保存日记', async () => {
+  const x = setup()
+  const controller = new AbortController()
+  const failure = new Error('test cancellation')
+  x.p.quietPrompt = async () => {
+    controller.abort(failure)
+    return 'late result'
+  }
+  await expect(runDay(x.p, now, () => 0, controller.signal, 'skip', true)).rejects.toBe(failure)
+  expect(x.f.kv.get('lastRun')).toMatchObject({ ok: false })
+  expect(x.f.kv.get('diary')).toBeUndefined()
+})
 test('筛 maxVideos、深读 deepReads，无图仍能精读；额度、信件 id、日记与素材边界', async () => {
   const x = setup()
   await runDay(x.p, now, () => 0)
@@ -415,7 +439,7 @@ test('私信渠道静默生成正文并附链接，只记私信投递和实际�
   const entry = x.f.kv.get<HistoryItem[]>('history')!.find((e) => e.shared)!
   expect(sent).toEqual([`private diary\n${entry.url}`])
   expect(entry.delivered).toEqual([{ via: 'dm', ok: true, at: now }])
-  expect(x.f.kv.get('shares')).toMatchObject({ entries: [{ said: 'private diary' }] })
+  expect(x.f.kv.get('shares')).toMatchObject({ entries: [{ said: 'private diary\nhttps://item/0' }] })
 })
 
 test('评论渠道只生成公开短评，不触发绑定会话，并记实际评论正文', async () => {

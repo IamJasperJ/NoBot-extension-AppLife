@@ -1,13 +1,18 @@
 import { expect, jest, mock, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import * as net from 'node:net'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { Hono } from '../../apps/server/node_modules/hono'
+import type { GenerateEvent, MessageDTO } from '../../packages/shared/src'
 import { CdpSession } from './apps/douyin/cdp'
+import * as browserInstaller from './apps/douyin/install'
 import * as dayCore from './core/day'
 import * as dmCore from './core/dm'
 import * as planCore from './core/plan'
 import * as host from './host'
-import { ChannelSendError, type ExtensionContext, type Host } from './host-api'
+import { type ChannelLookup, ChannelSendError, type ExtensionContext, type Host } from './host-api'
 import { setLanguageSource } from './i18n'
 import extension, { browserProxyReachable, Service } from './server'
 import { fixture, memory } from './test-utils'
@@ -116,7 +121,7 @@ test('Chrome 管理路由撤销立即生效，查看类路由离线不回落到�
     expect(await (await app.request('/chrome/status')).json()).toMatchObject({ paired: false, online: false })
     expect(typeof (await host.websocketUpgrade())).toBe('function')
   } finally {
-    extension.dispose()
+    await extension.dispose()
     screenshot.mockRestore()
     reopen.mockRestore()
     root.mockRestore()
@@ -173,13 +178,261 @@ function backgroundFixture(managed = true) {
     registrations,
     lifetime,
     log,
-    close() {
+    root,
+    async close() {
       lifetime.abort()
-      extension.dispose()
+      await extension.dispose()
       root.mockRestore()
     },
   }
 }
+
+function savedReply(id: string, changes: Partial<MessageDTO> = {}): MessageDTO {
+  return {
+    id,
+    chatId: 'home',
+    parentId: 'source',
+    role: 'assistant',
+    content: '本轮分享',
+    status: 'done',
+    meta: {},
+    speakerId: 'character',
+    createdAt: 1,
+    swipeIndex: 1,
+    swipeCount: 1,
+    ...changes,
+  }
+}
+
+test('主动分享只读取本轮任务的正式回复，切换分支和工具中间轮不影响结果', async () => {
+  const f = backgroundFixture()
+  const subscribed = Promise.withResolvers<(event: GenerateEvent) => void>()
+  const unsubscribe = mock(() => {})
+  const readHistory = spyOn(f.ctx.host, 'getChatInfo')
+  f.ctx.host.waitIdle = mock(async () => {})
+  f.ctx.host.trigger = (_id, options) => {
+    subscribed.resolve(options!.onEvent!)
+    return unsubscribe
+  }
+  try {
+    const finished = mock(() => {})
+    const sharing = new Service(f.ctx).trigger('home', 'Share this video')
+    void sharing.then(finished, finished)
+    const emit = await subscribed.promise
+    emit({ type: 'done', message: savedReply('foreign', { chatId: 'other' }) })
+    emit({
+      type: 'done',
+      message: savedReply('tool', { meta: { toolCalls: [{ id: 'tool', name: 'tool', arguments: '{}' }] } }),
+    })
+    emit({ type: 'done', message: savedReply('share') })
+    readHistory.mockReturnValue({ ...readHistory('home'), messages: [savedReply('manual')] })
+    readHistory.mockClear()
+    emit({ type: 'message', message: savedReply('manual') })
+    await Promise.resolve()
+    expect(finished).not.toHaveBeenCalled()
+    emit({ type: 'complete' })
+    expect(await sharing).toEqual({ id: 'share', text: '本轮分享' })
+    expect(readHistory).not.toHaveBeenCalled()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  } finally {
+    await f.close()
+  }
+})
+
+test('任务失败、回复被中止或旧宿主缺少任务事件时，主动分享不采用当前分支的文本', async () => {
+  const f = backgroundFixture()
+  const unsubscribe = mock(() => {})
+  f.ctx.host.waitIdle = async () => {}
+  const svc = new Service(f.ctx)
+  try {
+    f.ctx.host.trigger = (_id, options) => {
+      options!.onEvent!({ type: 'done', message: savedReply('interrupted') })
+      options!.onEvent!({ type: 'message', message: savedReply('interrupted', { status: 'aborted' }) })
+      options!.onEvent!({ type: 'complete' })
+      return unsubscribe
+    }
+    await expect(svc.trigger('home', 'Share')).rejects.toThrow('未找到本轮角色回复')
+    f.ctx.host.trigger = (_id, options) => {
+      options!.onEvent!({ type: 'done', message: savedReply('partial') })
+      options!.onEvent!({ type: 'error', code: 'MODEL', message: '模型生成失败' })
+      options!.onEvent!({ type: 'complete' })
+      return unsubscribe
+    }
+    await expect(svc.trigger('home', 'Share')).rejects.toThrow('未找到本轮角色回复')
+    f.ctx.host.trigger = () => {}
+    await expect(svc.trigger('home', 'Share')).rejects.toThrow('当前 NoBot 版本无法确认本轮角色回复')
+    expect(unsubscribe).toHaveBeenCalledTimes(2)
+  } finally {
+    await f.close()
+  }
+})
+
+test('等待分享回复时取消，释放宿主任务监听', async () => {
+  const f = backgroundFixture()
+  const subscribed = Promise.withResolvers<void>()
+  const unsubscribe = mock(() => {})
+  const controller = new AbortController()
+  f.ctx.host.waitIdle = mock(async () => {})
+  f.ctx.host.trigger = () => {
+    subscribed.resolve()
+    return unsubscribe
+  }
+  try {
+    const pending = new Service(f.ctx).trigger('home', 'Share', controller.signal).catch((error: unknown) => error)
+    await subscribed.promise
+    controller.abort(new Error('停用任务'))
+    expect(await pending).toMatchObject({ message: '停用任务' })
+    expect(f.ctx.host.waitIdle).toHaveBeenCalledWith('home', 120000, controller.signal)
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  } finally {
+    controller.abort()
+    await f.close()
+  }
+})
+
+test('关闭后台时使用启动时的用户目录，无须请求上下文也会关闭浏览器', async () => {
+  const f = backgroundFixture()
+  const close = spyOn(CdpSession.prototype, 'close').mockResolvedValue()
+  const reopen = spyOn(CdpSession.prototype, 'reopen').mockResolvedValue(new Uint8Array([1]))
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    const app = new Hono()
+    extension.routes(app, f.ctx)
+    expect((await app.request('/browser/reopen', { method: 'POST' })).status).toBe(200)
+    f.root.mockClear()
+    f.lifetime.abort()
+    expect(f.root).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledTimes(1)
+  } finally {
+    await f.close()
+    reopen.mockRestore()
+    close.mockRestore()
+  }
+})
+
+test('停用后重载仍等待旧浏览器退出，浏览器清理失败也完成收尾', async () => {
+  const f = backgroundFixture()
+  const exit = Promise.withResolvers<void>()
+  const close = spyOn(CdpSession.prototype, 'close').mockImplementation(() => exit.promise)
+  const reopen = spyOn(CdpSession.prototype, 'reopen').mockResolvedValue(new Uint8Array([1]))
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    const app = new Hono()
+    extension.routes(app, f.ctx)
+    expect((await app.request('/browser/reopen', { method: 'POST' })).status).toBe(200)
+    f.lifetime.abort()
+    expect(close).toHaveBeenCalledTimes(1)
+    const completed = mock(() => {})
+    const dispose = Promise.resolve(extension.dispose()).then(completed)
+    await Bun.sleep(0)
+    expect(completed).not.toHaveBeenCalled()
+    exit.reject(new Error('模拟浏览器清理失败'))
+    await dispose
+    expect(completed).toHaveBeenCalledTimes(1)
+    expect(close).toHaveBeenCalledTimes(1)
+  } finally {
+    exit.resolve()
+    await f.close()
+    reopen.mockRestore()
+    close.mockRestore()
+  }
+})
+
+test('浏览器安装路由启动的下载在停用时取消，重载等待命令收尾', async () => {
+  const f = backgroundFixture()
+  const directory = await mkdtemp(join(tmpdir(), 'app-life-install-route-'))
+  f.root.mockReturnValue(directory)
+  const download = Promise.withResolvers<AbortSignal>()
+  const release = Promise.withResolvers<void>()
+  const close = spyOn(CdpSession.prototype, 'close').mockResolvedValue()
+  const createInstaller = browserInstaller.createInstaller
+  const create = spyOn(browserInstaller, 'createInstaller').mockImplementation((dir, options) =>
+    createInstaller(dir, {
+      ...options,
+      which: () => '/fake',
+      sh: async (cmd, _cwd, _timeout, _env, signal) => {
+        if (cmd[0] === 'dpkg') return 'amd64'
+        if (cmd.includes('-s')) return 'Inst chromium'
+        if (cmd.includes('download')) {
+          download.resolve(signal)
+          await release.promise
+          signal.throwIfAborted()
+        }
+        return ''
+      },
+    }),
+  )
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    const app = new Hono()
+    extension.routes(app, f.ctx)
+    expect((await app.request('/browser/install', { method: 'POST' })).status).toBe(200)
+    const signal = await download.promise
+    const rejected = await app.request('/browser', { method: 'DELETE' })
+    expect(rejected.status).toBe(400)
+    expect(await rejected.json()).toMatchObject({ error: { message: '正在安装，请稍后' } })
+    expect(close).not.toHaveBeenCalled()
+    f.lifetime.abort()
+    expect(signal.aborted).toBe(true)
+    const completed = mock(() => {})
+    const disposing = Promise.resolve(extension.dispose()).then(completed)
+    await Bun.sleep(0)
+    expect(completed).not.toHaveBeenCalled()
+    release.resolve()
+    await disposing
+    expect(completed).toHaveBeenCalledTimes(1)
+  } finally {
+    release.resolve()
+    await f.close()
+    close.mockRestore()
+    create.mockRestore()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('卸载等待浏览器退出，阻止新安装并合并重复的卸载请求', async () => {
+  const f = backgroundFixture()
+  const directory = await mkdtemp(join(tmpdir(), 'app-life-removal-route-'))
+  f.root.mockReturnValue(directory)
+  const binary = join(directory, 'app-life/browser/root/usr/lib/chromium/chromium')
+  const profile = join(directory, 'app-life/douyin-profile')
+  const closing = Promise.withResolvers<void>()
+  const close = spyOn(CdpSession.prototype, 'close').mockImplementation(() => closing.promise)
+  try {
+    await mkdir(dirname(binary), { recursive: true })
+    await writeFile(binary, 'installed browser fixture')
+    await mkdir(profile, { recursive: true })
+    await writeFile(join(profile, 'login-data'), 'preserved login fixture')
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    const app = new Hono()
+    extension.routes(app, f.ctx)
+
+    const removal = app.request('/browser', { method: 'DELETE' })
+    const repeated = app.request('/browser', { method: 'DELETE' })
+    const rejected = await app.request('/browser/install', { method: 'POST' })
+    expect(rejected.status).toBe(400)
+    expect(await rejected.json()).toMatchObject({ error: { message: '正在卸载浏览器组件，请稍后' } })
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(await Bun.file(binary).exists()).toBe(true)
+
+    f.lifetime.abort()
+    const completed = mock(() => {})
+    const disposing = Promise.resolve(extension.dispose()).then(completed)
+    await Bun.sleep(0)
+    expect(completed).not.toHaveBeenCalled()
+    closing.resolve()
+    expect((await removal).status).toBe(200)
+    expect((await repeated).status).toBe(200)
+    await disposing
+    expect(await Bun.file(binary).exists()).toBe(false)
+    expect(await Bun.file(join(profile, 'login-data')).text()).toBe('preserved login fixture')
+  } finally {
+    closing.resolve()
+    await f.close()
+    close.mockRestore()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 test('宿主注册两项 skip 周期任务，首轮约一秒，回调等待整轮完成', async () => {
   const f = backgroundFixture()
@@ -224,7 +477,7 @@ test('宿主注册两项 skip 周期任务，首轮约一秒，回调等待整�
     release()
     await run
     expect(finished).toBe(true)
-    expect(dm).toHaveBeenCalledTimes(1)
+    expect(dm).not.toHaveBeenCalled()
     let releaseDm!: () => void
     dm.mockImplementationOnce(async () => {
       await new Promise<void>((resolve) => {
@@ -236,7 +489,7 @@ test('宿主注册两项 skip 周期任务，首轮约一秒，回调等待整�
       finished = true
     })
     await Promise.resolve()
-    expect(dm).toHaveBeenCalledTimes(2)
+    expect(dm).toHaveBeenCalledTimes(1)
     expect(finished).toBe(false)
     releaseDm()
     await messages
@@ -247,7 +500,29 @@ test('宿主注册两项 skip 周期任务，首轮约一秒，回调等待整�
     dm.mockRestore()
     plan.mockRestore()
     interval.mockRestore()
-    f.close()
+    await f.close()
+  }
+})
+
+test('登录切换与后台任务共用运行锁，在改动浏览器前保护待回复私信', async () => {
+  const f = backgroundFixture()
+  const service = new Service(f.ctx)
+  const login = mock(async () => 'done')
+  try {
+    f.ctx.storage.set('douyin:dm', { pendingReplies: [{ userMessageId: 'msg', peerId: 'owner', at: Date.now() }] })
+    await expect(service.loginOperation('douyin', login)).rejects.toMatchObject({ code: 'PENDING_DM' })
+    expect(login).not.toHaveBeenCalled()
+    f.ctx.storage.delete('douyin:dm')
+    await expect(
+      service.loginOperation('douyin', async () => {
+        expect(await service.wake(true)).toBe(false)
+        return login()
+      }),
+    ).resolves.toBe('done')
+    expect(service.dmBusy).toBe(false)
+    expect(login).toHaveBeenCalledTimes(1)
+  } finally {
+    await f.close()
   }
 })
 
@@ -293,7 +568,7 @@ test('任务取消传入 runDay 与私信，生命周期不被任务取消；异
     day.mockRestore()
     dm.mockRestore()
     plan.mockRestore()
-    f.close()
+    await f.close()
   }
 })
 
@@ -311,7 +586,7 @@ test('旧宿主保留两个定时器、启动立即 tick，生命周期结束清
     f.lifetime.abort()
     for (const result of interval.mock.results) expect(clear).toHaveBeenCalledWith(result.value)
   } finally {
-    f.close()
+    await f.close()
     interval.mockRestore()
     clear.mockRestore()
     plan.mockRestore()
@@ -355,7 +630,7 @@ test('渠道只在能力存在且设置开启时注册，账号带固定角色�
           await started
         } else expect(ensureAccount).not.toHaveBeenCalled()
       } finally {
-        f.close()
+        await f.close()
       }
     }
   }
@@ -445,7 +720,7 @@ test('多绑定按本轮来源隔离 hook 与工具，ownerPresent 和家里会�
     )
   } finally {
     personas.mockRestore()
-    f.close()
+    await f.close()
   }
 })
 
@@ -480,7 +755,7 @@ test('后台运行中开启渠道会在下一轮消息任务注册，角色变�
     await f.registrations.find((item) => item.definition.id === 'messages')!.run(new AbortController().signal)
     expect(providers).toHaveLength(1)
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -540,7 +815,7 @@ test('v2 宿主：关闭渠道时注销平台，重新开启再注册', async ()
     controller.abort()
     await started
   } finally {
-    f.close()
+    await f.close()
   }
 })
 
@@ -565,7 +840,7 @@ test('nearestUserMessage 沿父链找最近用户消息，读不到时返回 und
   expect(nearestUserMessage(broken, { chatId: 'c', parentId: 't1' })).toBeUndefined()
 })
 
-test('主人渠道能力切换：新宿主停用抖音专线，旧宿主保留；B 站轮询与回复不变', async () => {
+test('主人渠道接管后停止读取专线，接管前的等待消息仍通过专线回复', async () => {
   for (const supported of [false, true]) {
     const f = backgroundFixture()
     const poll = spyOn(dmCore, 'pollOwnerDm').mockResolvedValue()
@@ -580,6 +855,11 @@ test('主人渠道能力切换：新宿主停用抖音专线，旧宿主保留�
       liveListen: false,
     }
     f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
+    const info = f.ctx.host.getChatInfo
+    f.ctx.host.getChatInfo = (...args) => ({
+      ...info(...args),
+      messages: [{ id: 'source', parentId: null, role: 'user' } as import('../../packages/shared/src').MessageDTO],
+    })
     f.ctx.channels = {
       registerProvider: () => ({ unregister() {} }),
       ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
@@ -601,27 +881,75 @@ test('主人渠道能力切换：新宿主停用抖音专线，旧宿主保留�
           pendingReplies: [{ userMessageId: 'source', peerId: 'owner', at: Date.now() }],
         })
       }
-      await extension.hooks.onEvent(
-        {
-          type: 'message:saved',
-          message: {
-            chatId: 'home',
-            role: 'assistant',
-            content: '回复',
-            status: 'done',
-            meta: {},
-          } as import('../../packages/shared/src').MessageDTO,
-        },
-        { ...f.ctx, chatId: 'home' },
-      )
-      expect(reply.mock.calls.map(([p]) => p.adapter.id).sort()).toEqual(
-        supported ? ['bilibili'] : ['bilibili', 'douyin'],
-      )
+      const emitReply = (parentId: string, status: MessageDTO['status'] = 'done') =>
+        extension.hooks.onEvent(
+          {
+            type: 'message:saved',
+            message: {
+              chatId: 'home',
+              parentId,
+              role: 'assistant',
+              content: '回复',
+              status,
+              meta: {},
+            } as import('../../packages/shared/src').MessageDTO,
+          },
+          { ...f.ctx, chatId: 'home' },
+        )
+      await emitReply('missing')
+      await emitReply('source', 'aborted')
+      expect(reply).not.toHaveBeenCalled()
+      await emitReply('source')
+      expect(reply.mock.calls.map(([p]) => p.adapter.id).sort()).toEqual(['bilibili', 'douyin'])
     } finally {
       poll.mockRestore()
       reply.mockRestore()
-      f.close()
+      await f.close()
     }
+  }
+})
+
+test('关闭渠道后迁移旧主人游标，换登录账号时从新基线开始', async () => {
+  const f = backgroundFixture()
+  const svc = new Service(f.ctx)
+  const store = f.ctx.storage
+  const owner = 'MS4wLjABowner12345678'
+  try {
+    f.ctx.settings = { ...f.ctx.settings, douyinEnabled: true, douyinOwnerId: owner }
+    store.set('channel-owner', { key: `${owner}:home`, since: 10 })
+    store.set('channel-cursors', { [owner]: { seq: '123', lastAt: 13 } })
+    svc.registerChannel()
+    expect(store.get('channel-owner')).toBeUndefined()
+    expect(store.get('douyin:dm')).toMatchObject({ cursor: '123', cursorPeer: owner })
+    f.ctx.settings.douyinChannel = true
+    svc.storeLogin('douyin', { sessionid: 'new' }, { id: 'new-account', name: 'new' })
+    expect(store.get('channel-cursors')).toBeUndefined()
+    expect(store.get('douyin:dm')).toBeUndefined()
+    expect(store.get('channel-since')).toBeNumber()
+  } finally {
+    await f.close()
+  }
+})
+
+test('抖音渠道创建失败时先完成 B 站轮询，再向宿主报告失败', async () => {
+  const f = backgroundFixture()
+  const poll = spyOn(dmCore, 'pollOwnerDm').mockResolvedValue()
+  const failure = new Error('channel account creation failed')
+  f.ctx.settings = { ...f.ctx.settings, douyinEnabled: true, douyinChannel: true }
+  f.ctx.channels = {
+    registerProvider: () => ({ unregister() {} }),
+    ensureAccount: async () => {
+      throw failure
+    },
+    lookup: () => null,
+  }
+  try {
+    extension.startBackground(f.ctx, f.lifetime.signal)
+    await expect(Promise.resolve(f.registrations[1]!.run(new AbortController().signal))).rejects.toBe(failure)
+    expect(poll.mock.calls.map(([p]) => p.adapter.id)).toEqual(['bilibili'])
+  } finally {
+    poll.mockRestore()
+    await f.close()
   }
 })
 
@@ -672,7 +1000,7 @@ test('渠道出站等待私信锁释放，五分钟超时才 busy，取消等待
       }
       expect(sleeps).toBe(mode === 'timeout' ? 300 : mode === 'already-aborted' ? 0 : 1)
     } finally {
-      f.close()
+      await f.close()
     }
   }
 })
@@ -681,6 +1009,22 @@ test('表情工具只提供给抖音来源回合，解析含冒号的目标，�
   const f = backgroundFixture()
   f.ctx.storage.set('cred:douyin', { sessionid: 'test' })
   let clientMessageId = 'app-life.douyin:group:7705:123'
+  const group: ChannelLookup = {
+    provider: 'app-life.douyin',
+    accountId: 'account',
+    bindingId: 'binding-group',
+    scope: 'group',
+    external: { chat: '7705', title: '测试群' },
+    actors: [],
+    ownerPresent: false,
+  }
+  const privateChat: ChannelLookup = {
+    ...group,
+    bindingId: 'binding-private',
+    scope: 'private',
+    external: { chat: 'peer', title: '访客' },
+  }
+  let bindings = [group, privateChat]
   f.ctx.settings = { ...f.ctx.settings, bilibiliEnabled: false, douyinEnabled: true, douyinChannel: true }
   f.ctx.host.getChatInfo = () =>
     ({ characters: [{ id: 'character' }], messages: [{ role: 'user', meta: { clientMessageId } }] }) as ReturnType<
@@ -688,7 +1032,7 @@ test('表情工具只提供给抖音来源回合，解析含冒号的目标，�
     >
   f.ctx.channels = {
     lookup: () => null,
-    lookupAll: () => [],
+    lookupAll: (chatId) => (chatId === 'visitor' ? bindings : []),
     registerProvider: () => ({ unregister() {} }),
     ensureAccount: async () => ({ accountId: 'account', characterFollowed: true }),
   }
@@ -703,22 +1047,29 @@ test('表情工具只提供给抖音来源回合，解析含冒号的目标，�
     const ctx: ExtensionContext = { ...f.ctx, chatId: 'visitor' }
     const tool = extension.tools(ctx).find((tool) => tool.name === 'douyin_send_sticker')!
     expect(tool).toBeDefined()
+    expect(extension.tools({ ...ctx, chatId: 'legacy-copy' }).map((item) => item.name)).not.toContain(tool.name)
     expect(extension.tools(ctx).map((tool) => tool.name)).toContain('douyin_watch')
     expect(extension.tools(ctx).map((tool) => tool.name)).toContain('douyin_search')
     expect(await tool.run({ name: '比心' }, { signal: f.lifetime.signal })).toEqual({ content: 'Sticker sent.' })
-    expect(send).toHaveBeenCalledWith('group:7705', '比心', f.lifetime.signal)
+    expect(send).toHaveBeenCalledWith('group:7705', '比心', f.lifetime.signal, expect.any(Function))
     clientMessageId = 'app-life.douyin:peer:456'
-    await extension
-      .tools(ctx)
-      .find((tool) => tool.name === 'douyin_send_sticker')!
-      .run({ name: '比心' }, { signal: f.lifetime.signal })
-    expect(send).toHaveBeenLastCalledWith('peer', '比心', f.lifetime.signal)
+    const privateTool = extension.tools(ctx).find((item) => item.name === 'douyin_send_sticker')!
+    await privateTool.run({ name: '比心' }, { signal: f.lifetime.signal })
+    expect(send).toHaveBeenLastCalledWith('peer', '比心', f.lifetime.signal, expect.any(Function))
     send.mockResolvedValueOnce({ status: 'unknown-sticker', names: ['摇骰子'] })
-    expect((await tool.run({ name: '未知' }, {})).content).toContain('Available names: ["摇骰子"]')
+    expect((await privateTool.run({ name: '未知' }, {})).content).toContain('Available names: ["摇骰子"]')
     send.mockRejectedValueOnce(new ChannelSendError('unknown', 'uncertain'))
-    expect((await tool.run({ name: '比心' }, {})).content).toBe('Sticker result uncertain. Do not retry.')
+    expect((await privateTool.run({ name: '比心' }, {})).content).toBe('Sticker result uncertain. Do not retry.')
     send.mockRejectedValueOnce(new ChannelSendError('not-sent', 'sticker-cooldown'))
-    expect((await tool.run({ name: '比心' }, {})).content).toContain('Sticker not sent: Wait at least 30 seconds')
+    expect((await privateTool.run({ name: '比心' }, {})).content).toContain(
+      'Sticker not sent: Wait at least 30 seconds',
+    )
+    bindings = [group]
+    const attempts = send.mock.calls.length
+    expect(extension.tools(ctx).map((item) => item.name)).not.toContain(privateTool.name)
+    expect((await privateTool.run({ name: '比心' }, {})).content).toContain('binding has changed')
+    expect(send).toHaveBeenCalledTimes(attempts)
+    bindings = [group, privateChat]
     clientMessageId = 'web-message'
     expect(extension.tools(ctx).some((tool) => tool.name === 'douyin_send_sticker')).toBe(false)
     clientMessageId = 'app-life.douyin:peer:456'
@@ -729,6 +1080,6 @@ test('表情工具只提供给抖音来源回合，解析含冒号的目标，�
     expect(extension.tools(ctx).some((tool) => tool.name === 'douyin_send_sticker')).toBe(false)
   } finally {
     send.mockRestore()
-    f.close()
+    await f.close()
   }
 })

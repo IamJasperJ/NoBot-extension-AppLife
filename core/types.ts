@@ -124,7 +124,8 @@ export interface TrafficStatus {
 export interface TrafficGuard {
   /** 带保护的 fetch：init.waitWriteMs > 0 时写冷却会等待（最多 180 秒），否则直接抛 COOLDOWN */
   fetch(input: string | URL, init?: RequestInit & { waitWriteMs?: number }): Promise<Response>
-  status(): TrafficStatus
+  /** 传入凭据时只返回该账号的人工暂停记录，平台级自动退避仍生效。 */
+  status(headers?: HeadersInit): TrafficStatus
   /** 当前账号若被暂停，返回原因文字；否则 null */
   pauseReason(headers: HeadersInit): string | null
   /** 用户处理完验证码 / 重新登录后解除人工暂停 */

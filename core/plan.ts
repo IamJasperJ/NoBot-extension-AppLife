@@ -23,6 +23,8 @@ export interface Plan {
   windowKey?: string
   startsAt?: number
   endsAt?: number
+  slotEndsAt?: number
+  manualRestDate?: string
   reason?: string
   done?: boolean
   withinWindow?: string
@@ -36,23 +38,41 @@ function stamp(day: string, minutes: number) {
   d.setMinutes(minutes)
   return d.getTime()
 }
-function parse(s: string) {
+function parse(s: unknown) {
+  if (typeof s !== 'string') return
   const m = /^(\d{1,2}):(\d{2})$/.exec(s)
-  if (!m || +m[1]! > 24 || +m[2]! > 59 || (+m[1]! === 24 && +m[2]! !== 0)) throw new Error(t('无效作息时间'))
+  if (!m || +m[1]! > 24 || +m[2]! > 59 || (+m[1]! === 24 && +m[2]! !== 0)) return
   return +m[1]! * 60 + +m[2]!
 }
+export function normalizeWindows(value: unknown): PlanConfig['windows'] {
+  if (!Array.isArray(value)) return []
+  const windows = new Map<string, PlanConfig['windows'][number]>()
+  for (const w of value) {
+    if (!w || typeof w !== 'object') continue
+    const start = parse(w.start)
+    const end = parse(w.end)
+    if (start === undefined || start === 1440 || end === undefined) continue
+    const wakes =
+      typeof w.wakes === 'number' && Number.isFinite(w.wakes) ? Math.min(12, Math.max(0, Math.floor(w.wakes))) : 1
+    windows.set(`${start}|${end}`, { start: w.start, end: w.end, wakes })
+  }
+  return [...windows.values()]
+}
 export function windowsOf(cfg: PlanConfig) {
-  return cfg.windows.map((w) => {
+  return cfg.windows.flatMap((w) => {
     const start = parse(w.start),
-      rawEnd = parse(w.end),
-      end = rawEnd <= start ? rawEnd + 1440 : rawEnd
-    return {
-      start,
-      end,
-      wrap: end > 1440,
-      label: `${w.start}–${w.end}`,
-      wakes: Math.min(12, Math.max(0, Math.floor(Number(w.wakes ?? 1) || 0))),
-    }
+      rawEnd = parse(w.end)
+    if (start === undefined || start === 1440 || rawEnd === undefined) return []
+    const end = rawEnd <= start ? rawEnd + 1440 : rawEnd
+    return [
+      {
+        start,
+        end,
+        wrap: end > 1440,
+        label: `${w.start}–${w.end}`,
+        wakes: Math.min(12, Math.max(0, Math.floor(Number(w.wakes ?? 1) || 0))),
+      },
+    ]
   })
 }
 export const maxWakes = (cfg: PlanConfig) =>
@@ -97,27 +117,35 @@ export function historyOf(state: Partial<Plan> = {}, now: number): Plan {
     date: dayOf(now),
     wakes: state.date === dayOf(now) ? Number(state.wakes ?? 0) : 0,
     wokeAt: state.wokeAt ?? null,
+    ...(state.manualRestDate === dayOf(now) ? { manualRestDate: state.manualRestDate } : {}),
     usedCount,
     skippedWindows: [...skippedWindows].filter((key) => key.slice(0, 10) >= dayOf(cutoff)),
   }
 }
-export function isPending(state: Partial<Plan>, now: number) {
-  return (
-    state.schema === 2 &&
-    (state.action === 'wake' || state.action === 'skip') &&
-    !state.fired &&
-    !state.woke &&
-    Number.isFinite(state.atMs) &&
-    Number.isFinite(state.endsAt) &&
-    state.endsAt! > now
+export function isPending(state: Partial<Plan>, now: number, cfg: PlanConfig) {
+  if (
+    state.schema !== 2 ||
+    (state.action !== 'wake' && state.action !== 'skip') ||
+    state.fired ||
+    state.woke ||
+    state.atMs === undefined ||
+    !Number.isFinite(state.atMs)
   )
+    return false
+  const window = occurrences(cfg, now).find((w) => w.key === state.windowKey && w.wakes > 0)
+  if (!window || state.atMs < window.startsAt || state.atMs >= window.endsAt) return false
+  const length = (window.endsAt - window.startsAt) / window.wakes
+  // 旧计划只记录窗口终点，按当前时段边界判断过期。
+  const slotEndsAt = window.startsAt + (Math.floor((state.atMs - window.startsAt) / length) + 1) * length
+  return (state.slotEndsAt === undefined || state.slotEndsAt === slotEndsAt) && now < slotEndsAt
 }
 // 将窗口按次数等分后在时段内随机取点，避免醒来挤在晚上、配置的次数用不满。
 export function makePlan(cfg: PlanConfig, state: Partial<Plan> = {}, now: number, random: () => number): Plan {
-  if (isPending(state, now)) return state as Plan
   const history = historyOf(state, now)
   const done = (reason: string): Plan => ({ ...history, action: 'done', done: true, reason })
+  if (history.manualRestDate) return done(t('今天已手动休息'))
   if (history.wakes >= maxWakes(cfg)) return done(t('今天醒来次数已用完'))
+  if (isPending(state, now, cfg)) return state as Plan
   const pool = occurrences(cfg, now)
     .filter((w) => w.wakes > (history.usedCount[w.key] ?? 0))
     .sort((a, b) => a.endsAt - b.endsAt || a.startsAt - b.startsAt)
@@ -150,6 +178,7 @@ export function makePlan(cfg: PlanConfig, state: Partial<Plan> = {}, now: number
         windowKey: w.key,
         startsAt: w.startsAt,
         endsAt: w.endsAt,
+        slotEndsAt: to,
         withinWindow: `${w.label} 第 ${(history.usedCount[w.key] ?? 0) + 1}/${w.wakes} 次`,
         maxVideos: cfg.maxVideos ?? 5,
         createdAt: new Date(now).toISOString(),

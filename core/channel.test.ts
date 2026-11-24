@@ -291,7 +291,7 @@ test('逐条按 seq 投递图片和分享 context，失败不推进，停止错�
     await f.channel.poll()
     expect(emitted.map((m) => m.id)).toEqual(['2', '3'])
     expect(f.kv.get('channel-cursors')).toMatchObject({ visitor: { seq: '3' } })
-    expect(f.kv.get('history')).toBeDefined()
+    expect(f.kv.get('history')).toBeUndefined()
   } finally {
     await f.close()
   }
@@ -436,7 +436,7 @@ test('渠道分享观看失败保留作品 id，图片最多四张且拒绝大�
     await f.channel.poll()
     expect(emitted[0]!.images).toHaveLength(4)
     expect(emitted[0]!.context).toContain('watching failed or timed out')
-    expect(emitted[0]!.context).toContain('id: failed-work')
+    expect(emitted[0]!.context).toContain('id_or_url: failed-work')
     expect(emitted[0]!.context).not.toMatch(/owner|主人/i)
   } finally {
     await f.close()
@@ -492,6 +492,9 @@ test('消息来源纯判断：抖音访客、主人、其他渠道及无来源',
   const user = (clientMessageId?: string) => ({ role: 'user', meta: { clientMessageId } })
   expect(visitorMessage(user('app-life.douyin:visitor:1'), bindings, 'owner')).toBe(true)
   expect(visitorMessage(user('app-life.douyin:owner:1'), bindings, 'owner')).toBe(false)
+  expect(
+    visitorMessage(user('app-life.douyin:visitor:1'), [turnBinding('app-life.douyin', 'visitor', true)], 'owner'),
+  ).toBe(true)
   expect(visitorMessage(user('app-life.douyin:visitor:1'), [turnBinding('app-life.douyin', 'visitor', true)], '')).toBe(
     false,
   )
@@ -645,7 +648,7 @@ test('主人渠道接管：start 绑定家里、切换基线去重、素材保�
     // 模拟专线与接管交界：已处理序号即使时间较新也不能重复投递。
     f.home.chatId = 'new-home'
     await f.channel.bindOwner()
-    expect(dmOf(f.kv).pendingReplies).toEqual([])
+    expect(dmOf(f.kv).pendingReplies).toEqual([{ userMessageId: 'old', peerId: 'owner', at: since }])
     f.peers([peer('owner', since + 5)])
     f.messages([
       message('9', { senderId: 'owner', at: since + 1 }),
@@ -654,6 +657,7 @@ test('主人渠道接管：start 绑定家里、切换基线去重、素材保�
     ])
     await f.channel.poll()
     expect(f.io.emit).toHaveBeenCalledTimes(1)
+    expect(dmOf(f.kv)).toMatchObject({ cursorPeer: 'owner', cursor: '12' })
     expect(f.io.emit).toHaveBeenCalledWith(
       expect.objectContaining({
         id: '12',
@@ -685,6 +689,7 @@ test('主人绑定失败不抛出，下轮重试；换主人和家里会话重�
     f.bind.mockRejectedValueOnce(new Error('暂时失败'))
     await f.channel.bindOwner()
     expect(f.dm.log).toHaveBeenCalled()
+    expect(f.io.setOwner).toHaveBeenLastCalledWith('owner')
     await f.channel.bindOwner()
     expect(f.io.setOwner).toHaveBeenLastCalledWith('new-owner')
     expect(f.bind).toHaveBeenLastCalledWith('douyin', {
@@ -702,6 +707,26 @@ test('主人绑定失败不抛出，下轮重试；换主人和家里会话重�
     f.peers([peer('new-owner')])
     await f.channel.poll()
     expect(f.list).not.toHaveBeenCalled()
+  } finally {
+    await f.close()
+  }
+})
+
+test('等待浏览器锁时更换家里会话，旧主人路由的消息停止发送', async () => {
+  const f = fixture({}, true)
+  try {
+    await f.channel.bindOwner()
+    f.exclusive.mockImplementationOnce(() => {
+      f.home.chatId = 'another-home'
+    })
+    await expect(
+      f.provider.send(
+        { id: 'account', config: {}, cursor: null },
+        { chatId: 'owner', text: '旧回复' },
+        f.lifetime.signal,
+      ),
+    ).rejects.toMatchObject({ kind: 'not-sent', code: 'binding-changed' })
+    expect(f.send).not.toHaveBeenCalled()
   } finally {
     await f.close()
   }
@@ -802,6 +827,28 @@ test('渠道表情共用文字每日计数，并按位置执行 30 秒冷却', a
     ).rejects.toMatchObject({ code: 'daily-limit' })
     expect(sticker).toHaveBeenCalledTimes(2)
     expect(f.exclusive).toHaveBeenCalled()
+  } finally {
+    await f.close()
+  }
+})
+
+test('渠道表情取得发送锁后重新校验绑定，失效时不进入适配器', async () => {
+  const f = fixture()
+  const sticker = mock(async () => ({ status: 'sent' as const, id: 's', names: ['比心'] }))
+  f.dm.adapter.directMessages.sendSticker = sticker
+  let bound = true
+  f.exclusive.mockImplementation(() => {
+    bound = false
+  })
+  try {
+    await expect(
+      f.channel.sendSticker('visitor', '比心', f.lifetime.signal, () => {
+        if (!bound) throw new ChannelSendError('not-sent', 'binding-changed')
+      }),
+    ).rejects.toMatchObject({ kind: 'not-sent', code: 'binding-changed' })
+    expect(f.exclusive).toHaveBeenCalledTimes(1)
+    expect(sticker).not.toHaveBeenCalled()
+    expect(f.kv.get('channel-sticker:visitor')).toBeUndefined()
   } finally {
     await f.close()
   }

@@ -1,4 +1,4 @@
-import { type HistoryItem, remember, type Settings } from './state'
+import { type HistoryItem, remember, type Settings, watchedHistory } from './state'
 import type { AppAdapter, ContentItem, KV } from './types'
 
 export function manualItem(item: ContentItem, app: string, now: number): HistoryItem {
@@ -27,7 +27,7 @@ export async function watchWork(
   id: string,
   depth: 'text' | 'full',
   now: number,
-  signal?: AbortSignal,
+  { signal, record = true }: { signal?: AbortSignal; record?: boolean } = {},
 ) {
   const item = await p.adapter.lookup(id, signal)
   signal?.throwIfAborted()
@@ -38,6 +38,18 @@ export async function watchWork(
     signal,
   })
   signal?.throwIfAborted()
-  remember(p.kv, { ...manualItem(item, p.adapter.id, now), depth })
+  if (record) {
+    // 重看只补素材和深度，保留评分、用户反馈和已有投递结果。
+    const previous = watchedHistory(p.kv).find((entry) => entry.id === item.id)
+    remember(
+      p.kv,
+      previous
+        ? { ...previous, depth: previous.depth === 'full' ? 'full' : depth }
+        : {
+            ...manualItem(item, p.adapter.id, now),
+            depth,
+          },
+    )
+  }
   return digest
 }

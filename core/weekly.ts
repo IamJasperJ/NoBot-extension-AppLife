@@ -13,9 +13,10 @@ export function previousWeek(now: number) {
   return { start: start.getTime(), end: end.getTime(), date: dayOf(start) }
 }
 export async function weeklyDigest(p: DayPorts, now: number, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   const { kv, settings: s } = p
-  const home = kv.get<{ chatId: string }>('home')
-  if (!s.memoryWeeks || !home) return
+  const home = kv.get<{ chatId: string; characterId?: string }>('home')
+  if (!s.memoryWeeks || !home || (home.characterId && home.characterId !== s.characterId)) return
   const week = previousWeek(now)
   const diary = kv.get<DiaryEntry[]>('diary') ?? []
   if (diary.some((e) => e.kind === 'weekly' && e.date === week.date)) return
@@ -48,10 +49,12 @@ export async function weeklyDigest(p: DayPorts, now: number, signal?: AbortSigna
       model: s.model || undefined,
       signal,
     })
+    signal?.throwIfAborted()
     if (!text.trim()) throw new Error('Empty weekly digest')
     addDiary(kv, { id: `${week.date}-weekly`, kind: 'weekly', date: week.date, text: text.slice(0, 600), at: now })
     kv.delete('weekly-failed-at')
   } catch (error) {
+    signal?.throwIfAborted()
     kv.set('weekly-failed-at', now)
     p.log(error)
   }
